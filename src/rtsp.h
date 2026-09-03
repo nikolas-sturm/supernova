@@ -6,9 +6,13 @@
 
 // standard includes
 #include <atomic>
+#include <chrono>
+#include <string>
+#include <vector>
 
 // local includes
 #include "crypto.h"
+#include "eclipse_api.h"
 #include "thread_safe.h"
 
 namespace rtsp_stream {
@@ -19,6 +23,10 @@ namespace rtsp_stream {
    */
   struct launch_session_t {
     uint32_t id;  ///< RTSP launch-session identifier assigned before stream startup.
+    std::string session_id;  ///< Stable logical Eclipse session UUID.
+    std::string client_uuid;  ///< Persistent UUID of the paired client owning this session.
+    std::string app_uuid;  ///< Stable UUID of the launched application.
+    eclipse_api::input_permissions_t input_permissions;  ///< Input classes granted to this paired client.
 
     crypto::aes_t gcm_key;  ///< AES-GCM key negotiated for encrypted RTSP messages.
     crypto::aes_t iv;  ///< Initial RTSP AES-GCM IV supplied by the client.
@@ -47,11 +55,28 @@ namespace rtsp_stream {
   };
 
   /**
+   * @brief Immutable Eclipse view of one active streaming session.
+   */
+  struct session_info_t {
+    std::string id;  ///< Stable logical session UUID.
+    std::string client_uuid;  ///< Persistent owner client UUID.
+    std::string app_uuid;  ///< Stable application UUID.
+    int legacy_app_id;  ///< Legacy numeric GameStream application ID.
+    std::string state;  ///< Explicit stream lifecycle state.
+    std::chrono::system_clock::time_point started_at;  ///< Time at which stream state was allocated.
+    int width;  ///< Negotiated capture width.
+    int height;  ///< Negotiated capture height.
+    int fps;  ///< Negotiated refresh rate.
+    bool hdr;  ///< Whether HDR was requested.
+  };
+
+  /**
    * @brief Queue a launch session until the RTSP client connects.
    *
    * @param launch_session Session state prepared by the GameStream launch handler.
+   * @return `true` when queued, or `false` when another launch is pending.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+  bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
 
   /**
    * @brief Clear state for the specified launch session.
@@ -64,6 +89,20 @@ namespace rtsp_stream {
    * @return Count of active sessions.
    */
   int session_count();
+  /**
+   * @brief Return immutable snapshots of active streaming sessions.
+   *
+   * @return Active session snapshots.
+   */
+  std::vector<session_info_t> sessions();
+  /**
+   * @brief Terminate active streams for one logical Eclipse session.
+   *
+   * @param session_id Stable logical session UUID.
+   * @param client_uuid Required owner UUID; empty permits administrative control.
+   * @return `true` when at least one matching stream was terminated.
+   */
+  bool terminate_session(std::string_view session_id, std::string_view client_uuid);
 
   /**
    * @brief Terminates all running streaming sessions.

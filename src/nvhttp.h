@@ -8,6 +8,7 @@
 // standard includes
 #include <chrono>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,6 +20,7 @@
 
 // local includes
 #include "crypto.h"
+#include "eclipse_api.h"
 
 /**
  * @brief Contains all the functions and variables related to the nvhttp (GameStream) server.
@@ -123,6 +125,9 @@ namespace nvhttp {
       std::string uniqueID = {};
       std::string cert = {};
       std::string name = {};
+      std::string platform = {};  ///< Untrusted platform name reported by an Eclipse pairing client.
+      eclipse_api::client_permissions_t requested_permissions = eclipse_api::legacy_client_permissions();  ///< Permissions requested during pairing.
+      bool requested_eclipse_permissions = false;  ///< Whether the pairing client explicitly requested Eclipse permissions.
     } client;  ///< Client object or client certificate data owned by this state..
 
     std::unique_ptr<crypto::aes_t> cipher_key = {};  ///< Cipher key.
@@ -157,6 +162,9 @@ namespace nvhttp {
     std::string id;  ///< Unguessable approval identifier.
     std::string name;  ///< Untrusted device name reported by the pairing client.
     std::string address;  ///< Network address from which the request originated.
+    std::string platform;  ///< Untrusted client platform reported during pairing.
+    std::vector<std::string> requested_scopes;  ///< Eclipse scopes requested by the pairing client.
+    std::vector<std::string> requested_inputs;  ///< Streamed input classes requested by the pairing client.
   };
 
   /**
@@ -322,6 +330,49 @@ namespace nvhttp {
    * @return true if the client was found and updated.
    */
   bool set_client_enabled(std::string_view uuid, bool enabled);
+
+  /**
+   * @brief Optional paired-client fields changed by one atomic update.
+   */
+  struct client_update_t {
+    std::optional<bool> enabled;  ///< Replacement enabled state, or no change.
+    std::optional<eclipse_api::client_permissions_t> permissions;  ///< Replacement permission policy, or no change.
+    std::optional<std::string> certificate;  ///< Replacement PEM certificate, or no change.
+  };
+
+  /**
+   * @brief Atomically update paired-client state and invalidate active authorization.
+   *
+   * @param uuid Persistent paired-client UUID.
+   * @param update Validated fields to replace.
+   * @return `true` when the client exists and every supplied field is valid.
+   */
+  bool update_client(std::string_view uuid, client_update_t update);
+
+  /**
+   * @brief Return certificate-bound permissions for one paired client.
+   *
+   * @param uuid Persistent paired-client UUID.
+   * @return Stored policy, or no value when the client is unknown.
+   */
+  std::optional<eclipse_api::client_permissions_t> get_client_permissions(std::string_view uuid);
+
+  /**
+   * @brief Replace certificate-bound permissions for one paired client.
+   *
+   * @param uuid Persistent paired-client UUID.
+   * @param permissions Validated permissions to store.
+   * @return `true` when the client was found and updated.
+   */
+  bool set_client_permissions(std::string_view uuid, eclipse_api::client_permissions_t permissions);
+  /**
+   * @brief Replace paired certificate while preserving client identity and policy.
+   *
+   * @param uuid Persistent paired-client UUID.
+   * @param cert New PEM-encoded client certificate.
+   * @return `true` when certificate is valid and client was updated.
+   */
+  bool rotate_client_certificate(std::string_view uuid, std::string cert);
   /**
    * @brief Get cert by UUID.
    *
@@ -366,6 +417,13 @@ namespace nvhttp {
      * @return Persistent UUID for the added client, or an empty string when invalid.
      */
     std::string add_client(const std::string &name, std::string cert, bool enabled);
+    /**
+     * @brief Return persisted permissions for one test client.
+     *
+     * @param uuid Persistent paired-client UUID.
+     * @return Client permissions, or no value when unknown.
+     */
+    std::optional<eclipse_api::client_permissions_t> client_permissions(std::string_view uuid);
 
     /**
      * @brief Run the production certificate authorization checks against PEM input.

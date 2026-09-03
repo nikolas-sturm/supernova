@@ -13,11 +13,14 @@
 #endif
 
 // standard includes
+#include <cstdint>
 #include <optional>
+#include <string_view>
 #include <unordered_map>
 
 // lib includes
 #include <boost/process/v1.hpp>
+#include <nlohmann/json.hpp>
 
 // local includes
 #include "config.h"
@@ -76,7 +79,9 @@ namespace proc {
     std::string working_dir;  ///< Working dir.
     std::string output;  ///< Captured output from the launched process.
     std::string image_path;  ///< Image path.
-    std::string id;  ///< Stable identifier for the configured application.
+    std::string id;  ///< Legacy numeric GameStream identifier for the configured application.
+    std::string uuid;  ///< Stable Eclipse application UUID.
+    nlohmann::json eclipse_metadata;  ///< Versioned metadata read from the application's `x-eclipse` object.
     bool elevated;  ///< Whether the process should be launched elevated.
     bool auto_detach;  ///< Whether the process should detach automatically.
     bool wait_all;  ///< Whether Sunshine waits for all child processes.
@@ -134,6 +139,20 @@ namespace proc {
      */
     std::vector<ctx_t> &get_apps();
     /**
+     * @brief Find an application by its stable Eclipse UUID.
+     *
+     * @param uuid Stable Eclipse application UUID.
+     * @return Application context, or `nullptr` when no application matches.
+     */
+    const ctx_t *find_app_by_uuid(std::string_view uuid) const;
+    /**
+     * @brief Find an application by its legacy GameStream identifier.
+     *
+     * @param app_id Legacy numeric GameStream application identifier.
+     * @return Application context, or `nullptr` when no application matches.
+     */
+    const ctx_t *find_app_by_id(int app_id) const;
+    /**
      * @brief Get app image.
      *
      * @param app_id App ID.
@@ -179,6 +198,28 @@ namespace proc {
    * @param index Zero-based index of the item being addressed.
    */
   std::tuple<std::string, std::string> calculate_app_id(const std::string &app_name, std::string app_image_path, int index);
+
+  /**
+   * @brief Immutable application catalog and matching revision.
+   */
+  struct catalog_snapshot_t {
+    std::uint64_t revision;  ///< Catalog revision associated with apps.
+    std::vector<ctx_t> apps;  ///< Copied application records safe for concurrent readers.
+  };
+
+  /**
+   * @brief Return a consistent copy of the current application catalog.
+   *
+   * @return Application records and their matching revision.
+   */
+  catalog_snapshot_t catalog_snapshot();
+
+  /**
+   * @brief Return current in-memory application catalog revision.
+   *
+   * @return Monotonic revision incremented after each successful refresh.
+   */
+  std::uint64_t catalog_revision();
 
   bool check_valid_png(const std::filesystem::path &path);
   /**

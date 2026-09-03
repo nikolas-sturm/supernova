@@ -6,6 +6,7 @@
 
 // standard includes
 #include <string>
+#include <string_view>
 
 /**
  * @brief Responsible for file handling functions.
@@ -51,4 +52,13 @@ namespace file_handler {
    * @examples_end
    */
   int write_file(const char *path, const std::string_view &contents);
+
+  /**
+   * @brief Replace a file atomically after fully writing sibling temporary storage.
+   *
+   * @param path Destination file path.
+   * @param contents Complete replacement contents.
+   * @return `0` on success, or `-1` when writing or replacement fails.
+   */
+  int write_file_atomic(const char *path, std::string_view contents);
 }  // namespace file_handler

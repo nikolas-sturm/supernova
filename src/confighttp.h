@@ -103,6 +103,14 @@ namespace confighttp {
   void savePin(const resp_https_t &response, const req_https_t &request);
 
   /**
+   * @brief Atomically update enabled state, permissions, or certificate for one paired client.
+   *
+   * @param response HTTP response object to populate.
+   * @param request Authenticated JSON request containing client fields to update.
+   */
+  void updateClient(resp_https_t response, req_https_t request);
+
+  /**
    * @brief Check whether a detected driver version satisfies a minimum version.
    *
    * Empty minimum versions accept any detected version. Non-empty minimum versions

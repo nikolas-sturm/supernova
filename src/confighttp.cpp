@@ -1247,7 +1247,12 @@ namespace confighttp {
    * @code{.json}
    * {
    *   "uuid": "<uuid>",
-   *   "enabled": true
+   *   "enabled": true,
+   *   "scopes": ["catalog.read", "stream.launch"],
+   *   "allowed_apps": ["<app-uuid>"],
+   *   "expires_at": 0,
+   *   "certificate": "<optional replacement PEM>",
+   *   "input": {"keyboard": true, "mouse": true, "controller": true, "touch": true, "pen": true}
    * }
    * @endcode
    *
@@ -1273,22 +1278,75 @@ namespace confighttp {
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
       nlohmann::json output_tree;
       std::string uuid = input_tree.value("uuid", "");
-      bool enabled = input_tree.value("enabled", true);
-      output_tree["status"] = nvhttp::set_client_enabled(uuid, enabled);
-
-      if (!enabled && output_tree["status"]) {
-        auto cert = nvhttp::get_cert_by_uuid(uuid);
-        if (!cert.empty()) {
-          rtsp_stream::terminate_sessions_by_cert(cert);
+      nvhttp::client_update_t update;
+      if (input_tree.contains("enabled")) {
+        update.enabled = input_tree.at("enabled").get<bool>();
+      }
+      if (input_tree.contains("scopes") || input_tree.contains("allowed_apps") || input_tree.contains("input") || input_tree.contains("expires_at")) {
+        auto permissions = nvhttp::get_client_permissions(uuid);
+        if (!permissions) {
+          output_tree["status"] = false;
+          send_response(response, output_tree);
+          return;
         }
+        if (input_tree.contains("expires_at")) {
+          permissions->expires_at = input_tree.at("expires_at").get<std::int64_t>();
+        }
+        if (permissions->expires_at < 0) {
+          throw std::invalid_argument("expires_at must be a non-negative Unix timestamp");
+        }
+        if (input_tree.contains("scopes")) {
+          if (!input_tree.at("scopes").is_array()) {
+            throw std::invalid_argument("scopes must be an array");
+          }
+          permissions->scopes.clear();
+          for (const auto &scope_value : input_tree.at("scopes")) {
+            const auto scope = scope_value.get<std::string>();
+            if (!eclipse_api::is_known_scope(scope)) {
+              throw std::invalid_argument(std::format("unknown Eclipse scope: {}", scope));
+            }
+            permissions->scopes.emplace(scope);
+          }
+        }
+        if (input_tree.contains("allowed_apps")) {
+          if (!input_tree.at("allowed_apps").is_array()) {
+            throw std::invalid_argument("allowed_apps must be an array");
+          }
+          permissions->allowed_apps.clear();
+          for (const auto &app_value : input_tree.at("allowed_apps")) {
+            const auto app_uuid = app_value.get<std::string>();
+            if (!uuid_util::is_valid(app_uuid)) {
+              throw std::invalid_argument("allowed_apps entries must be canonical UUIDs");
+            }
+            permissions->allowed_apps.emplace(app_uuid);
+          }
+        }
+        if (input_tree.contains("input")) {
+          const auto &input = input_tree.at("input");
+          if (!input.is_object()) {
+            throw std::invalid_argument("input must be an object");
+          }
+          permissions->input.keyboard = input.value("keyboard", permissions->input.keyboard);
+          permissions->input.mouse = input.value("mouse", permissions->input.mouse);
+          permissions->input.controller = input.value("controller", permissions->input.controller);
+          permissions->input.touch = input.value("touch", permissions->input.touch);
+          permissions->input.pen = input.value("pen", permissions->input.pen);
+        }
+        update.permissions = std::move(*permissions);
+      }
+      if (input_tree.contains("certificate")) {
+        update.certificate = input_tree.at("certificate").get<std::string>();
+      }
+      output_tree["status"] = nvhttp::update_client(uuid, std::move(update));
 
+      if (input_tree.value("enabled", true) == false && output_tree["status"]) {
         if (rtsp_stream::session_count() == 0 && proc::proc.running() > 0) {
           proc::proc.terminate();
         }
       }
 
       send_response(response, output_tree);
-    } catch (nlohmann::json::exception &e) {
+    } catch (std::exception &e) {
       BOOST_LOG(warning) << "Update Client: "sv << e.what();
       bad_request(response, request, e.what());
     }
@@ -1722,6 +1780,9 @@ namespace confighttp {
         {"id", pairing.id},
         {"name", pairing.name},
         {"address", pairing.address},
+        {"platform", pairing.platform},
+        {"requested_scopes", pairing.requested_scopes},
+        {"requested_inputs", pairing.requested_inputs},
       });
     }
     send_response(response, output_tree);

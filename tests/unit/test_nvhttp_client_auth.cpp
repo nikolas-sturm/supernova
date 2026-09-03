@@ -160,3 +160,105 @@ TEST_F(ClientAuthorizationTest, ConcurrentStateChangesRemainConsistent) {
   ASSERT_TRUE(nvhttp::set_client_enabled(uuid, false));
   EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
 }
+
+TEST_F(ClientAuthorizationTest, PersistsScopedPermissionsAndApplicationAllowlist) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  const auto uuid = nvhttp::test_support::add_client("scoped", credentials.x509, true);
+  ASSERT_FALSE(uuid.empty());
+
+  eclipse_api::client_permissions_t permissions;
+  permissions.scopes.emplace("catalog.read");
+  permissions.allowed_apps.emplace("11111111-1111-1111-1111-111111111111");
+  permissions.input.keyboard = false;
+  permissions.input.pen = false;
+  permissions.expires_at = 4102444800;
+  ASSERT_TRUE(nvhttp::set_client_permissions(uuid, permissions));
+
+  nvhttp::test_support::reset_client_state();
+  nvhttp::test_support::reload_client_state();
+  const auto persisted = nvhttp::test_support::client_permissions(uuid);
+  ASSERT_TRUE(persisted.has_value());
+  EXPECT_EQ(persisted->scopes, permissions.scopes);
+  EXPECT_EQ(persisted->allowed_apps, permissions.allowed_apps);
+  EXPECT_FALSE(persisted->input.keyboard);
+  EXPECT_FALSE(persisted->input.pen);
+  EXPECT_EQ(persisted->expires_at, permissions.expires_at);
+  EXPECT_TRUE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
+}
+
+TEST_F(ClientAuthorizationTest, RejectsExpiredClientPolicy) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials();
+  const auto uuid = nvhttp::test_support::add_client("expired policy", credentials.x509, true);
+  ASSERT_FALSE(uuid.empty());
+
+  auto permissions = eclipse_api::legacy_client_permissions();
+  permissions.expires_at = 1;
+  ASSERT_TRUE(nvhttp::set_client_permissions(uuid, std::move(permissions)));
+  EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
+}
+
+TEST_F(ClientAuthorizationTest, RotatesCertificateWithoutChangingClientIdentity) {
+  const auto original = test_utils::certificates::generate_ca_credentials("Original Client");
+  const auto replacement = test_utils::certificates::generate_ca_credentials("Replacement Client");
+  const auto uuid = nvhttp::test_support::add_client("rotating", original.x509, true);
+  ASSERT_FALSE(uuid.empty());
+
+  ASSERT_TRUE(nvhttp::rotate_client_certificate(uuid, replacement.x509));
+  EXPECT_FALSE(nvhttp::test_support::authorize_client_certificate(original.x509));
+  EXPECT_TRUE(nvhttp::test_support::authorize_client_certificate(replacement.x509));
+  EXPECT_EQ(nvhttp::get_cert_by_uuid(uuid), replacement.x509);
+
+  nvhttp::test_support::reset_client_state();
+  nvhttp::test_support::reload_client_state();
+  EXPECT_EQ(nvhttp::get_cert_by_uuid(uuid), replacement.x509);
+  EXPECT_TRUE(nvhttp::test_support::authorize_client_certificate(replacement.x509));
+}
+
+TEST_F(ClientAuthorizationTest, RejectsAtomicUpdateWithoutChangingAnyClientField) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials("Atomic Update Client");
+  const auto uuid = nvhttp::test_support::add_client("atomic", credentials.x509, true);
+  ASSERT_FALSE(uuid.empty());
+  const auto original_permissions = nvhttp::get_client_permissions(uuid);
+  ASSERT_TRUE(original_permissions.has_value());
+
+  eclipse_api::client_permissions_t restricted_permissions;
+  restricted_permissions.scopes.emplace("catalog.read");
+  restricted_permissions.input.keyboard = false;
+  nvhttp::client_update_t update;
+  update.enabled = false;
+  update.permissions = restricted_permissions;
+  update.certificate = "not a certificate";
+
+  EXPECT_FALSE(nvhttp::update_client(uuid, std::move(update)));
+  EXPECT_TRUE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
+  EXPECT_EQ(nvhttp::get_cert_by_uuid(uuid), credentials.x509);
+  const auto current_permissions = nvhttp::get_client_permissions(uuid);
+  ASSERT_TRUE(current_permissions.has_value());
+  EXPECT_EQ(current_permissions->scopes, original_permissions->scopes);
+  EXPECT_TRUE(current_permissions->input.keyboard);
+}
+
+TEST_F(ClientAuthorizationTest, RollsBackSecurityUpdateWhenPersistenceFails) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials("Persistence Failure Client");
+  const auto uuid = nvhttp::test_support::add_client("persistence failure", credentials.x509, true);
+  ASSERT_FALSE(uuid.empty());
+  const auto original_permissions = nvhttp::get_client_permissions(uuid);
+  ASSERT_TRUE(original_permissions.has_value());
+
+  const auto writable_state_file = config::nvhttp.file_state;
+  auto restore_state_file = util::fail_guard([&]() {
+    config::nvhttp.file_state = writable_state_file;
+  });
+  config::nvhttp.file_state = (state_file / "missing-parent" / "state.json").string();
+
+  eclipse_api::client_permissions_t restricted_permissions;
+  restricted_permissions.scopes.emplace("catalog.read");
+  restricted_permissions.input.keyboard = false;
+  EXPECT_FALSE(nvhttp::set_client_permissions(uuid, std::move(restricted_permissions)));
+
+  const auto current_permissions = nvhttp::get_client_permissions(uuid);
+  ASSERT_TRUE(current_permissions.has_value());
+  EXPECT_EQ(current_permissions->scopes, original_permissions->scopes);
+  EXPECT_TRUE(current_permissions->input.keyboard);
+  EXPECT_TRUE(nvhttp::test_support::authorize_client_certificate(credentials.x509));
+}

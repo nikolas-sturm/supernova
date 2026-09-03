@@ -13,6 +13,7 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <map>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -591,10 +592,10 @@ namespace rtsp_stream {
      *       the session will be discarded.
      * @param launch_session Streaming session information.
      */
-    void session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    bool session_raise(std::shared_ptr<launch_session_t> launch_session) {
       // If a launch event is still pending, don't overwrite it.
       if (launch_event.view(0s)) {
-        return;
+        return false;
       }
 
       // Raise the new launch session to prepare for the RTSP handshake
@@ -610,6 +611,7 @@ namespace rtsp_stream {
           }
         }
       });
+      return true;
     }
 
     /**
@@ -637,6 +639,27 @@ namespace rtsp_stream {
     int session_count() {
       auto lg = _session_slots.lock();
       return (int) _session_slots->size();
+    }
+
+    /**
+     * @brief Return immutable snapshots of active streams.
+     *
+     * @return One snapshot per logical Eclipse session.
+     */
+    std::vector<session_info_t> sessions() {
+      auto lg = _session_slots.lock();
+      std::map<std::string, session_info_t, std::less<>> snapshots;
+      for (const auto &slot : *_session_slots) {
+        auto snapshot = stream::session::snapshot(*slot);
+        snapshots.insert_or_assign(snapshot.id, std::move(snapshot));
+      }
+      std::vector<session_info_t> result;
+      result.reserve(snapshots.size());
+      for (auto &[id, snapshot] : snapshots) {
+        static_cast<void>(id);
+        result.emplace_back(std::move(snapshot));
+      }
+      return result;
     }
 
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;  ///< Launch event.
@@ -681,6 +704,31 @@ namespace rtsp_stream {
           i++;
         }
       }
+    }
+
+    /**
+     * @brief Clear streams matching a logical session and optional owner.
+     *
+     * @param session_id Stable logical session UUID.
+     * @param client_uuid Required owner UUID, or empty for administrative control.
+     * @return `true` when at least one stream matched.
+     */
+    bool clear_by_session(const std::string_view session_id, const std::string_view client_uuid) {
+      auto lg = _session_slots.lock();
+      bool removed = false;
+      for (auto i = _session_slots->begin(); i != _session_slots->end();) {
+        auto &slot = *(*i);
+        const auto snapshot = stream::session::snapshot(slot);
+        if (snapshot.id == session_id && (client_uuid.empty() || snapshot.client_uuid == client_uuid)) {
+          stream::session::stop(slot);
+          stream::session::join(slot);
+          i = _session_slots->erase(i);
+          removed = true;
+        } else {
+          ++i;
+        }
+      }
+      return removed;
     }
 
     /**
@@ -741,8 +789,8 @@ namespace rtsp_stream {
   /**
    * @brief Queue a launch session until the RTSP client connects.
    */
-  void launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
-    server.session_raise(std::move(launch_session));
+  bool launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    return server.session_raise(std::move(launch_session));
   }
 
   void launch_session_clear(uint32_t launch_session_id) {
@@ -754,6 +802,15 @@ namespace rtsp_stream {
     server.clear(false);
 
     return server.session_count();
+  }
+
+  std::vector<session_info_t> sessions() {
+    server.clear(false);
+    return server.sessions();
+  }
+
+  bool terminate_session(const std::string_view session_id, const std::string_view client_uuid) {
+    return server.clear_by_session(session_id, client_uuid);
   }
 
   void terminate_sessions() {

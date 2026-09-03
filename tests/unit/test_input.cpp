@@ -250,6 +250,47 @@ TEST_F(InputGamepadSessionTest, RejectsMalformedBatchablePacketsAtQueueIngress) 
   }
 }
 
+TEST_F(InputGamepadSessionTest, EnforcesCertificateBoundInputClassesAtQueueIngress) {
+  ASSERT_FALSE(task_pool.running());
+  eclipse_api::input_permissions_t permissions;
+  permissions.keyboard = false;
+  permissions.mouse = false;
+  permissions.controller = false;
+  permissions.pen = false;
+  auto stream_input = input::alloc(std::make_shared<safe::mail_raw_t>(), "restricted-input-client", permissions);
+  ASSERT_NE(stream_input, nullptr);
+
+  auto keyboard = make_input_packet(KEY_DOWN_EVENT_MAGIC, sizeof(NV_KEYBOARD_PACKET) - sizeof(std::uint32_t), sizeof(NV_KEYBOARD_PACKET));
+  input::passthrough(stream_input, std::move(keyboard));
+  EXPECT_EQ(input::testing::queued_input_packet_count(stream_input), 0);
+
+  auto touch = make_input_packet(SS_TOUCH_MAGIC, sizeof(SS_TOUCH_PACKET) - sizeof(std::uint32_t), sizeof(SS_TOUCH_PACKET));
+  input::passthrough(stream_input, std::move(touch));
+  EXPECT_EQ(input::testing::queued_input_packet_count(stream_input), 1);
+
+  input::terminate_gamepads("restricted-input-client");
+}
+
+TEST_F(InputGamepadSessionTest, ReplacesInputPermissionsWhenSessionResumes) {
+  ASSERT_FALSE(task_pool.running());
+  eclipse_api::input_permissions_t restricted_permissions;
+  restricted_permissions.keyboard = false;
+  auto stream_input = input::alloc(std::make_shared<safe::mail_raw_t>(), "permission-resume-client", restricted_permissions);
+  ASSERT_NE(stream_input, nullptr);
+
+  auto denied_keyboard = make_input_packet(KEY_DOWN_EVENT_MAGIC, sizeof(NV_KEYBOARD_PACKET) - sizeof(std::uint32_t), sizeof(NV_KEYBOARD_PACKET));
+  input::passthrough(stream_input, std::move(denied_keyboard));
+  EXPECT_EQ(input::testing::queued_input_packet_count(stream_input), 0);
+
+  auto resumed = input::alloc(std::make_shared<safe::mail_raw_t>(), "permission-resume-client");
+  ASSERT_EQ(resumed, stream_input);
+  auto allowed_keyboard = make_input_packet(KEY_DOWN_EVENT_MAGIC, sizeof(NV_KEYBOARD_PACKET) - sizeof(std::uint32_t), sizeof(NV_KEYBOARD_PACKET));
+  input::passthrough(resumed, std::move(allowed_keyboard));
+  EXPECT_EQ(input::testing::queued_input_packet_count(resumed), 1);
+
+  input::terminate_gamepads("permission-resume-client");
+}
+
 TEST_F(InputGamepadSessionTest, ReusesGamepadsAcrossPauseAndDestroysThemOnTermination) {
   const std::string session_id = "paired-client-certificate";
   auto first_mail = std::make_shared<safe::mail_raw_t>();

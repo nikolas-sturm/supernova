@@ -8,6 +8,7 @@
  */
 
 // test includes
+#include "../certificate_test_utils.h"
 #include "../tests_common.h"
 
 // standard includes
@@ -328,6 +329,7 @@ protected:
     server->resource["^/pairing-test$"]["DELETE"] = confighttp::cancelPairing;
     server->resource["^/pairing-test$"]["GET"] = confighttp::getPendingPairings;
     server->resource["^/pairing-test$"]["POST"] = confighttp::savePin;
+    server->resource["^/client-update-test$"]["POST"] = confighttp::updateClient;
 
     // Start server
     server_thread = std::jthread([this]() {
@@ -422,6 +424,43 @@ protected:
     ASSERT_TRUE(body.find(expected_message) != std::string::npos);
     ASSERT_TRUE(body.find(expected_status_code) != std::string::npos);
   }
+};
+
+/**
+ * @brief Config HTTP fixture with isolated paired-client persistence.
+ */
+class ClientUpdateConfigHttpTest: public ConfigHttpTest {
+protected:
+  /**
+   * @brief Redirect paired-client state before starting the HTTPS fixture.
+   */
+  void SetUp() override {
+    original_state_file = config::nvhttp.file_state;
+    original_fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
+    state_file = std::filesystem::temp_directory_path() / "sunshine_confighttp_client_update_state.json";
+    config::nvhttp.file_state = state_file.string();
+    config::sunshine.flags[config::flag::FRESH_STATE] = false;
+    nvhttp::test_support::reset_client_state();
+    std::error_code error;
+    std::filesystem::remove(state_file, error);
+    ConfigHttpTest::SetUp();
+  }
+
+  /**
+   * @brief Remove isolated paired-client state and restore configuration.
+   */
+  void TearDown() override {
+    nvhttp::test_support::reset_client_state();
+    std::error_code error;
+    std::filesystem::remove(state_file, error);
+    config::nvhttp.file_state = original_state_file;
+    config::sunshine.flags[config::flag::FRESH_STATE] = original_fresh_state;
+    ConfigHttpTest::TearDown();
+  }
+
+  std::filesystem::path state_file;  ///< Isolated paired-client state path.
+  std::string original_state_file;  ///< State path restored after each test.
+  bool original_fresh_state;  ///< Fresh-state flag restored after each test.
 };
 
 namespace {
@@ -650,6 +689,53 @@ TEST_F(ConfigHttpTest, PairingRestApiCancelsOnlyExplicitRequest) {
   ASSERT_EQ(response->status_code, "200 OK");
   EXPECT_TRUE(nlohmann::json::parse(response->content.string()).at("status").get<bool>());
   EXPECT_TRUE(nvhttp::get_pending_pairings().empty());
+}
+
+TEST_F(ClientUpdateConfigHttpTest, PreservesOmittedRestrictionsAndRejectsMalformedPolicy) {
+  const auto credentials = test_utils::certificates::generate_ca_credentials("Config Update Client");
+  const auto uuid = nvhttp::test_support::add_client("config update", credentials.x509, true);
+  ASSERT_FALSE(uuid.empty());
+
+  eclipse_api::client_permissions_t permissions;
+  permissions.scopes.emplace("catalog.read");
+  permissions.allowed_apps.emplace("11111111-1111-1111-1111-111111111111");
+  permissions.input.keyboard = false;
+  permissions.expires_at = 4102444800;
+  ASSERT_TRUE(nvhttp::set_client_permissions(uuid, permissions));
+
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  headers.emplace("Content-Type", "application/json");
+  headers.emplace("Origin", std::format("https://localhost:{}", port));
+
+  const auto update_response = client->request(
+    "POST",
+    "/client-update-test",
+    nlohmann::json {{"uuid", uuid}, {"input", {{"mouse", false}}}}.dump(),
+    headers
+  );
+  ASSERT_EQ(update_response->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(update_response->content.string()).at("status").get<bool>());
+  const auto updated = nvhttp::get_client_permissions(uuid);
+  ASSERT_TRUE(updated.has_value());
+  EXPECT_EQ(updated->scopes, permissions.scopes);
+  EXPECT_EQ(updated->allowed_apps, permissions.allowed_apps);
+  EXPECT_FALSE(updated->input.keyboard);
+  EXPECT_FALSE(updated->input.mouse);
+  EXPECT_TRUE(updated->input.controller);
+  EXPECT_EQ(updated->expires_at, permissions.expires_at);
+
+  const auto invalid_response = client->request(
+    "POST",
+    "/client-update-test",
+    nlohmann::json {{"uuid", uuid}, {"scopes", {"unknown.scope"}}}.dump(),
+    headers
+  );
+  ASSERT_EQ(invalid_response->status_code, "400 Bad Request");
+  const auto unchanged = nvhttp::get_client_permissions(uuid);
+  ASSERT_TRUE(unchanged.has_value());
+  EXPECT_EQ(unchanged->scopes, permissions.scopes);
+  EXPECT_EQ(unchanged->allowed_apps, permissions.allowed_apps);
 }
 
 // Test: confighttp::authenticate() rejects requests without auth header

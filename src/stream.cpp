@@ -551,6 +551,16 @@ namespace stream {
     } control;  ///< Runtime state for the encrypted GameStream control channel.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
+    std::string session_id;  ///< Stable logical Eclipse session UUID.
+    std::string client_uuid;  ///< Persistent UUID of the paired client owning this stream.
+    std::string app_uuid;  ///< Stable UUID of the streamed application.
+    int legacy_app_id;  ///< Legacy numeric GameStream application ID.
+    std::chrono::system_clock::time_point started_at;  ///< Time at which this stream state was allocated.
+    int width;  ///< Negotiated capture width.
+    int height;  ///< Negotiated capture height.
+    int fps;  ///< Negotiated refresh rate.
+    bool hdr;  ///< Whether HDR was requested.
+    eclipse_api::input_permissions_t input_permissions;  ///< Input classes permitted for this stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
 
@@ -2194,6 +2204,34 @@ namespace stream {
       return session.client_cert;
     }
 
+    rtsp_stream::session_info_t snapshot(session_t &session) {
+      const auto state_name = [&]() -> std::string {
+        switch (state(session)) {
+          case state_e::STOPPED:
+            return "stopped";
+          case state_e::STOPPING:
+            return "stopping";
+          case state_e::STARTING:
+            return "starting";
+          case state_e::RUNNING:
+            return "running";
+        }
+        return "unknown";
+      }();
+      return {
+        .id = session.session_id,
+        .client_uuid = session.client_uuid,
+        .app_uuid = session.app_uuid,
+        .legacy_app_id = session.legacy_app_id,
+        .state = state_name,
+        .started_at = session.started_at,
+        .width = session.width,
+        .height = session.height,
+        .fps = session.fps,
+        .hdr = session.hdr,
+      };
+    }
+
     /**
      * @brief Stop the active streaming session and prevent new packets from being queued.
      */
@@ -2263,7 +2301,7 @@ namespace stream {
      * @brief Start the audio, video, and control workers for a streaming session.
      */
     int start(session_t &session, const std::string &addr_string) {
-      session.input = input::alloc(session.mail, session.input_session_id);
+      session.input = input::alloc(session.mail, session.input_session_id, session.input_permissions);
 
       session.broadcast_ref = broadcast.ref();
       if (!session.broadcast_ref) {
@@ -2314,6 +2352,16 @@ namespace stream {
 
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
+      session->session_id = launch_session.session_id;
+      session->client_uuid = launch_session.client_uuid;
+      session->app_uuid = launch_session.app_uuid;
+      session->legacy_app_id = launch_session.appid;
+      session->started_at = std::chrono::system_clock::now();
+      session->width = launch_session.width;
+      session->height = launch_session.height;
+      session->fps = launch_session.fps;
+      session->hdr = launch_session.enable_hdr;
+      session->input_permissions = launch_session.input_permissions;
       session->client_cert = launch_session.client_cert;
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
 

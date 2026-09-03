@@ -10,7 +10,9 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -72,7 +74,7 @@ namespace nvhttp {
       context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
     }
 
-    std::function<int(SSL *)> verify;  ///< Callback that validates a client's TLS certificate after handshake.
+    std::function<int(SSL *, const boost::asio::ip::tcp::endpoint &)> verify;  ///< Callback that validates a client's TLS certificate after handshake.
     std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;  ///< Handler used to return the pairing challenge when client verification fails.
 
   protected:
@@ -123,7 +125,7 @@ namespace nvhttp {
               return;
             }
             if (!ec) {
-              if (verify && !verify(session->connection->socket->native_handle())) {
+              if (verify && !verify(session->connection->socket->native_handle(), session->connection->socket->lowest_layer().remote_endpoint())) {
                 this->write(session, on_verify_failed);
               } else {
                 this->read(session);
@@ -163,7 +165,19 @@ namespace nvhttp {
     std::string name;  ///< Human-readable name for this item.
     std::string uuid;  ///< Persistent Moonlight client UUID associated with the certificate.
     std::string cert;  ///< Certificate PEM string or path.
+    std::string platform;  ///< Platform reported by the paired Eclipse client.
+    eclipse_api::client_permissions_t permissions = eclipse_api::legacy_client_permissions();  ///< Certificate-bound permissions.
     bool enabled = true;  ///< Whether this persisted client entry may connect.
+  };
+
+  /**
+   * @brief Immutable identity captured from one verified TLS connection.
+   */
+  struct verified_client_t {
+    std::string uuid;  ///< Persistent paired-client UUID.
+    std::string name;  ///< Paired-client friendly name.
+    std::string cert;  ///< Canonical certificate PEM.
+    eclipse_api::client_permissions_t permissions;  ///< Permission snapshot used by requests on this connection.
   };
 
   /**
@@ -178,10 +192,26 @@ namespace nvhttp {
   std::recursive_mutex map_id_sess_mutex;  ///< Mutex protecting pairing-session storage and lifecycle transitions.
   client_t client_root;  ///< In-memory representation of the paired-client database.
   std::atomic<uint32_t> session_id_counter;  ///< Monotonic counter used to allocate GameStream session IDs.
+  constexpr std::size_t MAX_VERIFIED_CLIENT_CONNECTIONS = 1024;  ///< Bound for request-scoped TLS identity snapshots.
+  std::map<std::string, verified_client_t, std::less<>> verified_clients;  ///< Verified clients keyed by TLS peer endpoint.
 
-  // Set by TLS verify callback, read by launch/resume handler (single-threaded HTTPS server)
-  std::string last_verified_client_cert;  ///< Last client certificate accepted by the TLS verify callback.  // NOSONAR(cpp:S5421): intentionally mutable global
-  std::string last_verified_client_name;  ///< Friendly name of last client certificate accepted by the TLS verify callback. // NOSONAR(cpp:S5421): intentionally mutable global
+  /**
+   * @brief Resumable logical session associated with Sunshine's single running application.
+   */
+  struct logical_session_t {
+    std::string id;  ///< Stable Eclipse session UUID.
+    std::string client_uuid;  ///< Persistent owning-client UUID.
+    std::string app_uuid;  ///< Stable application UUID.
+    int legacy_app_id;  ///< Legacy GameStream application ID.
+    std::chrono::system_clock::time_point started_at;  ///< Session creation time.
+    int width;  ///< Requested capture width.
+    int height;  ///< Requested capture height.
+    int fps;  ///< Requested refresh rate.
+    bool hdr;  ///< Whether HDR was requested.
+  };
+
+  std::mutex logical_session_mutex;  ///< Protects resumable logical-session metadata.
+  std::optional<logical_session_t> logical_session;  ///< Current resumable logical session.
 
   /**
    * @brief Case-insensitive map used for HTTP headers and query parameters.
@@ -233,9 +263,60 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Persist the current state to its backing store.
+   * @brief Format a TCP endpoint for verified-connection identity lookup.
+   *
+   * @param endpoint Remote TLS endpoint.
+   * @return Stable address-and-port key for the connection lifetime.
    */
-  void save_state() {
+  std::string endpoint_key(const boost::asio::ip::tcp::endpoint &endpoint) {
+    return std::format("{}:{}", net::addr_to_normalized_string(endpoint.address()), endpoint.port());
+  }
+
+  bool permissions_expired(const eclipse_api::client_permissions_t &permissions);
+
+  /**
+   * @brief Return authenticated identity captured for an HTTPS request.
+   *
+   * @param request Paired-client HTTPS request.
+   * @return Immutable identity snapshot, or no value after revocation or expiry.
+   */
+  std::optional<verified_client_t> verified_client(const req_https_t &request) {
+    std::lock_guard lock {client_auth_mutex};
+    const auto client = verified_clients.find(endpoint_key(request->remote_endpoint()));
+    if (client == verified_clients.end() || permissions_expired(client->second.permissions)) {
+      return std::nullopt;
+    }
+    return client->second;
+  }
+
+  /**
+   * @brief Check a scope in an authenticated client policy snapshot.
+   *
+   * @param client Authenticated paired client.
+   * @param scope Required stable scope name.
+   * @return `true` when the client holds the requested scope.
+   */
+  bool scope_allowed(const verified_client_t &client, const std::string_view scope) {
+    return client.permissions.scopes.contains(scope);
+  }
+
+  /**
+   * @brief Check application allowlist access for a client.
+   *
+   * @param client Authenticated paired client.
+   * @param app_uuid Stable application UUID.
+   * @return `true` when allowlist is empty or contains the application.
+   */
+  bool app_allowed(const verified_client_t &client, const std::string_view app_uuid) {
+    return client.permissions.allowed_apps.empty() || client.permissions.allowed_apps.contains(app_uuid);
+  }
+
+  /**
+   * @brief Persist the current state to its backing store.
+   *
+   * @return `true` when complete state was atomically replaced.
+   */
+  bool save_state() {
     pt::ptree root;
 
     if (fs::exists(config::nvhttp.file_state)) {
@@ -243,7 +324,7 @@ namespace nvhttp {
         pt::read_json(config::nvhttp.file_state, root);
       } catch (std::exception &e) {
         BOOST_LOG(error) << "Couldn't read "sv << config::nvhttp.file_state << ": "sv << e.what();
-        return;
+        return false;
       }
     }
 
@@ -260,16 +341,44 @@ namespace nvhttp {
       named_cert_node.put("cert"s, named_cert.cert);
       named_cert_node.put("uuid"s, named_cert.uuid);
       named_cert_node.put("enabled"s, named_cert.enabled);
+      named_cert_node.put("platform"s, named_cert.platform);
+      named_cert_node.put("eclipse_permissions.version"s, 1);
+      named_cert_node.put("eclipse_permissions.expires_at"s, named_cert.permissions.expires_at);
+      named_cert_node.put("eclipse_permissions.input.keyboard"s, named_cert.permissions.input.keyboard);
+      named_cert_node.put("eclipse_permissions.input.mouse"s, named_cert.permissions.input.mouse);
+      named_cert_node.put("eclipse_permissions.input.controller"s, named_cert.permissions.input.controller);
+      named_cert_node.put("eclipse_permissions.input.touch"s, named_cert.permissions.input.touch);
+      named_cert_node.put("eclipse_permissions.input.pen"s, named_cert.permissions.input.pen);
+      pt::ptree scope_nodes;
+      for (const auto &scope : named_cert.permissions.scopes) {
+        pt::ptree scope_node;
+        scope_node.put_value(scope);
+        scope_nodes.push_back(std::make_pair(""s, scope_node));
+      }
+      named_cert_node.add_child("eclipse_permissions.scopes"s, scope_nodes);
+      pt::ptree app_nodes;
+      for (const auto &app_uuid : named_cert.permissions.allowed_apps) {
+        pt::ptree app_node;
+        app_node.put_value(app_uuid);
+        app_nodes.push_back(std::make_pair(""s, app_node));
+      }
+      named_cert_node.add_child("eclipse_permissions.allowed_apps"s, app_nodes);
       named_cert_nodes.push_back(std::make_pair(""s, named_cert_node));
     }
     root.add_child("root.named_devices"s, named_cert_nodes);
 
     try {
-      pt::write_json(config::nvhttp.file_state, root);
+      std::ostringstream serialized;
+      pt::write_json(serialized, root);
+      if (file_handler::write_file_atomic(config::nvhttp.file_state.c_str(), serialized.str()) != 0) {
+        BOOST_LOG(error) << "Couldn't atomically replace "sv << config::nvhttp.file_state;
+        return false;
+      }
     } catch (std::exception &e) {
       BOOST_LOG(error) << "Couldn't write "sv << config::nvhttp.file_state << ": "sv << e.what();
-      return;
+      return false;
     }
+    return true;
   }
 
   /**
@@ -284,6 +393,20 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Check whether a client policy has passed its configured expiry.
+   *
+   * @param permissions Client policy to inspect.
+   * @return `true` when policy expiry is set and has passed.
+   */
+  bool permissions_expired(const eclipse_api::client_permissions_t &permissions) {
+    if (permissions.expires_at == 0) {
+      return false;
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    return now >= permissions.expires_at;
+  }
+
+  /**
    * @brief Rebuild the GameStream trust stores from enabled paired-client records.
    *
    * @note The caller must hold `client_auth_mutex`.
@@ -291,7 +414,7 @@ namespace nvhttp {
   void rebuild_client_cert_chain() {
     cert_chain.clear();
     for (const auto &named_cert : client_root.named_devices) {
-      if (!named_cert.enabled) {
+      if (!named_cert.enabled || permissions_expired(named_cert.permissions)) {
         continue;
       }
 
@@ -320,7 +443,7 @@ namespace nvhttp {
         continue;
       }
 
-      if (matched || !named_cert.enabled) {
+      if (matched || !named_cert.enabled || permissions_expired(named_cert.permissions)) {
         return false;
       }
       matched = true;
@@ -398,6 +521,29 @@ namespace nvhttp {
         named_cert.cert = el.get_child("cert").get_value<std::string>();
         named_cert.uuid = el.get_child("uuid").get_value<std::string>();
         named_cert.enabled = el.get<bool>("enabled", true);
+        named_cert.platform = el.get<std::string>("platform", "");
+        if (el.get<int>("eclipse_permissions.version", 0) == 1) {
+          named_cert.permissions = {};
+          named_cert.permissions.expires_at = el.get<std::int64_t>("eclipse_permissions.expires_at", 0);
+          named_cert.permissions.input.keyboard = el.get<bool>("eclipse_permissions.input.keyboard", true);
+          named_cert.permissions.input.mouse = el.get<bool>("eclipse_permissions.input.mouse", true);
+          named_cert.permissions.input.controller = el.get<bool>("eclipse_permissions.input.controller", true);
+          named_cert.permissions.input.touch = el.get<bool>("eclipse_permissions.input.touch", true);
+          named_cert.permissions.input.pen = el.get<bool>("eclipse_permissions.input.pen", true);
+          if (const auto scopes = el.get_child_optional("eclipse_permissions.scopes")) {
+            for (const auto &[_, scope] : *scopes) {
+              const auto value = scope.get_value<std::string>();
+              if (eclipse_api::is_known_scope(value)) {
+                named_cert.permissions.scopes.emplace(value);
+              }
+            }
+          }
+          if (const auto allowed_apps = el.get_child_optional("eclipse_permissions.allowed_apps")) {
+            for (const auto &[_, app_uuid] : *allowed_apps) {
+              named_cert.permissions.allowed_apps.emplace(app_uuid.get_value<std::string>());
+            }
+          }
+        }
         client.named_devices.emplace_back(named_cert);
       }
     }
@@ -419,9 +565,16 @@ namespace nvhttp {
    *
    * @param name Human-readable name to assign.
    * @param cert Certificate data or object used by the operation.
+   * @param platform Client platform reported during pairing.
+   * @param permissions Certificate-bound policy approved during pairing.
    * @return Persistent UUID for the added client, or an empty string when the certificate is invalid.
    */
-  std::string add_authorized_client(const std::string &name, std::string &&cert) {
+  std::string add_authorized_client(
+    const std::string &name,
+    std::string &&cert,
+    std::string platform = {},
+    eclipse_api::client_permissions_t permissions = eclipse_api::legacy_client_permissions()
+  ) {
     auto canonical_certificate = canonical_certificate_pem(cert);
     if (canonical_certificate.empty()) {
       return {};
@@ -431,13 +584,19 @@ namespace nvhttp {
     named_cert.name = name;
     named_cert.cert = std::move(canonical_certificate);
     named_cert.uuid = uuid_util::uuid_t::generate().string();
+    named_cert.platform = std::move(platform);
+    named_cert.permissions = std::move(permissions);
 
     std::lock_guard lock {client_auth_mutex};
     client_root.named_devices.emplace_back(std::move(named_cert));
     rebuild_client_cert_chain();
 
     if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
-      save_state();
+      if (!save_state()) {
+        client_root.named_devices.pop_back();
+        rebuild_client_cert_chain();
+        return {};
+      }
     }
     return client_root.named_devices.back().uuid;
   }
@@ -447,12 +606,24 @@ namespace nvhttp {
    *
    * @param host_audio Host audio.
    * @param args Arguments forwarded to the callable or parser.
+   * @param client Authenticated paired-client identity.
+   * @param session_id Existing logical session UUID used for resume.
    * @return Constructed launch session object.
    */
-  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args) {
+  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(
+    bool host_audio,
+    const args_t &args,
+    const verified_client_t &client,
+    std::string session_id = {}
+  ) {
     auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
 
     launch_session->id = ++session_id_counter;
+    launch_session->session_id = session_id.empty() ? uuid_util::uuid_t::generate().string() : std::move(session_id);
+    launch_session->client_uuid = client.uuid;
+    launch_session->client_cert = client.cert;
+    launch_session->client_name = client.name;
+    launch_session->input_permissions = client.permissions.input;
 
     auto rikey = util::from_hex_vec(get_arg(args, "rikey"), true);
     std::copy(rikey.cbegin(), rikey.cend(), std::back_inserter(launch_session->gcm_key));
@@ -476,6 +647,10 @@ namespace nvhttp {
     }
     launch_session->unique_id = (get_arg(args, "uniqueid", "unknown"));
     launch_session->appid = (int) util::from_view(get_arg(args, "appid", "unknown"));
+    const auto catalog = proc::catalog_snapshot();
+    if (const auto app = std::ranges::find(catalog.apps, std::to_string(launch_session->appid), &proc::ctx_t::id); app != catalog.apps.end()) {
+      launch_session->app_uuid = app->uuid;
+    }
     launch_session->enable_sops = util::from_view(get_arg(args, "sops", "0"));
     launch_session->surround_info = (int) util::from_view(get_arg(args, "surroundAudioInfo", "196610"));
     launch_session->surround_params = (get_arg(args, "surroundParams", ""));
@@ -493,9 +668,6 @@ namespace nvhttp {
       launch_session->rtsp_iv_counter = 0;
     }
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
-    launch_session->client_cert = last_verified_client_cert;
-    launch_session->client_name = last_verified_client_name;
-
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
     unsigned char raw_payload[8];
     RAND_bytes(raw_payload, sizeof(raw_payload));
@@ -621,10 +793,36 @@ namespace nvhttp {
     std::vector<pending_pairing_t> result;
     result.reserve(pending_sessions.size());
     for (const auto *sess : pending_sessions) {
+      std::vector<std::string> requested_scopes;
+      if (sess->client.requested_eclipse_permissions) {
+        requested_scopes.assign(sess->client.requested_permissions.scopes.begin(), sess->client.requested_permissions.scopes.end());
+      }
+      std::vector<std::string> requested_inputs;
+      if (sess->client.requested_eclipse_permissions) {
+        const auto &input = sess->client.requested_permissions.input;
+        if (input.keyboard) {
+          requested_inputs.emplace_back("keyboard");
+        }
+        if (input.mouse) {
+          requested_inputs.emplace_back("mouse");
+        }
+        if (input.controller) {
+          requested_inputs.emplace_back("controller");
+        }
+        if (input.touch) {
+          requested_inputs.emplace_back("touch");
+        }
+        if (input.pen) {
+          requested_inputs.emplace_back("pen");
+        }
+      }
       result.push_back({
         .id = sess->async_insert_pin.id,
         .name = sess->async_insert_pin.device_name,
         .address = sess->async_insert_pin.address,
+        .platform = sess->client.platform,
+        .requested_scopes = std::move(requested_scopes),
+        .requested_inputs = std::move(requested_inputs),
       });
     }
     return result;
@@ -835,7 +1033,12 @@ namespace nvhttp {
     auto verify = crypto::verify256(crypto::x509(client.cert), secret, sign);
     if (same_hash && verify) {
       // The client is now successfully paired and will be authorized to connect
-      tree.put("root.paired", add_authorized_client(client.name, std::move(client.cert)).empty() ? 0 : 1);
+      auto permissions = client.requested_eclipse_permissions ? std::move(client.requested_permissions) : eclipse_api::legacy_client_permissions();
+      const auto uuid = add_authorized_client(client.name, std::move(client.cert), std::move(client.platform), std::move(permissions));
+      tree.put("root.paired", uuid.empty() ? 0 : 1);
+      if (!uuid.empty()) {
+        BOOST_LOG(info) << "Audit: paired client ["sv << uuid << "] as ["sv << client.name << ']';
+      }
     } else {
       tree.put("root.paired", 0);
     }
@@ -875,13 +1078,14 @@ namespace nvhttp {
     BOOST_LOG(debug) << "DESTINATION :: "sv << request->path;
 
     for (auto &[name, val] : request->header) {
-      BOOST_LOG(debug) << name << " -- " << val;
+      BOOST_LOG(debug) << name << " -- " << (boost::iequals(name, "Authorization") ? "CREDENTIALS REDACTED" : val);
     }
 
     BOOST_LOG(debug) << " [--] "sv;
 
     for (auto &[name, val] : request->parse_query_string()) {
-      BOOST_LOG(debug) << name << " -- " << val;
+      const bool sensitive = boost::iequals(name, "rikey") || boost::iequals(name, "rikeyid") || boost::iequals(name, "clientcert") || boost::iequals(name, "clientpairingsecret") || boost::iequals(name, "clientchallenge") || boost::iequals(name, "serverchallengeresp");
+      BOOST_LOG(debug) << name << " -- " << (sensitive ? "CREDENTIALS REDACTED" : val);
     }
 
     BOOST_LOG(debug) << " [--] "sv;
@@ -952,8 +1156,54 @@ namespace nvhttp {
         sess.async_insert_pin.salt = get_arg(args, "salt");
         sess.async_insert_pin.device_name = get_arg(args, "devicename");
         sess.async_insert_pin.address = net::addr_to_normalized_string(request->remote_endpoint().address());
+        sess.client.platform = get_arg(args, "eclipsePlatform", "").substr(0, 64);
+        bool invalid_eclipse_permission = false;
+        if (const auto scopes = args.find("eclipseScopes"); scopes != args.end()) {
+          sess.client.requested_eclipse_permissions = true;
+          sess.client.requested_permissions.scopes.clear();
+          std::stringstream values {scopes->second};
+          std::string scope;
+          while (std::getline(values, scope, ',')) {
+            if (eclipse_api::is_known_scope(scope)) {
+              sess.client.requested_permissions.scopes.emplace(std::move(scope));
+            } else if (!scope.empty()) {
+              invalid_eclipse_permission = true;
+            }
+          }
+        }
+        if (const auto inputs = args.find("eclipseInput"); inputs != args.end()) {
+          sess.client.requested_eclipse_permissions = true;
+          sess.client.requested_permissions.input = {};
+          sess.client.requested_permissions.input.keyboard = false;
+          sess.client.requested_permissions.input.mouse = false;
+          sess.client.requested_permissions.input.controller = false;
+          sess.client.requested_permissions.input.touch = false;
+          sess.client.requested_permissions.input.pen = false;
+          std::stringstream values {inputs->second};
+          std::string input_class;
+          while (std::getline(values, input_class, ',')) {
+            if (input_class == "keyboard") {
+              sess.client.requested_permissions.input.keyboard = true;
+            } else if (input_class == "mouse") {
+              sess.client.requested_permissions.input.mouse = true;
+            } else if (input_class == "controller") {
+              sess.client.requested_permissions.input.controller = true;
+            } else if (input_class == "touch") {
+              sess.client.requested_permissions.input.touch = true;
+            } else if (input_class == "pen") {
+              sess.client.requested_permissions.input.pen = true;
+            } else if (!input_class.empty()) {
+              invalid_eclipse_permission = true;
+            }
+          }
+        }
+        if (invalid_eclipse_permission) {
+          tree.put("root.paired", 0);
+          tree.put("root.<xmlattr>.status_code", 400);
+          tree.put("root.<xmlattr>.status_message", "Pairing request contains an unknown Eclipse permission");
+          return;
+        }
 
-        BOOST_LOG(debug) << sess.client.cert;
         const bool pin_stdin = config::sunshine.flags[config::flag::PIN_STDIN];
         if (!pin_stdin) {
           sess.async_insert_pin.response = response;
@@ -1145,6 +1395,9 @@ namespace nvhttp {
     // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
       tree.put("root.mac", platf::get_mac_address(net::addr_to_normalized_string(local_endpoint.address())));
+      tree.put("root.EclipseApiVersion", eclipse_api::API_VERSION);
+      tree.put("root.EclipseCapabilities", "client-permissions,catalog-v2,session-ids,structured-errors");
+      tree.put("root.EclipseApiPort", net::map_port(PORT_HTTPS));
     } else {
       tree.put("root.mac", "00:00:00:00:00:00");
     }
@@ -1191,6 +1444,17 @@ namespace nvhttp {
       named_cert_node["name"] = named_cert.name;
       named_cert_node["uuid"] = named_cert.uuid;
       named_cert_node["enabled"] = named_cert.enabled;
+      named_cert_node["platform"] = named_cert.platform;
+      named_cert_node["expires_at"] = named_cert.permissions.expires_at;
+      named_cert_node["scopes"] = named_cert.permissions.scopes;
+      named_cert_node["allowed_apps"] = named_cert.permissions.allowed_apps;
+      named_cert_node["input"] = {
+        {"keyboard", named_cert.permissions.input.keyboard},
+        {"mouse", named_cert.permissions.input.mouse},
+        {"controller", named_cert.permissions.input.controller},
+        {"touch", named_cert.permissions.input.touch},
+        {"pen", named_cert.permissions.input.pen},
+      };
       named_cert_nodes.push_back(named_cert_node);
     }
 
@@ -1218,14 +1482,29 @@ namespace nvhttp {
 
     auto &apps = tree.add_child("root", pt::ptree {});
 
-    apps.put("<xmlattr>.status_code", 200);
+    const auto client = verified_client(request);
+    if (!client || !scope_allowed(*client, "catalog.read")) {
+      apps.put("<xmlattr>.status_code", 403);
+      apps.put("<xmlattr>.status_message", "Client certificate lacks catalog.read permission");
+      return;
+    }
 
-    for (auto &proc : proc::proc.get_apps()) {
+    apps.put("<xmlattr>.status_code", 200);
+    const bool include_eclipse_fields = request->parse_query_string().contains("eclipseApiVersion");
+
+    const auto catalog = proc::catalog_snapshot();
+    for (const auto &app_context : catalog.apps) {
+      if (!app_allowed(*client, app_context.uuid)) {
+        continue;
+      }
       pt::ptree app;
 
       app.put("IsHdrSupported"s, video::active_hevc_mode >= 3 ? 1 : 0);
-      app.put("AppTitle"s, proc.name);
-      app.put("ID", proc.id);
+      app.put("AppTitle"s, app_context.name);
+      app.put("ID", app_context.id);
+      if (include_eclipse_fields) {
+        app.put("IsAppCollectorGame", app_context.eclipse_metadata.value("kind", "unknown") == "game" ? 1 : 0);
+      }
 
       apps.push_back(std::make_pair("App", std::move(app)));
     }
@@ -1274,6 +1553,15 @@ namespace nvhttp {
     }
 
     auto appid = util::from_view(get_arg(args, "appid"));
+    const auto client = verified_client(request);
+    const auto catalog = proc::catalog_snapshot();
+    const auto app = std::ranges::find(catalog.apps, std::to_string(appid), &proc::ctx_t::id);
+    if (!client || !scope_allowed(*client, "stream.launch") || (app != catalog.apps.end() && !app_allowed(*client, app->uuid)) || (app == catalog.apps.end() && !client->permissions.allowed_apps.empty())) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client certificate lacks permission to launch this application");
+      return;
+    }
 
     auto current_appid = proc::proc.running();
     if (current_appid > 0) {
@@ -1285,7 +1573,7 @@ namespace nvhttp {
     }
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    auto launch_session = make_launch_session(host_audio, args);
+    auto launch_session = make_launch_session(host_audio, args, *client);
 
     if (rtsp_stream::session_count() == 0) {
       // The display should be restored in case something fails as there are no other sessions.
@@ -1331,6 +1619,33 @@ namespace nvhttp {
       }
     }
 
+    {
+      std::lock_guard lock {logical_session_mutex};
+      logical_session = logical_session_t {
+        .id = launch_session->session_id,
+        .client_uuid = client->uuid,
+        .app_uuid = launch_session->app_uuid,
+        .legacy_app_id = launch_session->appid,
+        .started_at = std::chrono::system_clock::now(),
+        .width = launch_session->width,
+        .height = launch_session->height,
+        .fps = launch_session->fps,
+        .hdr = launch_session->enable_hdr,
+      };
+    }
+
+    if (!rtsp_stream::launch_session_raise(launch_session)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Another stream launch is already pending");
+      if (appid > 0) {
+        proc::proc.terminate();
+      }
+      std::lock_guard lock {logical_session_mutex};
+      logical_session.reset();
+      return;
+    }
+
     tree.put("root.<xmlattr>.status_code", 200);
     tree.put(
       "root.sessionUrl0",
@@ -1342,8 +1657,6 @@ namespace nvhttp {
       )
     );
     tree.put("root.gamesession", 1);
-
-    rtsp_stream::launch_session_raise(launch_session);
 
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
@@ -1371,6 +1684,14 @@ namespace nvhttp {
       response->write(data.str());
       response->close_connection_after_response = true;
     });
+
+    const auto client = verified_client(request);
+    if (!client || !scope_allowed(*client, "stream.launch")) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client certificate lacks stream.launch permission");
+      return;
+    }
 
     auto current_appid = proc::proc.running();
     if (current_appid == 0) {
@@ -1400,7 +1721,52 @@ namespace nvhttp {
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
-    const auto launch_session = make_launch_session(host_audio, args);
+    std::string logical_session_id;
+    std::string logical_app_uuid;
+    std::string logical_client_uuid;
+    {
+      std::lock_guard lock {logical_session_mutex};
+      if (logical_session && logical_session->client_uuid != client->uuid && !scope_allowed(*client, "host.control")) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 403);
+        tree.put("root.<xmlattr>.status_message", "Only the owning client may resume this session");
+        return;
+      }
+      if (logical_session) {
+        logical_session_id = logical_session->id;
+        logical_app_uuid = logical_session->app_uuid;
+        logical_client_uuid = logical_session->client_uuid;
+      }
+    }
+    if (!logical_app_uuid.empty() && !app_allowed(*client, logical_app_uuid)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client certificate is not allowed to resume this application");
+      return;
+    }
+    const auto launch_session = make_launch_session(host_audio, args, *client, std::move(logical_session_id));
+    if (!logical_app_uuid.empty()) {
+      launch_session->app_uuid = std::move(logical_app_uuid);
+    }
+    if (!logical_client_uuid.empty()) {
+      launch_session->client_uuid = std::move(logical_client_uuid);
+    }
+    {
+      std::lock_guard lock {logical_session_mutex};
+      if (!logical_session) {
+        logical_session = logical_session_t {
+          .id = launch_session->session_id,
+          .client_uuid = client->uuid,
+          .app_uuid = launch_session->app_uuid,
+          .legacy_app_id = current_appid,
+          .started_at = std::chrono::system_clock::now(),
+          .width = launch_session->width,
+          .height = launch_session->height,
+          .fps = launch_session->fps,
+          .hdr = launch_session->enable_hdr,
+        };
+      }
+    }
 
     if (no_active_sessions) {
       // We want to prepare display only if there are no active sessions at
@@ -1432,6 +1798,13 @@ namespace nvhttp {
       return;
     }
 
+    if (!rtsp_stream::launch_session_raise(launch_session)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Another stream launch is already pending");
+      return;
+    }
+
     tree.put("root.<xmlattr>.status_code", 200);
     tree.put(
       "root.sessionUrl0",
@@ -1443,8 +1816,6 @@ namespace nvhttp {
       )
     );
     tree.put("root.resume", 1);
-
-    rtsp_stream::launch_session_raise(launch_session);
   }
 
   /**
@@ -1465,6 +1836,14 @@ namespace nvhttp {
       response->close_connection_after_response = true;
     });
 
+    const auto client = verified_client(request);
+    if (!client || !scope_allowed(*client, "host.control")) {
+      tree.put("root.cancel", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client certificate lacks host.control permission");
+      return;
+    }
+
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
 
@@ -1476,6 +1855,8 @@ namespace nvhttp {
 
     // The config needs to be reverted regardless of whether "proc::proc.terminate()" was called or not.
     display_device::revert_configuration();
+    std::lock_guard lock {logical_session_mutex};
+    logical_session.reset();
   }
 
   /**
@@ -1488,13 +1869,326 @@ namespace nvhttp {
     print_req<SunshineHTTPS>(request);
 
     auto args = request->parse_query_string();
-    auto app_image = proc::proc.get_app_image((int) util::from_view(get_arg(args, "appid")));
+    const auto app_id = static_cast<int>(util::from_view(get_arg(args, "appid")));
+    const auto client = verified_client(request);
+    const auto catalog = proc::catalog_snapshot();
+    const auto app = std::ranges::find(catalog.apps, std::to_string(app_id), &proc::ctx_t::id);
+    if (!client || !scope_allowed(*client, "catalog.read") || app == catalog.apps.end() || !app_allowed(*client, app->uuid)) {
+      response->write(SimpleWeb::StatusCode::client_error_forbidden);
+      return;
+    }
+    auto app_image = proc::validate_app_image_path(app->image_path);
 
     std::ifstream in(app_image, std::ios::binary);
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "image/png");
     response->write(SimpleWeb::StatusCode::success_ok, in, headers);
     response->close_connection_after_response = true;
+  }
+
+  /**
+   * @brief Send a versioned Eclipse JSON response.
+   *
+   * @param response HTTPS response to populate.
+   * @param status HTTP status code.
+   * @param body JSON response body.
+   */
+  void send_eclipse_response(const resp_https_t &response, const SimpleWeb::StatusCode status, nlohmann::json body) {
+    body["schemaVersion"] = eclipse_api::API_VERSION;
+    const SimpleWeb::CaseInsensitiveMultimap headers {
+      {"Content-Type", "application/json"},
+      {"Cache-Control", "no-store"},
+    };
+    response->write(status, body.dump(), headers);
+    response->close_connection_after_response = true;
+  }
+
+  /**
+   * @brief Send a stable structured Eclipse API error.
+   *
+   * @param response HTTPS response to populate.
+   * @param status HTTP status code.
+   * @param code Stable machine-readable error code.
+   * @param message Human-readable error description.
+   */
+  void send_eclipse_error(const resp_https_t &response, const SimpleWeb::StatusCode status, const std::string_view code, const std::string_view message) {
+    send_eclipse_response(response, status, {
+                                              {"error", {
+                                                          {"code", code},
+                                                          {"message", message},
+                                                        }},
+                                            });
+  }
+
+  /**
+   * @brief Authenticate and authorize one Eclipse API request.
+   *
+   * @param response HTTPS response used for authorization errors.
+   * @param request Paired-client HTTPS request.
+   * @param scope Required scope, or empty when pairing alone is sufficient.
+   * @return Authenticated client identity, or no value after sending an error.
+   */
+  std::optional<verified_client_t> authorize_eclipse_request(const resp_https_t &response, const req_https_t &request, const std::string_view scope = {}) {
+    auto client = verified_client(request);
+    if (!client) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_unauthorized, "authentication_required", "Reconnect using an enabled paired client certificate");
+      return std::nullopt;
+    }
+    if (!scope.empty() && !scope_allowed(*client, scope)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", std::format("Client certificate lacks {} permission", scope));
+      return std::nullopt;
+    }
+    return client;
+  }
+
+  /**
+   * @brief Convert configured application metadata to Eclipse Catalog V2 JSON.
+   *
+   * @param app Runtime application context.
+   * @return Stable application resource.
+   */
+  nlohmann::json eclipse_app_json(const proc::ctx_t &app) {
+    const auto &metadata = app.eclipse_metadata;
+    const auto kind = metadata.value("kind", "unknown");
+    static const std::set<std::string, std::less<>> kinds {"game", "desktop", "tool", "workspace", "unknown"};
+    const auto normalized_kind = kinds.contains(kind) ? kind : "unknown";
+    nlohmann::json classification = metadata.value("classification", nlohmann::json::object());
+    if (!classification.is_object()) {
+      classification = nlohmann::json::object();
+    }
+    classification["source"] = classification.value("source", metadata.contains("kind") ? "user" : "unknown");
+    classification["confidence"] = classification.value("confidence", metadata.contains("kind") ? 1.0 : 0.0);
+
+    return {
+      {"uuid", app.uuid},
+      {"legacyId", std::stoi(app.id)},
+      {"name", app.name},
+      {"kind", normalized_kind},
+      {"classification", std::move(classification)},
+      {"tags", metadata.value("tags", nlohmann::json::array())},
+      {"description", metadata.value("description", "")},
+      {"source", metadata.value("source", "unknown")},
+      {"publisher", metadata.value("publisher", "")},
+      {"installed", metadata.value("installed", true)},
+      {"updateAvailable", metadata.value("updateAvailable", false)},
+      {"hdr", metadata.value("hdr", video::active_hevc_mode >= 3)},
+      {"inputRequirements", metadata.value("inputRequirements", nlohmann::json::array())},
+      {"launchProfiles", metadata.value("launchProfiles", nlohmann::json::array())},
+      {"assets", metadata.value("assets", nlohmann::json::object())},
+      {"displayProfileId", metadata.value("displayProfileId", "")},
+      {"streamProfileId", metadata.value("streamProfileId", "")},
+      {"sandboxProfileId", metadata.value("sandboxProfileId", "")},
+    };
+  }
+
+  /**
+   * @brief Serialize an immutable stream-session snapshot.
+   *
+   * @param session Session snapshot.
+   * @return Eclipse session resource.
+   */
+  nlohmann::json eclipse_session_json(const rtsp_stream::session_info_t &session) {
+    const auto started_at = std::chrono::duration_cast<std::chrono::milliseconds>(session.started_at.time_since_epoch()).count();
+    return {
+      {"id", session.id},
+      {"ownerClientUuid", session.client_uuid},
+      {"appUuid", session.app_uuid},
+      {"legacyAppId", session.legacy_app_id},
+      {"state", session.state},
+      {"startedAt", started_at},
+      {"width", session.width},
+      {"height", session.height},
+      {"refreshRate", session.fps},
+      {"hdr", session.hdr},
+    };
+  }
+
+  /**
+   * @brief Return active and resumable logical session snapshots.
+   *
+   * @return Immutable logical-session views, including disconnected resumable application state.
+   */
+  std::vector<rtsp_stream::session_info_t> eclipse_session_snapshots() {
+    auto sessions = rtsp_stream::sessions();
+    std::lock_guard lock {logical_session_mutex};
+    if (!logical_session) {
+      return sessions;
+    }
+    const bool active = std::ranges::any_of(sessions, [&](const auto &session) {
+      return session.id == logical_session->id;
+    });
+    if (!active && proc::proc.running() > 0) {
+      sessions.push_back({
+        .id = logical_session->id,
+        .client_uuid = logical_session->client_uuid,
+        .app_uuid = logical_session->app_uuid,
+        .legacy_app_id = logical_session->legacy_app_id,
+        .state = "disconnected",
+        .started_at = logical_session->started_at,
+        .width = logical_session->width,
+        .height = logical_session->height,
+        .fps = logical_session->fps,
+        .hdr = logical_session->hdr,
+      });
+    } else if (!active) {
+      logical_session.reset();
+    }
+    return sessions;
+  }
+
+  /**
+   * @brief Return Eclipse API capability and caller-policy metadata.
+   */
+  void eclipse_capabilities(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request);
+    if (!client) {
+      return;
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {
+                                                                         {"apiVersion", eclipse_api::API_VERSION},
+                                                                         {"capabilities", eclipse_api::CAPABILITIES},
+                                                                         {"client", {
+                                                                                      {"uuid", client->uuid},
+                                                                                      {"name", client->name},
+                                                                                      {"scopes", client->permissions.scopes},
+                                                                                      {"allowedApps", client->permissions.allowed_apps},
+                                                                                      {"expiresAt", client->permissions.expires_at},
+                                                                                    }},
+                                                                       });
+  }
+
+  /**
+   * @brief Return Eclipse Catalog V2 resources visible to the caller.
+   */
+  void eclipse_apps(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "catalog.read");
+    if (!client) {
+      return;
+    }
+    const auto catalog = proc::catalog_snapshot();
+    std::optional<std::uint64_t> since;
+    const auto args = request->parse_query_string();
+    if (const auto value = args.find("since"); value != args.end()) {
+      try {
+        std::size_t consumed {};
+        since = std::stoull(value->second, &consumed);
+        if (consumed != value->second.size()) {
+          throw std::invalid_argument("trailing characters");
+        }
+      } catch (const std::exception &) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "since must be an unsigned catalog revision");
+        return;
+      }
+    }
+
+    const bool changed = !since || *since != catalog.revision;
+    nlohmann::json apps = nlohmann::json::array();
+    if (changed) {
+      for (const auto &app : catalog.apps) {
+        if (app_allowed(*client, app.uuid)) {
+          apps.emplace_back(eclipse_app_json(app));
+        }
+      }
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {
+                                                                         {"revision", catalog.revision},
+                                                                         {"changed", changed},
+                                                                         {"fullSnapshot", changed},
+                                                                         {"apps", std::move(apps)},
+                                                                       });
+  }
+
+  /**
+   * @brief Return active Eclipse session resources visible to the caller.
+   */
+  void eclipse_sessions(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "session.control");
+    if (!client) {
+      return;
+    }
+    const bool administer = scope_allowed(*client, "host.control");
+    nlohmann::json sessions = nlohmann::json::array();
+    for (const auto &session : eclipse_session_snapshots()) {
+      if (administer || session.client_uuid == client->uuid) {
+        sessions.emplace_back(eclipse_session_json(session));
+      }
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"sessions", std::move(sessions)}});
+  }
+
+  /**
+   * @brief Return one active Eclipse session resource.
+   */
+  void eclipse_session(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "session.control");
+    if (!client) {
+      return;
+    }
+    const auto session_id = request->path_match[1].str();
+    const bool administer = scope_allowed(*client, "host.control");
+    for (const auto &session : eclipse_session_snapshots()) {
+      if (session.id == session_id && (administer || session.client_uuid == client->uuid)) {
+        send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"session", eclipse_session_json(session)}});
+        return;
+      }
+    }
+    send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "session_not_found", "Session does not exist or is not visible to this client");
+  }
+
+  /**
+   * @brief Disconnect one logical session without stopping its host application.
+   */
+  void eclipse_disconnect_session(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "session.control");
+    if (!client) {
+      return;
+    }
+    const auto session_id = request->path_match[1].str();
+    const auto owner = scope_allowed(*client, "host.control") ? std::string_view {} : std::string_view {client->uuid};
+    const auto sessions = eclipse_session_snapshots();
+    const bool visible = std::ranges::any_of(sessions, [&](const auto &session) {
+      return session.id == session_id && (owner.empty() || session.client_uuid == owner);
+    });
+    if (!visible) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "session_not_found", "Session does not exist or is not owned by this client");
+      return;
+    }
+    static_cast<void>(rtsp_stream::terminate_session(session_id, owner));
+    BOOST_LOG(info) << "Audit: client ["sv << client->uuid << "] disconnected session ["sv << session_id << ']';
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"disconnected", true}, {"sessionId", session_id}});
+  }
+
+  /**
+   * @brief Stop one logical session and its host application.
+   */
+  void eclipse_stop_session(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "session.control");
+    if (!client) {
+      return;
+    }
+    const auto session_id = request->path_match[1].str();
+    const auto owner = scope_allowed(*client, "host.control") ? std::string_view {} : std::string_view {client->uuid};
+    const auto sessions = eclipse_session_snapshots();
+    const bool visible = std::ranges::any_of(sessions, [&](const auto &session) {
+      return session.id == session_id && (owner.empty() || session.client_uuid == owner);
+    });
+    if (!visible) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "session_not_found", "Session does not exist or is not owned by this client");
+      return;
+    }
+    static_cast<void>(rtsp_stream::terminate_session(session_id, owner));
+    {
+      std::lock_guard lock {logical_session_mutex};
+      if (logical_session && logical_session->id == session_id && (owner.empty() || logical_session->client_uuid == owner)) {
+        if (proc::proc.running() > 0) {
+          proc::proc.terminate();
+        }
+        logical_session.reset();
+      }
+    }
+    display_device::revert_configuration();
+    BOOST_LOG(info) << "Audit: client ["sv << client->uuid << "] stopped session ["sv << session_id << ']';
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"stopped", true}, {"sessionId", session_id}});
   }
 
   void setup(const std::string &pkey, const std::string &cert) {
@@ -1537,7 +2231,7 @@ namespace nvhttp {
     http_server_t http_server;
 
     // Verify certificates after establishing connection
-    https_server.verify = [](SSL *ssl) {
+    https_server.verify = [](SSL *ssl, const boost::asio::ip::tcp::endpoint &endpoint) {
       crypto::x509_t x509 {
 #if OPENSSL_VERSION_MAJOR >= 3
         SSL_get1_peer_certificate(ssl)
@@ -1568,16 +2262,23 @@ namespace nvhttp {
         return verified;
       }
 
-      // Check if this client is enabled
       auto pem = crypto::pem(x509);
-      auto [enabled, client_name] = get_client_status(pem);
-      if (!enabled) {
+      const auto client = std::ranges::find(client_root.named_devices, pem, &named_cert_t::cert);
+      if (client == client_root.named_devices.end() || !client->enabled || permissions_expired(client->permissions)) {
         BOOST_LOG(info) << "Client is disabled -- denied"sv;
         return verified;
       }
 
-      last_verified_client_cert = pem;
-      last_verified_client_name = client_name;
+      const auto key = endpoint_key(endpoint);
+      if (!verified_clients.contains(key) && verified_clients.size() >= MAX_VERIFIED_CLIENT_CONNECTIONS) {
+        verified_clients.erase(verified_clients.begin());
+      }
+      verified_clients[key] = {
+        .uuid = client->uuid,
+        .name = client->name,
+        .cert = pem,
+        .permissions = client->permissions,
+      };
       verified = 1;
 
       return verified;
@@ -1612,6 +2313,12 @@ namespace nvhttp {
       resume(host_audio, resp, req);
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
+    https_server.resource["^/eclipse/v1/capabilities$"]["GET"] = eclipse_capabilities;
+    https_server.resource["^/eclipse/v1/apps$"]["GET"] = eclipse_apps;
+    https_server.resource["^/eclipse/v1/sessions$"]["GET"] = eclipse_sessions;
+    https_server.resource["^/eclipse/v1/sessions/([0-9a-fA-F-]+)$"]["GET"] = eclipse_session;
+    https_server.resource["^/eclipse/v1/sessions/([0-9a-fA-F-]+)/disconnect$"]["POST"] = eclipse_disconnect_session;
+    https_server.resource["^/eclipse/v1/sessions/([0-9a-fA-F-]+)/stop$"]["POST"] = eclipse_stop_session;
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);
@@ -1657,40 +2364,146 @@ namespace nvhttp {
   }
 
   void erase_all_clients() {
-    std::lock_guard lock {client_auth_mutex};
-    client_root = {};
-    cert_chain.clear();
-    save_state();
+    bool erased = false;
+    {
+      std::lock_guard lock {client_auth_mutex};
+      auto previous_clients = client_root;
+      client_root = {};
+      cert_chain.clear();
+      verified_clients.clear();
+      if (!save_state()) {
+        client_root = std::move(previous_clients);
+        rebuild_client_cert_chain();
+      } else {
+        erased = true;
+      }
+    }
+    if (erased) {
+      rtsp_stream::terminate_sessions();
+    }
   }
 
   bool unpair_client(const std::string_view uuid) {
-    std::lock_guard lock {client_auth_mutex};
+    std::string certificate;
     bool removed = false;
-    for (auto it = client_root.named_devices.begin(); it != client_root.named_devices.end();) {
-      if ((*it).uuid == uuid) {
-        it = client_root.named_devices.erase(it);
-        removed = true;
-      } else {
-        ++it;
+    {
+      std::lock_guard lock {client_auth_mutex};
+      const auto previous_clients = client_root;
+      for (auto it = client_root.named_devices.begin(); it != client_root.named_devices.end();) {
+        if ((*it).uuid == uuid) {
+          certificate = it->cert;
+          it = client_root.named_devices.erase(it);
+          removed = true;
+        } else {
+          ++it;
+        }
+      }
+
+      rebuild_client_cert_chain();
+      std::erase_if(verified_clients, [&](const auto &entry) {
+        return entry.second.uuid == uuid;
+      });
+      if (!save_state()) {
+        client_root = previous_clients;
+        rebuild_client_cert_chain();
+        removed = false;
       }
     }
-
-    rebuild_client_cert_chain();
-    save_state();
+    if (removed) {
+      rtsp_stream::terminate_sessions_by_cert(certificate);
+    }
     return removed;
   }
 
   bool set_client_enabled(const std::string_view uuid, bool enabled) {
-    std::lock_guard lock {client_auth_mutex};
-    for (auto &named_cert : client_root.named_devices) {
-      if (named_cert.uuid == uuid) {
-        named_cert.enabled = enabled;
-        rebuild_client_cert_chain();
-        save_state();
-        return true;
+    client_update_t update;
+    update.enabled = enabled;
+    return update_client(uuid, std::move(update));
+  }
+
+  bool update_client(const std::string_view uuid, client_update_t update) {
+    if (update.permissions && (update.permissions->expires_at < 0 || std::ranges::any_of(update.permissions->scopes, [](const auto &scope) {
+                                 return !eclipse_api::is_known_scope(scope);
+                               }) ||
+                               std::ranges::any_of(update.permissions->allowed_apps, [](const auto &app_uuid) {
+                                 return !uuid_util::is_valid(app_uuid);
+                               }))) {
+      return false;
+    }
+
+    if (update.certificate) {
+      *update.certificate = canonical_certificate_pem(*update.certificate);
+      if (update.certificate->empty()) {
+        return false;
       }
     }
-    return false;
+
+    std::string previous_certificate;
+    bool terminate_sessions = false;
+    {
+      std::lock_guard lock {client_auth_mutex};
+      const auto client = std::ranges::find(client_root.named_devices, uuid, &named_cert_t::uuid);
+      if (client == client_root.named_devices.end()) {
+        return false;
+      }
+      if (update.certificate && std::ranges::any_of(client_root.named_devices, [&](const auto &named_cert) {
+            return named_cert.uuid != uuid && named_cert.cert == *update.certificate;
+          })) {
+        return false;
+      }
+
+      previous_certificate = client->cert;
+      const auto previous_client = *client;
+      if (update.enabled) {
+        client->enabled = *update.enabled;
+        terminate_sessions = !*update.enabled;
+      }
+      if (update.permissions) {
+        client->permissions = std::move(*update.permissions);
+        terminate_sessions = true;
+        BOOST_LOG(info) << "Audit: changed permissions for client ["sv << uuid << ']';
+      }
+      if (update.certificate && client->cert != *update.certificate) {
+        client->cert = std::move(*update.certificate);
+        terminate_sessions = true;
+        BOOST_LOG(info) << "Audit: rotated certificate for client ["sv << uuid << ']';
+      }
+
+      rebuild_client_cert_chain();
+      std::erase_if(verified_clients, [&](const auto &entry) {
+        return entry.second.uuid == uuid;
+      });
+      if (!save_state()) {
+        *client = previous_client;
+        rebuild_client_cert_chain();
+        return false;
+      }
+    }
+    if (terminate_sessions) {
+      rtsp_stream::terminate_sessions_by_cert(previous_certificate);
+    }
+    return true;
+  }
+
+  std::optional<eclipse_api::client_permissions_t> get_client_permissions(const std::string_view uuid) {
+    std::lock_guard lock {client_auth_mutex};
+    const auto client = std::ranges::find(client_root.named_devices, uuid, &named_cert_t::uuid);
+    if (client == client_root.named_devices.end()) {
+      return std::nullopt;
+    }
+    return client->permissions;
+  }
+
+  bool set_client_permissions(const std::string_view uuid, eclipse_api::client_permissions_t permissions) {
+    client_update_t update;
+    update.permissions = std::move(permissions);
+    return update_client(uuid, std::move(update));
+  }
+
+  bool rotate_client_certificate(const std::string_view uuid, std::string cert) {
+    client_update_t update;
+    update.certificate = std::move(cert);
+    return update_client(uuid, std::move(update));
   }
 
   /**
@@ -1713,7 +2526,7 @@ namespace nvhttp {
     const client_t &client = client_root;
     for (const auto &named_cert : client.named_devices) {
       if (named_cert.cert == cert_pem) {
-        return {named_cert.enabled, named_cert.name};
+        return {named_cert.enabled && !permissions_expired(named_cert.permissions), named_cert.name};
       }
     }
     return {true, {}};
@@ -1725,6 +2538,7 @@ namespace nvhttp {
       std::lock_guard lock {client_auth_mutex};
       client_root = {};
       cert_chain.clear();
+      verified_clients.clear();
     }
 
     std::string add_client(const std::string &name, std::string cert, bool enabled) {
@@ -1733,6 +2547,10 @@ namespace nvhttp {
         set_client_enabled(uuid, false);
       }
       return uuid;
+    }
+
+    std::optional<eclipse_api::client_permissions_t> client_permissions(const std::string_view uuid) {
+      return get_client_permissions(uuid);
     }
 
     bool authorize_client_certificate(const std::string_view cert) {

@@ -33,6 +33,11 @@
             <x :size="18" class="icon"></x>
           </button>
         </div>
+        <div v-if="selectedPairing" class="mt-3 small text-body-secondary">
+          <div><b>{{ $t('pin.requested_platform') }}:</b> {{ selectedPairing.platform || $t('pin.unknown_platform') }}</div>
+          <div><b>{{ $t('pin.requested_permissions') }}:</b> {{ selectedPairing.requested_scopes.length ? selectedPairing.requested_scopes.join(', ') : $t('pin.legacy_permissions') }}</div>
+          <div v-if="selectedPairing.requested_inputs.length"><b>{{ $t('pin.requested_input') }}:</b> {{ selectedPairing.requested_inputs.join(', ') }}</div>
+        </div>
         <div class="input-group mt-2">
           <span class="input-group-text">
             <hash :size="18" class="icon"></hash>
@@ -90,6 +95,14 @@
         selectedPairingId: '',
         status: null,
       };
+    },
+    computed: {
+      /**
+       * Return pairing request selected for operator review.
+       */
+      selectedPairing() {
+        return this.pendingPairings.find((pairing) => pairing.id === this.selectedPairingId) || null;
+      },
     },
     mounted() {
       this.loadPendingPairings();

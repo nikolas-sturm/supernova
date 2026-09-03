@@ -5,6 +5,82 @@ Sunshine has a RESTful API which can be used to interact with the service.
 Unless otherwise specified, authentication is required for all API calls. You can authenticate using
 basic authentication with the admin username and password.
 
+## Eclipse API v1
+
+The Eclipse extension API is served from the GameStream HTTPS port, normally `47984`, under
+`/eclipse/v1`. It authenticates with an enabled paired-client certificate. Sunshine Web UI
+credentials are not accepted. Existing GameStream routes and RTSP behavior remain available for
+stock Moonlight clients.
+
+Paired HTTPS `/serverinfo` responses advertise `EclipseApiVersion`, `EclipseCapabilities`, and
+`EclipseApiPort`. These fields are intentionally omitted from unauthenticated HTTP discovery.
+
+Eclipse API errors use HTTP status codes and this stable envelope:
+
+```json
+{
+  "schemaVersion": 1,
+  "error": {
+    "code": "permission_denied",
+    "message": "Client certificate lacks catalog.read permission"
+  }
+}
+```
+
+Supported certificate-bound scopes are `catalog.read`, `stream.launch`, `session.control`,
+`telemetry.read`, `display.read`, `display.manage`, `virtual-display.manage`,
+`peripheral.forward`, `sandbox.manage`, and `host.control`. Paired clients created before this
+schema receive all scopes and input classes to preserve existing behavior. Explicit Eclipse
+pairing requests may request fewer scopes with `eclipseScopes` and input classes with
+`eclipseInput`. Administrators can review requested platform and scopes before entering the PIN.
+
+Application configuration specific to Eclipse is stored under a versioned `x-eclipse` object.
+Missing stable identities are generated once and persisted without changing legacy Moonlight IDs:
+
+```json
+{
+  "name": "Example",
+  "x-eclipse": {
+    "schemaVersion": 1,
+    "uuid": "0d818e2c-4232-41a4-949b-2fdd100c0b26",
+    "legacyId": 123,
+    "kind": "game",
+    "tags": ["rpg", "controller"],
+    "source": "steam",
+    "publisher": "Example Studio"
+  }
+}
+```
+
+### GET /eclipse/v1/capabilities
+
+Returns API capabilities, paired-client UUID, granted scopes, application allowlist, and expiry.
+
+### GET /eclipse/v1/apps
+
+Requires `catalog.read`. Returns Catalog V2 metadata filtered by client application allowlist.
+Pass `since=<revision>` for a conditional incremental check. An unchanged revision returns an
+empty application array with `changed: false`; stale revisions receive a full snapshot.
+
+### GET /eclipse/v1/sessions
+
+Requires `session.control`. Returns caller-owned active or disconnected resumable sessions.
+Clients with `host.control` can see every session.
+
+### GET /eclipse/v1/sessions/{id}
+
+Requires `session.control`. Returns one visible session.
+
+### POST /eclipse/v1/sessions/{id}/disconnect
+
+Requires `session.control`. Disconnects transport streams while leaving host application available
+for GameStream resume.
+
+### POST /eclipse/v1/sessions/{id}/stop
+
+Requires `session.control`. Stops transport streams and owning host application. Cross-client
+control additionally requires `host.control`.
+
 ## CSRF Protection
 
 State-changing API endpoints (POST, DELETE) are protected against Cross-Site Request Forgery (CSRF) attacks.

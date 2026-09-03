@@ -14,6 +14,7 @@
 #include <vector>
 
 // local includes
+#include "eclipse_api.h"
 #include "platform/common.h"
 #include "thread_safe.h"
 
@@ -80,9 +81,10 @@ namespace input {
    *
    * @param mail Mailbox used to exchange messages with worker threads.
    * @param session_id Stable paired-client identity shared by launch and resume connections.
+   * @param permissions Input classes permitted for this paired client.
    * @return Shared input state bound to the stream mailbox.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id);
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, eclipse_api::input_permissions_t permissions = {});
 
 #ifdef SUNSHINE_TESTS
   namespace testing {

@@ -99,3 +99,16 @@ TEST(FileHandlerTests, ReadMissingFileTest) {
   // read missing file
   EXPECT_EQ(file_handler::read_file("non-existing-file.txt"), "");
 }
+
+TEST(FileHandlerTests, AtomicWriteReplacesCompleteFile) {
+  const auto test_dir = std::filesystem::temp_directory_path() / "sunshine_atomic_write_test";
+  const auto test_file = test_dir / "state.json";
+  std::filesystem::create_directories(test_dir);
+  ASSERT_EQ(file_handler::write_file(test_file.string().c_str(), "old"), 0);
+
+  EXPECT_EQ(file_handler::write_file_atomic(test_file.string().c_str(), "new complete contents"), 0);
+  EXPECT_EQ(file_handler::read_file(test_file.string().c_str()), "new complete contents");
+  EXPECT_FALSE(std::filesystem::exists(test_file.string() + ".tmp"));
+
+  std::filesystem::remove_all(test_dir);
+}

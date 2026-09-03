@@ -29,6 +29,7 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "eclipse_api.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -267,16 +268,19 @@ namespace input {
      *
      * @param touch_port_event Event carrying the active touch port.
      * @param feedback_queue Queue used for controller feedback.
+     * @param permissions Input classes permitted for this client.
      */
     input_t(
       safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event,
-      platf::feedback_queue_t feedback_queue
+      platf::feedback_queue_t feedback_queue,
+      eclipse_api::input_permissions_t permissions
     ):
         shortcutFlags {},
         gamepads(MAX_GAMEPADS),
         client_context {platf::allocate_client_input_context(platf_input)},
         touch_port_event {std::move(touch_port_event)},
         feedback_queue {std::move(feedback_queue)},
+        permissions {permissions},
         mouse_left_button_timeout {},
         touch_port {{0, 0, 0, 0}, 0, 0, 1.0f, 1.0f, 0, 0},
         accumulated_vscroll_delta {},
@@ -295,6 +299,8 @@ namespace input {
 
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;  ///< Touch port event.
     platf::feedback_queue_t feedback_queue;  ///< Queue used to deliver controller feedback to the platform backend.
+    eclipse_api::input_permissions_t permissions;  ///< Input classes permitted by paired-client policy.
+    std::mutex permissions_mutex;  ///< Protects policy replacement and packet authorization on resumed streams.
 
     std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
     std::mutex input_queue_lock;  ///< Input queue lock.
@@ -1737,6 +1743,41 @@ namespace input {
   }
 
   /**
+   * @brief Check whether client policy permits a validated protocol input packet.
+   *
+   * @param permissions Certificate-bound input permissions.
+   * @param magic Validated input packet magic.
+   * @return `true` when this packet class may reach host input dispatch.
+   */
+  bool input_packet_permitted(const eclipse_api::input_permissions_t &permissions, const std::uint32_t magic) {
+    switch (magic) {
+      case MOUSE_MOVE_REL_MAGIC_GEN5:
+      case MOUSE_MOVE_ABS_MAGIC:
+      case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
+      case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
+      case SCROLL_MAGIC_GEN5:
+      case SS_HSCROLL_MAGIC:
+        return permissions.mouse;
+      case KEY_DOWN_EVENT_MAGIC:
+      case KEY_UP_EVENT_MAGIC:
+      case UTF8_TEXT_EVENT_MAGIC:
+        return permissions.keyboard;
+      case MULTI_CONTROLLER_MAGIC_GEN5:
+      case SS_CONTROLLER_ARRIVAL_MAGIC:
+      case SS_CONTROLLER_TOUCH_MAGIC:
+      case SS_CONTROLLER_MOTION_MAGIC:
+      case SS_CONTROLLER_BATTERY_MAGIC:
+        return permissions.controller;
+      case SS_TOUCH_MAGIC:
+        return permissions.touch;
+      case SS_PEN_MAGIC:
+        return permissions.pen;
+      default:
+        return permissions.keyboard && permissions.mouse && permissions.controller && permissions.touch && permissions.pen;
+    }
+  }
+
+  /**
    * @brief Enumerates supported batch result options.
    */
   enum class batch_result_e {
@@ -2132,6 +2173,13 @@ namespace input {
       }
       return;
     }
+    {
+      std::lock_guard lock {input->permissions_mutex};
+      if (!input_packet_permitted(input->permissions, util::endian::little(header.magic))) {
+        BOOST_LOG(debug) << "Dropping input packet denied by paired-client policy"sv;
+        return;
+      }
+    }
 
     {
       std::lock_guard<std::mutex> lg(input->input_queue_lock);
@@ -2303,7 +2351,7 @@ namespace input {
   /**
    * @brief Allocate and initialize platform input state for a stream.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id) {
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, const eclipse_api::input_permissions_t permissions) {
     std::shared_ptr<input_t> input;
     bool resumed = false;
     {
@@ -2316,13 +2364,18 @@ namespace input {
       } else {
         input = std::make_shared<input_t>(
           mail->event<input::touch_port_t>(mail::touch_port),
-          mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback)
+          mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback),
+          permissions
         );
         state.inputs.try_emplace(std::move(session_id), input);
       }
     }
 
     if (resumed) {
+      {
+        std::lock_guard lock {input->permissions_mutex};
+        input->permissions = permissions;
+      }
       dispatch_input_task([input, mail = std::move(mail)]() {
         rebind_input(input, mail);
       });

@@ -5,12 +5,36 @@
 #pragma once
 
 // standard includes
+#include <cctype>
 #include <random>
+#include <string_view>
 
 /**
  * @brief UUID utilities.
  */
 namespace uuid_util {
+  /**
+   * @brief Validate canonical textual UUID syntax.
+   *
+   * @param value Candidate UUID text.
+   * @return `true` for 36 hexadecimal characters and canonical hyphen positions.
+   */
+  inline bool is_valid(const std::string_view value) {
+    if (value.size() != 36) {
+      return false;
+    }
+    for (std::size_t index = 0; index < value.size(); ++index) {
+      if (index == 8 || index == 13 || index == 18 || index == 23) {
+        if (value[index] != '-') {
+          return false;
+        }
+      } else if (!std::isxdigit(static_cast<unsigned char>(value[index]))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   /**
    * @brief UUID value exposed through multiple integer views.
    */

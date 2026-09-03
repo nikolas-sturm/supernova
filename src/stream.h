@@ -94,5 +94,12 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+    /**
+     * @brief Build an immutable Eclipse snapshot for a stream session.
+     *
+     * @param session Active stream session.
+     * @return Session metadata safe to use after releasing registry lock.
+     */
+    rtsp_stream::session_info_t snapshot(session_t &session);
   }  // namespace session
 }  // namespace stream

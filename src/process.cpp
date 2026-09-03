@@ -5,7 +5,12 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <atomic>
 #include <filesystem>
+#include <limits>
+#include <mutex>
+#include <ranges>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,12 +30,14 @@
 #include "config.h"
 #include "crypto.h"
 #include "display_device.h"
+#include "file_handler.h"
 #include "input.h"
 #include "logging.h"
 #include "platform/common.h"
 #include "process.h"
 #include "system_tray.h"
 #include "utility.h"
+#include "uuid.h"
 
 #ifdef _WIN32
   // from_utf8() string conversion function
@@ -45,6 +52,9 @@ namespace proc {
   namespace pt = boost::property_tree;
 
   proc_t proc;  ///< Global process registry used to track and terminate child processes.
+  std::atomic_uint64_t catalog_revision_counter {};  ///< Monotonic application catalog revision.
+  std::mutex catalog_snapshot_mutex;  ///< Protects the copied catalog published to HTTP readers.
+  catalog_snapshot_t cached_catalog_snapshot {};  ///< Last complete catalog and matching revision.
 
   /**
    * @brief RAII helper that runs shutdown cleanup when destroyed.
@@ -377,6 +387,17 @@ namespace proc {
     return _apps;
   }
 
+  const ctx_t *proc_t::find_app_by_uuid(const std::string_view uuid) const {
+    const auto app = std::ranges::find(_apps, uuid, &ctx_t::uuid);
+    return app == _apps.end() ? nullptr : std::addressof(*app);
+  }
+
+  const ctx_t *proc_t::find_app_by_id(const int app_id) const {
+    const auto id = std::to_string(app_id);
+    const auto app = std::ranges::find(_apps, id, &ctx_t::id);
+    return app == _apps.end() ? nullptr : std::addressof(*app);
+  }
+
   // Gets application image from application list.
   // Returns image from assets directory if found there.
   // Returns default image if image configuration is not set.
@@ -655,10 +676,125 @@ namespace proc {
     auto input_with_index = ss.str();
 
     // CRC32 then truncate to signed 32-bit range due to client limitations
-    auto id_no_index = std::to_string(abs((int32_t) calculate_crc32(input_no_index)));
-    auto id_with_index = std::to_string(abs((int32_t) calculate_crc32(input_with_index)));
+    const auto positive_id = [](const std::uint32_t value) {
+      const auto signed_value = static_cast<std::int32_t>(value);
+      const auto magnitude = signed_value == std::numeric_limits<std::int32_t>::min() ? std::numeric_limits<std::int32_t>::max() : std::abs(signed_value);
+      return std::to_string(std::max(magnitude, 1));
+    };
+    auto id_no_index = positive_id(calculate_crc32(input_no_index));
+    auto id_with_index = positive_id(calculate_crc32(input_with_index));
 
     return std::make_tuple(id_no_index, id_with_index);
+  }
+
+  /**
+   * @brief Read a positive legacy application ID from JSON.
+   *
+   * @param value JSON value containing an integer or decimal string.
+   * @return Validated decimal ID, or no value when invalid.
+   */
+  std::optional<std::string> parse_legacy_app_id(const nlohmann::json &value) {
+    try {
+      std::int64_t id;
+      if (value.is_number_integer()) {
+        id = value.get<std::int64_t>();
+      } else if (value.is_string()) {
+        const auto text = value.get<std::string>();
+        std::size_t consumed {};
+        id = std::stoll(text, &consumed);
+        if (consumed != text.size()) {
+          return std::nullopt;
+        }
+      } else {
+        return std::nullopt;
+      }
+      if (id <= 0 || id > std::numeric_limits<std::int32_t>::max()) {
+        return std::nullopt;
+      }
+      return std::to_string(id);
+    } catch (const std::exception &) {
+      return std::nullopt;
+    }
+  }
+
+  /**
+   * @brief Remove malformed optional Eclipse metadata before publishing catalog records.
+   *
+   * @param metadata Mutable `x-eclipse` object loaded from the application configuration.
+   * @return `true` when one or more invalid fields were removed.
+   */
+  bool normalize_eclipse_metadata(nlohmann::json &metadata) {
+    bool changed = false;
+    const auto remove_invalid = [&](const char *key, const auto &valid) {
+      const auto value = metadata.find(key);
+      if (value != metadata.end() && !valid(*value)) {
+        metadata.erase(value);
+        changed = true;
+      }
+    };
+    const auto string_array = [](const nlohmann::json &value) {
+      return value.is_array() && std::ranges::all_of(value, [](const auto &entry) {
+               return entry.is_string();
+             });
+    };
+
+    remove_invalid("kind", [](const auto &value) {
+      return value.is_string();
+    });
+    remove_invalid("tags", string_array);
+    remove_invalid("description", [](const auto &value) {
+      return value.is_string();
+    });
+    remove_invalid("source", [](const auto &value) {
+      return value.is_string();
+    });
+    remove_invalid("publisher", [](const auto &value) {
+      return value.is_string();
+    });
+    remove_invalid("installed", [](const auto &value) {
+      return value.is_boolean();
+    });
+    remove_invalid("updateAvailable", [](const auto &value) {
+      return value.is_boolean();
+    });
+    remove_invalid("hdr", [](const auto &value) {
+      return value.is_boolean();
+    });
+    remove_invalid("inputRequirements", string_array);
+    remove_invalid("launchProfiles", [](const auto &value) {
+      return value.is_array();
+    });
+    remove_invalid("assets", [](const auto &value) {
+      return value.is_object();
+    });
+    remove_invalid("displayProfileId", [](const auto &value) {
+      return value.is_string();
+    });
+    remove_invalid("streamProfileId", [](const auto &value) {
+      return value.is_string();
+    });
+    remove_invalid("sandboxProfileId", [](const auto &value) {
+      return value.is_string();
+    });
+    remove_invalid("classification", [](const auto &value) {
+      return value.is_object();
+    });
+    if (const auto classification = metadata.find("classification"); classification != metadata.end()) {
+      const auto remove_invalid_classification = [&](const char *key, const auto &valid) {
+        const auto value = classification->find(key);
+        if (value != classification->end() && !valid(*value)) {
+          classification->erase(value);
+          changed = true;
+        }
+      };
+      remove_invalid_classification("source", [](const auto &value) {
+        return value.is_string();
+      });
+      remove_invalid_classification("confidence", [](const auto &value) {
+        return value.is_number();
+      });
+    }
+    return changed;
   }
 
   /**
@@ -670,6 +806,13 @@ namespace proc {
     try {
       pt::read_json(file_name, tree);
 
+      auto source_tree = nlohmann::json::parse(file_handler::read_file(file_name.c_str()));
+      auto &source_apps = source_tree.at("apps");
+      if (!source_apps.is_array()) {
+        throw std::runtime_error("apps must be an array");
+      }
+      bool migrate_catalog = false;
+
       auto &apps_node = tree.get_child("apps"s);
       auto &env_vars = tree.get_child("env"s);
 
@@ -680,10 +823,35 @@ namespace proc {
       }
 
       std::set<std::string> ids;
+      std::set<std::string> uuids;
       std::vector<proc::ctx_t> apps;
       int i = 0;
       for (auto &[_, app_node] : apps_node) {
         proc::ctx_t ctx;
+        auto &source_app = source_apps.at(static_cast<std::size_t>(i));
+        if (!source_app.is_object()) {
+          throw std::runtime_error("application entries must be objects");
+        }
+        auto &eclipse = source_app["x-eclipse"];
+        if (!eclipse.is_object()) {
+          eclipse = nlohmann::json::object();
+          migrate_catalog = true;
+        }
+
+        auto uuid = eclipse.contains("uuid") && eclipse["uuid"].is_string() ? eclipse["uuid"].get<std::string>() : std::string {};
+        if (!uuid_util::is_valid(uuid) || uuids.contains(uuid)) {
+          uuid = uuid_util::uuid_t::generate().string();
+          eclipse["uuid"] = uuid;
+          migrate_catalog = true;
+        }
+        uuids.emplace(uuid);
+        ctx.uuid = std::move(uuid);
+
+        if (!eclipse.contains("schemaVersion") || !eclipse["schemaVersion"].is_number_integer() || eclipse["schemaVersion"] != 1) {
+          eclipse["schemaVersion"] = 1;
+          migrate_catalog = true;
+        }
+        migrate_catalog = normalize_eclipse_metadata(eclipse) || migrate_catalog;
 
         auto prep_nodes_opt = app_node.get_child_optional("prep-cmd"s);
         auto detached_nodes_opt = app_node.get_child_optional("detached"s);
@@ -767,21 +935,43 @@ namespace proc {
         ctx.wait_all = wait_all.value_or(true);
         ctx.exit_timeout = std::chrono::seconds {exit_timeout.value_or(5)};
 
-        auto possible_ids = calculate_app_id(name, ctx.image_path, i++);
-        if (ids.count(std::get<0>(possible_ids)) == 0) {
-          // Avoid using index to generate id if possible
-          ctx.id = std::get<0>(possible_ids);
+        std::optional<std::string> persisted_id;
+        if (eclipse.contains("legacyId")) {
+          persisted_id = parse_legacy_app_id(eclipse["legacyId"]);
+        }
+        if (!persisted_id && source_app.contains("id")) {
+          persisted_id = parse_legacy_app_id(source_app["id"]);
+        }
+        if (persisted_id && !ids.contains(*persisted_id)) {
+          ctx.id = *persisted_id;
         } else {
-          // Fallback to include index on collision
-          ctx.id = std::get<1>(possible_ids);
+          auto possible_ids = calculate_app_id(name, ctx.image_path, i);
+          ctx.id = std::get<0>(possible_ids);
+          int collision_index = i;
+          while (ids.contains(ctx.id)) {
+            ctx.id = std::get<1>(calculate_app_id(name, ctx.image_path, collision_index++));
+          }
+        }
+        if (!eclipse.contains("legacyId") || parse_legacy_app_id(eclipse["legacyId"]) != ctx.id) {
+          eclipse["legacyId"] = std::stoi(ctx.id);
+          migrate_catalog = true;
         }
         ids.insert(ctx.id);
+        ++i;
+
+        ctx.eclipse_metadata = eclipse;
 
         ctx.name = std::move(name);
         ctx.prep_cmds = std::move(prep_cmds);
         ctx.detached = std::move(detached);
 
         apps.emplace_back(std::move(ctx));
+      }
+
+      if (migrate_catalog) {
+        if (file_handler::write_file_atomic(file_name.c_str(), source_tree.dump(4)) != 0) {
+          throw std::runtime_error("Failed to persist stable Eclipse application metadata");
+        }
       }
 
       return proc::proc_t {
@@ -802,7 +992,20 @@ namespace proc {
     auto proc_opt = proc::parse(file_name);
 
     if (proc_opt) {
+      auto apps = proc_opt->get_apps();
       proc = std::move(*proc_opt);
+      const auto revision = ++catalog_revision_counter;
+      std::lock_guard lock {catalog_snapshot_mutex};
+      cached_catalog_snapshot = {.revision = revision, .apps = std::move(apps)};
     }
+  }
+
+  catalog_snapshot_t catalog_snapshot() {
+    std::lock_guard lock {catalog_snapshot_mutex};
+    return cached_catalog_snapshot;
+  }
+
+  std::uint64_t catalog_revision() {
+    return catalog_revision_counter.load();
   }
 }  // namespace proc

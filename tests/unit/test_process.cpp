@@ -9,10 +9,21 @@
 #include <filesystem>
 #include <fstream>
 
+// lib includes
+#include <nlohmann/json.hpp>
+
 // local includes
 #include <src/process.h>
+#include <src/uuid.h>
 
 namespace fs = std::filesystem;
+
+TEST(UUIDValidationTest, AcceptsOnlyCanonicalSyntax) {
+  EXPECT_TRUE(uuid_util::is_valid("11111111-1111-1111-1111-111111111111"));
+  EXPECT_FALSE(uuid_util::is_valid("11111111-1111-1111-1111-11111111111"));
+  EXPECT_FALSE(uuid_util::is_valid("11111111_1111-1111-1111-111111111111"));
+  EXPECT_FALSE(uuid_util::is_valid("11111111-1111-1111-1111-11111111111z"));
+}
 
 class ProcessPNGTest: public BaseTest {
 protected:
@@ -271,4 +282,95 @@ TEST_F(ProcessPNGTest, ValidateAppImagePath_OldSteamDefault) {
   // Test the special case for old steam image path
   const std::string result = proc::validate_app_image_path("./assets/steam.png");
   EXPECT_EQ(result, SUNSHINE_ASSETS_DIR "/steam.png");
+}
+
+TEST_F(ProcessPNGTest, PersistsStableEclipseIdentityAcrossMutableMetadataChanges) {
+  const auto catalog = test_dir / "apps.json";
+  nlohmann::json source {
+    {"env", nlohmann::json::object()},
+    {"apps", {{{"name", "Original Name"}, {"cmd", ""}}}},
+  };
+  {
+    std::ofstream file {catalog};
+    file << source.dump(2);
+  }
+
+  const auto first = proc::parse(catalog.string());
+  ASSERT_TRUE(first.has_value());
+  ASSERT_EQ(first->get_apps().size(), 1);
+  const auto original_uuid = first->get_apps().front().uuid;
+  const auto original_id = first->get_apps().front().id;
+  EXPECT_EQ(original_uuid.size(), 36);
+  EXPECT_FALSE(original_id.empty());
+
+  {
+    std::ifstream file {catalog};
+    source = nlohmann::json::parse(file);
+  }
+  ASSERT_TRUE(source["apps"][0].contains("x-eclipse"));
+  source["apps"][0]["name"] = "Renamed Application";
+  source["apps"][0]["image-path"] = "missing-artwork.png";
+  {
+    std::ofstream file {catalog};
+    file << source.dump(2);
+  }
+
+  const auto second = proc::parse(catalog.string());
+  ASSERT_TRUE(second.has_value());
+  ASSERT_EQ(second->get_apps().size(), 1);
+  EXPECT_EQ(second->get_apps().front().uuid, original_uuid);
+  EXPECT_EQ(second->get_apps().front().id, original_id);
+  EXPECT_EQ(second->find_app_by_uuid(original_uuid), &second->get_apps().front());
+  EXPECT_EQ(second->find_app_by_id(std::stoi(original_id)), &second->get_apps().front());
+}
+
+TEST_F(ProcessPNGTest, RepairsDuplicateEclipseIdentitiesAndLegacyIds) {
+  const auto catalog = test_dir / "duplicate-apps.json";
+  constexpr auto duplicate_uuid = "11111111-1111-1111-1111-111111111111";
+  const nlohmann::json source {
+    {"env", nlohmann::json::object()},
+    {"apps", {
+               {{"name", "First"}, {"x-eclipse", {{"schemaVersion", 1}, {"uuid", duplicate_uuid}, {"legacyId", 42}}}},
+               {{"name", "Second"}, {"x-eclipse", {{"schemaVersion", 1}, {"uuid", duplicate_uuid}, {"legacyId", 42}}}},
+             }},
+  };
+  {
+    std::ofstream file {catalog};
+    file << source.dump(2);
+  }
+
+  const auto parsed = proc::parse(catalog.string());
+  ASSERT_TRUE(parsed.has_value());
+  ASSERT_EQ(parsed->get_apps().size(), 2);
+  EXPECT_NE(parsed->get_apps()[0].uuid, parsed->get_apps()[1].uuid);
+  EXPECT_NE(parsed->get_apps()[0].id, parsed->get_apps()[1].id);
+}
+
+TEST_F(ProcessPNGTest, RemovesMalformedOptionalEclipseMetadata) {
+  const auto catalog = test_dir / "malformed-eclipse-metadata.json";
+  const nlohmann::json source {
+    {"env", nlohmann::json::object()},
+    {"apps", {{{"name", "Malformed"}, {"x-eclipse", {
+                                                      {"kind", 42},
+                                                      {"tags", nlohmann::json::object()},
+                                                      {"installed", "yes"},
+                                                      {"classification", {{"source", false}, {"confidence", "high"}}},
+                                                      {"assets", nlohmann::json::array()},
+                                                    }}}}},
+  };
+  {
+    std::ofstream file {catalog};
+    file << source.dump(2);
+  }
+
+  const auto parsed = proc::parse(catalog.string());
+  ASSERT_TRUE(parsed.has_value());
+  ASSERT_EQ(parsed->get_apps().size(), 1);
+  const auto &metadata = parsed->get_apps().front().eclipse_metadata;
+  EXPECT_FALSE(metadata.contains("kind"));
+  EXPECT_FALSE(metadata.contains("tags"));
+  EXPECT_FALSE(metadata.contains("installed"));
+  EXPECT_FALSE(metadata.contains("assets"));
+  ASSERT_TRUE(metadata.at("classification").is_object());
+  EXPECT_TRUE(metadata.at("classification").empty());
 }
