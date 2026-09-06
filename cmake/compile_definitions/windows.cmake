@@ -67,6 +67,14 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/misc.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/misc.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/input.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/eclipse_display.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/eclipse_display.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/eclipse_sandbox_provider.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/eclipse_sandbox_provider.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/eclipse_virtual_display_provider.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/eclipse_virtual_display_provider.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/mttvdd.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/mttvdd.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_base.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_vram.cpp"
@@ -88,6 +96,7 @@ set(OPENSSL_LIBRARIES
 
 list(PREPEND PLATFORM_LIBRARIES
         ${CURL_STATIC_LIBRARIES}
+        advapi32
         avrt
         d3d11
         D3DCompiler
@@ -104,6 +113,7 @@ list(PREPEND PLATFORM_LIBRARIES
         shlwapi
         synchronization.lib
         userenv
+        wtsapi32
         ws2_32
         wsock32
 )

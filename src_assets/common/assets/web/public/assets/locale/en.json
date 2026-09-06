@@ -661,6 +661,10 @@
     "title": "Browse",
     "up": "Up"
   },
+  "clients": {
+    "title": "Paired Clients",
+    "description": "Manage the devices paired with this Sunshine host."
+  },
   "welcome": {
     "confirm_password": "Confirm password",
     "create_creds": "Before Getting Started, we need you to make a new username and password for accessing the Web UI.",

@@ -2191,6 +2191,68 @@ namespace input {
   /**
    * @brief Release every pressed mouse button tracked by Sunshine.
    */
+  /**
+   * @brief Queue a keyboard key event synthesized by peripheral forwarding.
+   */
+  void peripheral_forward_keyboard(std::shared_ptr<input_t> &input, std::uint16_t key_code, std::uint8_t modifiers, bool release) {
+    if (!config::input.keyboard || key_code == 0) {
+      return;
+    }
+    const std::uint32_t magic = release ? KEY_UP_EVENT_MAGIC : KEY_DOWN_EVENT_MAGIC;
+    NV_KEYBOARD_PACKET packet {};
+    packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+    packet.header.magic = util::endian::little(magic);
+    packet.keyCode = static_cast<short>(key_code);
+    packet.modifiers = static_cast<char>(modifiers);
+    packet.flags = 0;
+    passthrough(input, &packet);
+  }
+
+  /**
+   * @brief Queue a relative mouse move synthesized by peripheral forwarding.
+   */
+  void peripheral_forward_mouse_move(std::shared_ptr<input_t> &input, std::int16_t delta_x, std::int16_t delta_y) {
+    if (!config::input.mouse || (delta_x == 0 && delta_y == 0)) {
+      return;
+    }
+    NV_REL_MOUSE_MOVE_PACKET packet {};
+    packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+    packet.header.magic = util::endian::little(MOUSE_MOVE_REL_MAGIC_GEN5);
+    packet.deltaX = util::endian::big(delta_x);
+    packet.deltaY = util::endian::big(delta_y);
+    passthrough(input, &packet);
+  }
+
+  /**
+   * @brief Queue a mouse button event synthesized by peripheral forwarding.
+   */
+  void peripheral_forward_mouse_button(std::shared_ptr<input_t> &input, std::uint8_t button, bool release) {
+    if (!config::input.mouse || button == 0) {
+      return;
+    }
+    NV_MOUSE_BUTTON_PACKET packet {};
+    packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+    packet.header.magic = util::endian::little(release ? MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5 : MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5);
+    packet.button = button;
+    passthrough(input, &packet);
+  }
+
+  /**
+   * @brief Queue a vertical wheel scroll synthesized by peripheral forwarding.
+   */
+  void peripheral_forward_scroll(std::shared_ptr<input_t> &input, std::int16_t clicks) {
+    if (!config::input.mouse || clicks == 0) {
+      return;
+    }
+    NV_SCROLL_PACKET packet {};
+    packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+    packet.header.magic = util::endian::little(SCROLL_MAGIC_GEN5);
+    packet.scrollAmt1 = util::endian::big(clicks);
+    packet.scrollAmt2 = 0;
+    packet.zero3 = 0;
+    passthrough(input, &packet);
+  }
+
   void reset_mouse_buttons() {
     for (int button = 0; button < mouse_press.size(); ++button) {
       if (mouse_press[button]) {

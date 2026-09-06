@@ -1,0 +1,162 @@
+.filterRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-lg);
+}
+
+.filterButton {
+  padding: 0.4rem 0.9rem;
+  background: transparent;
+  border: 1px solid var(--color-primary);
+  border-radius: 999px;
+  color: var(--color-primary);
+  font-size: 0.88rem;
+}
+
+.filterButton:hover {
+  background: var(--color-primary-light);
+}
+
+.filterActive {
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: var(--spacing-md);
+  align-items: start;
+}
+
+.appCard {
+  height: 100%;
+}
+
+.cardHead {
+  display: flex;
+  gap: var(--spacing-md);
+  align-items: flex-start;
+  margin-bottom: var(--spacing-md);
+}
+
+.icon {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-md);
+}
+
+.iconPlaceholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  color: var(--color-text-subtle);
+  background: var(--color-bg-subtle);
+  border-radius: var(--radius-md);
+}
+
+.headText {
+  flex: 1;
+  min-width: 0;
+}
+
+.headText p {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.85rem;
+}
+
+.description {
+  color: var(--color-text-muted);
+  font-size: 0.88rem;
+}
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-md);
+  margin-bottom: var(--spacing-md);
+  color: var(--color-text-muted);
+  font-size: 0.82rem;
+}
+
+.stats span {
+  display: inline-flex;
+  gap: 0.3rem;
+  align-items: center;
+}
+
+.screenshots {
+  display: flex;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-md);
+  overflow-x: auto;
+  padding-bottom: var(--spacing-xs);
+}
+
+.screenshots img {
+  height: 90px;
+  border-radius: var(--radius-sm);
+  cursor: zoom-in;
+}
+
+.platforms {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-xs);
+  margin-bottom: var(--spacing-md);
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.9);
+  padding: var(--spacing-lg);
+}
+
+.lightboxContent {
+  position: relative;
+  max-width: min(1100px, 100%);
+}
+
+.lightboxContent img {
+  max-width: 100%;
+  max-height: 85vh;
+  border-radius: var(--radius-md);
+}
+
+.lightboxNav {
+  position: absolute;
+  top: 50%;
+  display: inline-flex;
+  padding: var(--spacing-sm);
+  background: rgba(0, 0, 0, 0.5);
+  border: none;
+  border-radius: 50%;
+  color: #fff;
+  transform: translateY(-50%);
+}
+
+.lightboxPrev {
+  left: calc(-1 * var(--spacing-xl));
+}
+
+.lightboxNext {
+  right: calc(-1 * var(--spacing-xl));
+}
+
+.lightboxCounter {
+  position: absolute;
+  bottom: calc(-1 * var(--spacing-lg));
+  left: 50%;
+  color: #fff;
+  font-size: 0.85rem;
+  transform: translateX(-50%);
+}

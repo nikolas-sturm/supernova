@@ -72,113 +72,129 @@ protected:
     return options;
   }
 
-  // Helper function to find brace boundaries
-  static size_t findClosingBrace(const std::string &content, const size_t start) {
-    size_t pos = start + 1;
-    int braceLevel = 1;
-
-    while (pos < content.length() && braceLevel > 0) {
-      if (content[pos] == '{') {
-        braceLevel++;
-      } else if (content[pos] == '}') {
-        braceLevel--;
-      }
-      pos++;
-    }
-
-    return pos - 1;
+  // React UI tab files mapped to their stable tab identifier.
+  static const std::map<std::string, std::string, std::less<>> &tabFileIds() {
+    static const std::map<std::string, std::string, std::less<>> mapping {
+      {"GeneralTab.tsx", "general"},
+      {"InputTab.tsx", "input"},
+      {"AudioVideoTab.tsx", "av"},
+      {"NetworkTab.tsx", "network"},
+      {"FilesTab.tsx", "files"},
+      {"AdvancedTab.tsx", "advanced"},
+    };
+    return mapping;
   }
 
-  // Helper function to extract tab ID from a tab object
-  static std::string extractTabId(const std::string &tabObject) {
-    const std::regex idPattern(R"DELIM(id:\s*"([^"]+)")DELIM");
-
-    if (std::smatch idMatch; std::regex_search(tabObject, idMatch, idPattern)) {
-      return idMatch[1].str();
-    }
-
-    return "";
+  // Encoder section container ids inside EncoderTabs.tsx mapped to tab identifiers.
+  static const std::map<std::string, std::string, std::less<>> &encoderSectionIds() {
+    static const std::map<std::string, std::string, std::less<>> mapping {
+      {"nvidia-nvenc-encoder", "nv"},
+      {"intel-quicksync-encoder", "qsv"},
+      {"amd-amf-encoder", "amd"},
+      {"videotoolbox-encoder", "vt"},
+      {"vaapi-encoder", "vaapi"},
+      {"vulkan-encoder", "vulkan"},
+      {"software-encoder", "sw"},
+    };
+    return mapping;
   }
 
-  // Helper function to find and extract tabs content from HTML
-  static std::string extractTabsContent(const std::string &content) {
-    const size_t tabsStart = content.find("tabs: [");
-    if (tabsStart == std::string::npos) {
-      return "";
+  // Option ids are lowercase snake_case tokens and never one of the tab container ids.
+  static bool isOptionId(const std::string &id) {
+    static const std::set<std::string, std::less<>> containerIds = {
+      "general",
+      "input",
+      "av",
+      "network",
+      "files",
+      "advanced",
+    };
+    if (containerIds.contains(id)) {
+      return false;
     }
-
-    // Find the end of the tab array
-    size_t pos = tabsStart + 7;  // Skip "tabs: ["
-    int bracketLevel = 1;
-    size_t tabsEnd = pos;
-
-    while (pos < content.length() && bracketLevel > 0) {
-      if (content[pos] == '[') {
-        bracketLevel++;
-      } else if (content[pos] == ']') {
-        bracketLevel--;
-      }
-      tabsEnd = pos;
-      pos++;
-    }
-
-    return content.substr(tabsStart + 7, tabsEnd - tabsStart - 7);
+    return id.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") == std::string::npos;
   }
 
-  // Helper function to extract options from a tab object (generic version)
-  template<typename Container>
-  static void extractOptionsFromTabGeneric(const std::string &tabObject, Container &container) {
-    const std::string tabId = extractTabId(tabObject);
-    if (tabId.empty()) {
-      return;
+  /**
+   * @brief Scan the React config tabs and collect every declared option.
+   *
+   * Options appear as `id="..."` fields, `setDraftValue('...')` calls, or
+   * `t('config....')` i18n keys.
+   *
+   * @param optionsByOption Receives option name mapped to tab id when non-null.
+   * @param optionsByTab Receives tab id mapped to ordered option names when non-null.
+   */
+  static void collectUiOptions(std::map<std::string, std::string, std::less<>> *optionsByOption, std::map<std::string, std::vector<std::string>, std::less<>> *optionsByTab) {
+    static const std::string TABS_DIR = "src_assets/common/assets/web/src/routes/config/tabs";
+    static const std::vector<std::regex> patterns = {
+      std::regex(R"DELIM(id="([A-Za-z0-9_]+)")DELIM"),
+      std::regex(R"DELIM(setDraftValue\('([A-Za-z0-9_]+)')DELIM"),
+      std::regex(R"DELIM(t\('config\.([A-Za-z0-9_]+)')DELIM"),
+    };
+
+    std::vector<std::pair<std::string, std::string>> sources;
+    for (const auto &[filename, tabId] : tabFileIds()) {
+      sources.emplace_back(filename, tabId);
     }
+    sources.emplace_back("EncoderTabs.tsx", "");
 
-    const size_t optionsStart = tabObject.find("options:");
-    if (optionsStart == std::string::npos) {
-      return;
-    }
+    for (const auto &[filename, tabId] : sources) {
+      const std::string path = TABS_DIR + "/" + filename;
+      if (!std::filesystem::exists(path)) {
+        continue;
+      }
+      const std::string content = file_handler::read_file(path.c_str());
+      if (content.empty()) {
+        continue;
+      }
 
-    const size_t optStart = tabObject.find('{', optionsStart);
-    if (optStart == std::string::npos) {
-      return;
-    }
+      // Encoder sections are cut into per-tab segments by their container id.
+      std::vector<std::pair<size_t, std::string>> sectionBounds;
+      for (const auto &[sectionId, sectionTabId] : encoderSectionIds()) {
+        const size_t at = content.find("id=\"" + sectionId + "\"");
+        if (at != std::string::npos) {
+          sectionBounds.emplace_back(at, sectionTabId);
+        }
+      }
+      std::ranges::sort(sectionBounds);
 
-    const size_t optEnd = findClosingBrace(tabObject, optStart);
-    std::string optionsSection = tabObject.substr(optStart + 1, optEnd - optStart - 1);
-
-    // Extract option names
-    const std::regex optionPattern(R"DELIM("([^"]+)":\s*)DELIM");
-    std::sregex_iterator optionIter(optionsSection.begin(), optionsSection.end(), optionPattern);
-
-    for (const std::sregex_iterator optionEnd; optionIter != optionEnd; ++optionIter) {
-      std::string optionName = (*optionIter)[1].str();
-
-      // Use if constexpr to handle different container types
-      if constexpr (std::is_same_v<Container, std::map<std::string, std::string, std::less<>>>) {
-        container[optionName] = tabId;
-      } else if constexpr (std::is_same_v<Container, std::map<std::string, std::vector<std::string>, std::less<>>>) {
-        container[tabId].push_back(optionName);
+      for (const auto &idPattern : patterns) {
+        for (std::sregex_iterator iter(content.begin(), content.end(), idPattern); iter != std::sregex_iterator(); ++iter) {
+          const std::string optionName = (*iter)[1].str();
+          if (!isOptionId(optionName)) {
+            continue;
+          }
+          const size_t position = static_cast<size_t>((*iter).position());
+          std::string ownerTab = tabId;
+          if (tabId.empty()) {
+            for (const auto &[sectionStart, sectionTabId] : sectionBounds) {
+              if (position >= sectionStart) {
+                ownerTab = sectionTabId;
+              }
+            }
+          }
+          if (ownerTab.empty()) {
+            continue;
+          }
+          if (optionsByOption != nullptr) {
+            optionsByOption->insert_or_assign(optionName, ownerTab);
+          }
+          if (optionsByTab != nullptr) {
+            std::vector<std::string> &list = (*optionsByTab)[ownerTab];
+            if (std::ranges::find(list, optionName) == list.end()) {
+              list.push_back(optionName);
+            }
+          }
+        }
       }
     }
   }
 
-  // Helper function to process tab objects from tabs content
-  template<typename Container>
-  static void processTabObjects(const std::string &tabsContent, Container &container) {
-    size_t tabPos = 0;
-    while (tabPos < tabsContent.length()) {
-      const size_t objStart = tabsContent.find('{', tabPos);
-      if (objStart == std::string::npos) {
-        break;
-      }
-
-      const size_t objEnd = findClosingBrace(tabsContent, objStart);
-      std::string tabObject = tabsContent.substr(objStart, objEnd - objStart + 1);
-
-      extractOptionsFromTabGeneric(tabObject, container);
-
-      tabPos = objEnd + 1;
-    }
+  // Extract config options from the React config tabs
+  static std::map<std::string, std::string, std::less<>> extractConfigHtmlOptions() {
+    std::map<std::string, std::string, std::less<>> options;
+    collectUiOptions(&options, nullptr);
+    return options;
   }
 
   // Helper function to trim whitespace from string
@@ -197,36 +213,10 @@ protected:
     return "";
   }
 
-  // Extract config options from config.html
-  static std::map<std::string, std::string, std::less<>> extractConfigHtmlOptions() {
-    std::map<std::string, std::string, std::less<>> options;
-    const std::string content = file_handler::read_file("src_assets/common/assets/web/config.html");
-
-    const std::string tabsContent = extractTabsContent(content);
-    if (tabsContent.empty()) {
-      return options;
-    }
-
-    processTabObjects(tabsContent, options);
-    return options;
-  }
-
-  // Helper function to extract options from a single tab object (now using generic function)
-  static void extractOptionsFromTab(const std::string &tabObject, std::map<std::string, std::vector<std::string>, std::less<>> &optionsByTab) {
-    extractOptionsFromTabGeneric(tabObject, optionsByTab);
-  }
-
   // Extract config options from config.html with order preserved
   static std::map<std::string, std::vector<std::string>, std::less<>> extractConfigHtmlOptionsWithOrder() {
     std::map<std::string, std::vector<std::string>, std::less<>> optionsByTab;
-    const std::string content = file_handler::read_file("src_assets/common/assets/web/config.html");
-
-    const std::string tabsContent = extractTabsContent(content);
-    if (tabsContent.empty()) {
-      return optionsByTab;
-    }
-
-    processTabObjects(tabsContent, optionsByTab);
+    collectUiOptions(nullptr, &optionsByTab);
     return optionsByTab;
   }
 

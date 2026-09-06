@@ -1,32 +1,63 @@
 {
   "name": "sunshine",
   "version": "0.0.0",
-  "scripts": {
-    "build": "vite build --debug",
-    "build-clean": "vite build --debug --emptyOutDir",
-    "dev": "vite build --watch",
-    "serve": "serve ./tests/fixtures/http --no-port-switching"
-  },
   "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "build-clean": "vite build --emptyOutDir",
+    "dev": "vite",
+    "serve": "serve ./tests/fixtures/http --no-port-switching",
+    "check": "npm run lint && npm run typecheck && npm run test",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
   "dependencies": {
-    "@lucide/vue": "1.39.0",
-    "bootstrap": "5.3.8",
+    "@tanstack/react-form": "^1.23.0",
+    "@tanstack/react-query": "^5.62.0",
+    "@tanstack/react-router": "^1.120.0",
+    "@tanstack/react-table": "^8.20.5",
     "date-fns": "4.4.0",
-    "marked": "18.0.11",
-    "vue": "3.5.42",
-    "vue-i18n": "11.4.10",
-    "vue3-simple-icons": "16.10.0"
+    "i18next": "^25.0.0",
+    "lucide-react": "1.35.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-i18next": "^15.0.0",
+    "react-markdown": "^10.0.0",
+    "zod": "4.4.3",
+    "zustand": "5.0.15"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.11",
     "@codecov/vite-plugin": "2.0.1",
-    "@vitejs/plugin-vue": "6.0.8",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "^14.5.2",
+    "@types/node": "24.3.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "@vitejs/plugin-react": "6.1.1",
+    "jsdom": "30.0.1",
+    "oxc-transform-react": "0.145.0",
     "serve": "14.2.6",
+    "typescript": "5.9.2",
     "vite": "8.2.2",
-    "vite-plugin-ejs": "2.0.0"
+    "vitest": "4.1.11"
   },
   "overrides": {
     "@codecov/vite-plugin": {
       "vite": "$vite"
+    }
+  },
+  "packageManager": "npm@12.0.2+sha512.b885e890b9418fa1693544d05f53e64f9a73ec194837d4258b15fecdd692347b1dd2a517b1b0cbaf9d31cd8e92c3b70956bd2ecc72833a57b4b3098f5bfa7943",
+  "devEngines": {
+    "packageManager": {
+      "name": "npm",
+      "version": "^12.0.2",
+      "onFail": "warn"
     }
   }
 }

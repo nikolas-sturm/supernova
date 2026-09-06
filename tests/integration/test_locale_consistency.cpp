@@ -50,25 +50,35 @@ protected:
     return locales;
   }
 
-  // Extract locale options from General.vue
+  // Extract locale options from the React general tab (GeneralTab.tsx)
   static std::map<std::string, std::string, std::less<>> extractGeneralVueLocales() {
     std::map<std::string, std::string, std::less<>> locales;
-    const std::string content = file_handler::read_file("src_assets/common/assets/web/configs/tabs/General.vue");
+    const std::string content = file_handler::read_file("src_assets/common/assets/web/src/routes/config/tabs/GeneralTab.tsx");
 
-    // Find the locale select section specifically
-    const std::regex localeSelectPattern("id=\"locale\"[^>]*>([^<]*(?:<option[^>]*>[^<]*</option>[^<]*)*)</select>");
+    // Locale codes come from the `localeOptions` array: 'bg', 'en_GB', ...
+    const size_t listStart = content.find("const localeOptions = [");
+    if (listStart == std::string::npos) {
+      return locales;
+    }
+    const size_t codesStart = content.find('[', listStart);
+    const size_t codesEnd = content.find(']', codesStart);
+    if (codesStart == std::string::npos || codesEnd == std::string::npos) {
+      return locales;
+    }
+    const std::string codesSection = content.substr(codesStart, codesEnd - codesStart);
+    const std::regex codePattern(R"delimiter('([a-z]+(?:_[A-Z][a-zA-Z]*)*)')delimiter");
 
-    if (std::smatch selectMatch; std::regex_search(content, selectMatch, localeSelectPattern)) {
-      const std::string localeSection = selectMatch[1].str();
+    // Display names come from the `localeNames` record: bg: 'Bulgarian', ...
+    const std::regex namePattern(R"delimiter(^\s{2}([a-zA-Z_]+):\s*'([^']+)',)delimiter");
 
-      // Extract option elements with locale codes and display names from the locale section
-      const std::regex optionPattern(R"delimiter(<option\s+value="([^"]+)">([^<]+)</option>)delimiter");
-      std::sregex_iterator iter(localeSection.begin(), localeSection.end(), optionPattern);
+    for (std::sregex_iterator iter(codesSection.begin(), codesSection.end(), codePattern); iter != std::sregex_iterator(); ++iter) {
+      locales[(*iter)[1].str()] = {};
+    }
 
-      for (const std::sregex_iterator end; iter != end; ++iter) {
-        const std::string localeCode = (*iter)[1].str();
-        const std::string displayName = (*iter)[2].str();
-        locales[localeCode] = displayName;
+    for (std::sregex_iterator iter(content.begin(), content.end(), namePattern); iter != std::sregex_iterator(); ++iter) {
+      const std::string code = (*iter)[1].str();
+      if (locales.contains(code)) {
+        locales[code] = (*iter)[2].str();
       }
     }
 

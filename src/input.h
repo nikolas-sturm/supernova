@@ -55,6 +55,42 @@ namespace input {
   void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data);
 
   /**
+   * @brief Inject one peripheral-forwarding keyboard key event.
+   *
+   * @param input Platform input backend that receives the event.
+   * @param key_code Windows virtual-key code.
+   * @param modifiers Moonlight modifier bitmask active for the event.
+   * @param release Whether the key is released instead of pressed.
+   */
+  void peripheral_forward_keyboard(std::shared_ptr<input_t> &input, std::uint16_t key_code, std::uint8_t modifiers, bool release);
+
+  /**
+   * @brief Inject one peripheral-forwarding relative mouse move.
+   *
+   * @param input Platform input backend that receives the event.
+   * @param delta_x Signed horizontal delta.
+   * @param delta_y Signed vertical delta.
+   */
+  void peripheral_forward_mouse_move(std::shared_ptr<input_t> &input, std::int16_t delta_x, std::int16_t delta_y);
+
+  /**
+   * @brief Inject one peripheral-forwarding mouse button event.
+   *
+   * @param input Platform input backend that receives the event.
+   * @param button Moonlight button number: 1 left, 2 middle, 3 right.
+   * @param release Whether the button is released instead of pressed.
+   */
+  void peripheral_forward_mouse_button(std::shared_ptr<input_t> &input, std::uint8_t button, bool release);
+
+  /**
+   * @brief Inject one peripheral-forwarding vertical wheel scroll.
+   *
+   * @param input Platform input backend that receives the event.
+   * @param clicks Signed wheel-click count; positive scrolls up.
+   */
+  void peripheral_forward_scroll(std::shared_ptr<input_t> &input, std::int16_t clicks);
+
+  /**
    * @brief Initialize global input resources and platform backends.
    *
    * @return Cleanup handle for initialized input resources, or null if none are required.

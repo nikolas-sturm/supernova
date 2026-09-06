@@ -5,7 +5,9 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <filesystem>
 #include <limits>
 #include <mutex>
@@ -839,6 +841,11 @@ namespace proc {
         }
 
         auto uuid = eclipse.contains("uuid") && eclipse["uuid"].is_string() ? eclipse["uuid"].get<std::string>() : std::string {};
+        // Older releases generated uppercase UUID text; canonicalize so Eclipse
+        // resource references keep matching previously persisted applications.
+        std::transform(uuid.begin(), uuid.end(), uuid.begin(), [](const unsigned char character) {
+          return static_cast<char>(std::tolower(character));
+        });
         if (!uuid_util::is_valid(uuid) || uuids.contains(uuid)) {
           uuid = uuid_util::uuid_t::generate().string();
           eclipse["uuid"] = uuid;

@@ -58,8 +58,10 @@ namespace uuid_util {
         el = dist(engine);
       }
 
-      buf.b8[7] &= (std::uint8_t) 0b00101111;
-      buf.b8[9] &= (std::uint8_t) 0b10011111;
+      // string() prints memory bytes in order, so the RFC version field
+      // (printed byte 6) is b8[6] and the variant field (printed byte 8) is b8[8].
+      buf.b8[6] = static_cast<std::uint8_t>((buf.b8[6] & 0x0F) | 0x40);
+      buf.b8[8] = static_cast<std::uint8_t>((buf.b8[8] & 0x3F) | 0x80);
 
       return buf;
     }
@@ -105,6 +107,10 @@ namespace uuid_util {
       }
 
       std::copy(std::begin(last_slice), std::end(last_slice), std::back_inserter(result));
+
+      for (auto &character : result) {
+        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+      }
 
       return result;
     }

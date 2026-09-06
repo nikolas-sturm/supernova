@@ -175,7 +175,13 @@ set(INTEGRATION_TEST_FILES
     "src_assets/common/assets/web/config.html"
     "docs/configuration.md"
     "src_assets/common/assets/web/public/assets/locale/en.json"
-    "src_assets/common/assets/web/configs/tabs/General.vue"
+    "src_assets/common/assets/web/src/routes/config/tabs/GeneralTab.tsx"
+    "src_assets/common/assets/web/src/routes/config/tabs/InputTab.tsx"
+    "src_assets/common/assets/web/src/routes/config/tabs/AudioVideoTab.tsx"
+    "src_assets/common/assets/web/src/routes/config/tabs/NetworkTab.tsx"
+    "src_assets/common/assets/web/src/routes/config/tabs/FilesTab.tsx"
+    "src_assets/common/assets/web/src/routes/config/tabs/AdvancedTab.tsx"
+    "src_assets/common/assets/web/src/routes/config/tabs/EncoderTabs.tsx"
     "src_assets/linux/misc/60-sunshine.rules"
 )
 

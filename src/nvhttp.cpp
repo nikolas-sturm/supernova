@@ -7,26 +7,46 @@
 
 // standard includes
 #include <algorithm>
+#include <atomic>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <format>
+#include <functional>
+#include <future>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <regex>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 
 // lib includes
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/context_base.hpp>
+#include <boost/program_options/parsers.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
+#include <openssl/evp.h>
+#include <Simple-Web-Server/crypto.hpp>
 #include <Simple-Web-Server/server_http.hpp>
 
 // local includes
 #include "config.h"
 #include "display_device.h"
+#include "eclipse_assets.h"
+#include "eclipse_events.h"
+#include "eclipse_operations.h"
+#include "eclipse_peripherals.h"
+#include "eclipse_profiles.h"
+#include "eclipse_sandboxes.h"
+#include "eclipse_virtual_display.h"
+#include "eclipse_workspaces.h"
 #include "file_handler.h"
 #include "globals.h"
 #include "httpcommon.h"
@@ -40,6 +60,12 @@
 #include "utility.h"
 #include "uuid.h"
 #include "video.h"
+
+#ifdef _WIN32
+  #include "platform/windows/eclipse_display.h"
+  #include "platform/windows/eclipse_sandbox_provider.h"
+  #include "platform/windows/eclipse_virtual_display_provider.h"
+#endif
 
 using namespace std::literals;
 
@@ -214,6 +240,84 @@ namespace nvhttp {
   std::optional<logical_session_t> logical_session;  ///< Current resumable logical session.
 
   /**
+   * @brief Resolved profile and runtime associations for one logical session.
+   */
+  struct eclipse_session_binding_t {
+    std::string workspace_id;  ///< Associated workspace UUID, empty when none.
+    std::string sandbox_id;  ///< Associated sandbox UUID, empty when none.
+    std::string display_profile_id;  ///< Resolved display-profile UUID, empty when none.
+    std::string stream_profile_id;  ///< Resolved stream-profile UUID, empty when none.
+    std::string launch_profile_id;  ///< Resolved launch-profile UUID, empty when none.
+    std::string sandbox_profile_id;  ///< Resolved sandbox-profile UUID, empty when none.
+  };
+
+  /**
+   * @brief Published lifecycle tracking state for one logical session.
+   */
+  struct eclipse_session_tracking_t {
+    eclipse_session_binding_t binding;  ///< Resolved profile and runtime associations.
+    std::string owner_client_uuid;  ///< Owning client UUID, empty when unknown.
+    std::string app_uuid;  ///< Associated application UUID, empty when unknown.
+    std::string state;  ///< Last observed session state.
+    std::uint64_t revision = 1;  ///< Monotonic session-resource revision.
+    std::int64_t updated_at = 0;  ///< Last published transition in Unix milliseconds.
+    std::optional<std::int64_t> terminal_since;  ///< Retention start for terminal sessions.
+    bool announced = false;  ///< Whether session.created has been published.
+  };
+
+  std::mutex eclipse_session_tracking_mutex;  ///< Protects published session tracking state.
+  std::map<std::string, eclipse_session_tracking_t> eclipse_session_tracking;  ///< Published session resources keyed by session UUID.
+  std::uint64_t eclipse_session_collection_revision = 0;  ///< Monotonic sessions-collection revision.
+  std::chrono::steady_clock::time_point eclipse_start_time = std::chrono::steady_clock::now();  ///< Host uptime reference for telemetry.
+  std::unique_ptr<eclipse_events::hub_t> eclipse_event_hub;  ///< Per-client SSE replay and delivery hub.
+  std::mutex eclipse_event_stream_mutex;  ///< Protects owned SSE worker threads.
+  std::vector<std::future<void>> eclipse_event_streams;  ///< Owned long-lived SSE response workers.
+  std::unique_ptr<eclipse_operations::store_t> eclipse_operation_store;  ///< Persistent Eclipse operation and idempotency records.
+  thread_pool_util::ThreadPool eclipse_operation_pool;  ///< Dedicated worker pool for durable Eclipse operations, isolated from the shared task pool.
+  std::unique_ptr<eclipse::profiles::manager_t> eclipse_profile_manager;  ///< Persistent profiles-v1 resource manager.
+  std::unique_ptr<eclipse_peripherals::manager_t> eclipse_peripheral_manager;  ///< Peripheral device registry and claim manager.
+  std::uint64_t eclipse_peripheral_collection_revision = 0;  ///< Monotonic peripherals collection revision.
+  std::mutex eclipse_peripheral_revision_mutex;  ///< Protects the peripherals collection revision.
+  std::unique_ptr<eclipse_workspaces::manager_t> eclipse_workspace_manager;  ///< Persistent workspaces-v1 lifecycle manager.
+#ifdef _WIN32
+  std::unique_ptr<eclipse_virtual_display::manager_t> eclipse_virtual_display_manager;  ///< MttVDD virtual-display lifecycle manager.
+  std::unique_ptr<eclipse_sandboxes::manager_t> eclipse_sandbox_manager;  ///< Persistent sandboxes-v1 lifecycle manager.
+  void revoke_eclipse_profiles(const std::string &owner, const std::optional<eclipse_api::client_permissions_t> &permissions = std::nullopt);
+  void revoke_eclipse_sandboxes(const std::string &owner);
+  void revoke_eclipse_workspaces(const std::string &owner);
+  bool eclipse_workspace_visible(const verified_client_t &client, const eclipse_workspaces::resource_t &workspace, bool lifecycle);
+#endif
+
+#ifdef _WIN32
+  /**
+   * @brief Process-lifetime revision state for physical display snapshots.
+   */
+  struct physical_display_revision_t {
+    std::mutex mutex;  ///< Protects fingerprint and revision.
+    std::string fingerprint;  ///< Canonical JSON fingerprint of last snapshot.
+    std::uint64_t revision = 0;  ///< Monotonic collection revision.
+  } physical_display_revision;  ///< Shared physical display revision state.
+
+  /**
+   * @brief Process-lifetime revision state for the unified display inventory.
+   */
+  struct eclipse_unified_display_revision_t {
+    std::mutex mutex;  ///< Protects combined revision inputs.
+    std::pair<std::uint64_t, std::uint64_t> inputs {};  ///< Last observed physical and virtual revisions.
+    std::uint64_t revision = 0;  ///< Monotonic unified collection revision.
+  } eclipse_unified_display_revision;  ///< Shared unified display revision state.
+
+  /**
+   * @brief Process-lifetime state for the display topology resource.
+   */
+  struct eclipse_topology_state_t {
+    std::mutex mutex;  ///< Protects fingerprint and revision.
+    std::string fingerprint;  ///< Canonical JSON fingerprint of last topology snapshot.
+    std::uint64_t revision = 0;  ///< Monotonic topology revision.
+  } eclipse_topology_state;  ///< Shared display topology revision state.
+#endif
+
+  /**
    * @brief Case-insensitive map used for HTTP headers and query parameters.
    */
   using args_t = SimpleWeb::CaseInsensitiveMultimap;
@@ -225,6 +329,32 @@ namespace nvhttp {
    * @brief Shared HTTPS request object received by GameStream handlers.
    */
   using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request>;
+
+  std::optional<std::string> eclipse_header(const req_https_t &request, std::string_view name);
+  nlohmann::json eclipse_session_json(const rtsp_stream::session_info_t &session, const eclipse_session_tracking_t *tracking = nullptr);
+  std::optional<eclipse_session_binding_t> eclipse_resolve_launch_references(const verified_client_t &client, const proc::ctx_t &app, const args_t &args, const eclipse_workspaces::resource_t *workspace, std::string_view *error_code, std::string &error_message);
+  bool eclipse_launch_direct_sandbox(const verified_client_t &client, const proc::ctx_t &app, eclipse_session_binding_t &binding, std::string &error_message);
+  void eclipse_destroy_sandbox_by_id(const std::string &sandbox_id);
+  void eclipse_destroy_session_sandbox(const eclipse_session_binding_t &binding);
+  void eclipse_unregister_session(const std::string &session_id);
+  bool eclipse_json_contains_string(const nlohmann::json &values, const std::string &value);
+  void publish_eclipse_sandbox_event(const std::string &type, const eclipse_sandboxes::resource_t &sandbox, nlohmann::json data, const std::string &owner);
+  void publish_eclipse_peripheral_event(const std::string &type, nlohmann::json data);
+  void eclipse_bump_peripheral_revision();
+  std::vector<rtsp_stream::session_info_t> eclipse_session_snapshots();
+#ifdef _WIN32
+  std::optional<std::pair<std::uint64_t, nlohmann::json>> eclipse_display_snapshot();
+#endif
+  nlohmann::json eclipse_telemetry_session_json(const rtsp_stream::session_info_t &session, const eclipse_session_tracking_t *tracking);
+  nlohmann::json eclipse_telemetry_document(const std::string &owner_filter = {});
+  void eclipse_patch_virtual_display(resp_https_t response, req_https_t request);
+  std::optional<std::uint64_t> eclipse_if_match(const req_https_t &request);
+  std::optional<nlohmann::json> eclipse_request_json(const resp_https_t &response, const req_https_t &request);
+  std::optional<std::pair<std::uint64_t, nlohmann::json>> eclipse_unified_displays();
+  nlohmann::json eclipse_topology_document(nlohmann::json displays);
+  namespace asio = boost::asio;
+  void eclipse_close_peripheral_channel(const std::string &claim_id);
+  void eclipse_peripheral_channel_upgrade(std::unique_ptr<SunshineHTTPS> &socket, std::shared_ptr<SimpleWeb::ServerBase<SunshineHTTPS>::Request> request);
   /**
    * @brief Shared HTTP response object passed to redirect and discovery handlers.
    */
@@ -281,12 +411,35 @@ namespace nvhttp {
    * @return Immutable identity snapshot, or no value after revocation or expiry.
    */
   std::optional<verified_client_t> verified_client(const req_https_t &request) {
-    std::lock_guard lock {client_auth_mutex};
-    const auto client = verified_clients.find(endpoint_key(request->remote_endpoint()));
-    if (client == verified_clients.end() || permissions_expired(client->second.permissions)) {
-      return std::nullopt;
+    std::optional<verified_client_t> result;
+    std::string expired_owner;
+    {
+      std::lock_guard lock {client_auth_mutex};
+      const auto client = verified_clients.find(endpoint_key(request->remote_endpoint()));
+      if (client == verified_clients.end()) {
+        return std::nullopt;
+      }
+      if (permissions_expired(client->second.permissions)) {
+        expired_owner = client->second.uuid;
+        verified_clients.erase(client);
+      } else {
+        result = client->second;
+      }
     }
-    return client->second;
+    if (!expired_owner.empty() && eclipse_event_hub) {
+      eclipse_event_hub->disconnect_client(expired_owner);
+    }
+#ifdef _WIN32
+    if (!expired_owner.empty() && eclipse_virtual_display_manager) {
+      static_cast<void>(eclipse_virtual_display_manager->revoke_owner(expired_owner));
+    }
+    if (!expired_owner.empty()) {
+      revoke_eclipse_sandboxes(expired_owner);
+      revoke_eclipse_profiles(expired_owner);
+      revoke_eclipse_workspaces(expired_owner);
+    }
+#endif
+    return result;
   }
 
   /**
@@ -407,6 +560,93 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Select paired clients authorized to observe one event.
+   *
+   * @param scope Required domain read scope, or empty for pairing-wide events.
+   * @param owner_uuid Optional resource owner restricting visibility.
+   * @param app_uuids Application associations that must all pass caller allowlist.
+   * @return Enabled, unexpired recipient UUIDs without duplicates.
+   */
+  std::vector<std::string> eclipse_event_recipients(const std::string_view scope, const std::string_view owner_uuid = {}, const std::vector<std::string> &app_uuids = {}) {
+    std::vector<std::string> recipients;
+    std::lock_guard lock {client_auth_mutex};
+    for (const auto &client : client_root.named_devices) {
+      if (!client.enabled || permissions_expired(client.permissions) || (!scope.empty() && !client.permissions.scopes.contains(scope))) {
+        continue;
+      }
+      if (!owner_uuid.empty() && client.uuid != owner_uuid && !client.permissions.scopes.contains("host.control")) {
+        continue;
+      }
+      if (std::ranges::any_of(app_uuids, [&](const auto &app_uuid) {
+            return !client.permissions.allowed_apps.empty() && !client.permissions.allowed_apps.contains(app_uuid);
+          })) {
+        continue;
+      }
+      recipients.push_back(client.uuid);
+    }
+    return recipients;
+  }
+
+  /**
+   * @brief Publish one event after applying current client policy projection.
+   *
+   * @param event Event payload.
+   * @param scope Required event scope.
+   * @param owner_uuid Optional owner visibility restriction.
+   * @param app_uuids Associated application UUIDs.
+   */
+  void publish_eclipse_event(eclipse_events::event_t event, const std::string_view scope = {}, const std::string_view owner_uuid = {}, const std::vector<std::string> &app_uuids = {}) {
+    if (!eclipse_event_hub) {
+      return;
+    }
+    try {
+      eclipse_event_hub->publish(std::move(event), eclipse_event_recipients(scope, owner_uuid, app_uuids));
+    } catch (const std::exception &exception) {
+      BOOST_LOG(error) << "Eclipse event publication failed: " << exception.what();
+    }
+  }
+
+  /**
+   * @brief Resolve domain scope required to observe an asynchronous operation.
+   *
+   * @param action Stable operation action.
+   * @return Required scope, or empty when action is not recognized.
+   */
+  std::string_view eclipse_operation_scope(const std::string_view action) {
+    if (action.starts_with("virtual-display.")) {
+      return "virtual-display.manage";
+    }
+    if (action.starts_with("workspace.")) {
+      if (action.ends_with(".start")) {
+        return "stream.launch";
+      }
+      if (action.ends_with(".stop")) {
+        return "session.control";
+      }
+      return "host.control";
+    }
+    if (action.starts_with("sandbox.")) {
+      return "sandbox.manage";
+    }
+    if (action.starts_with("peripheral.")) {
+      return "peripheral.forward";
+    }
+    if (action.starts_with("display.")) {
+      return "display.manage";
+    }
+    if (action.starts_with("profile.display.")) {
+      return "display.manage";
+    }
+    if (action.starts_with("profile.sandbox.")) {
+      return "sandbox.manage";
+    }
+    if (action.starts_with("profile.stream.") || action.starts_with("profile.launch.")) {
+      return "host.control";
+    }
+    return {};
+  }
+
+  /**
    * @brief Rebuild the GameStream trust stores from enabled paired-client records.
    *
    * @note The caller must hold `client_auth_mutex`.
@@ -520,6 +760,11 @@ namespace nvhttp {
         named_cert.name = el.get_child("name").get_value<std::string>();
         named_cert.cert = el.get_child("cert").get_value<std::string>();
         named_cert.uuid = el.get_child("uuid").get_value<std::string>();
+        // Older releases generated uppercase UUID text; canonicalize so Eclipse
+        // resource ownership keeps working with previously paired clients.
+        std::ranges::transform(named_cert.uuid, named_cert.uuid.begin(), [](const unsigned char character) {
+          return static_cast<char>(std::tolower(character));
+        });
         named_cert.enabled = el.get<bool>("enabled", true);
         named_cert.platform = el.get<std::string>("platform", "");
         if (el.get<int>("eclipse_permissions.version", 0) == 1) {
@@ -1157,52 +1402,20 @@ namespace nvhttp {
         sess.async_insert_pin.device_name = get_arg(args, "devicename");
         sess.async_insert_pin.address = net::addr_to_normalized_string(request->remote_endpoint().address());
         sess.client.platform = get_arg(args, "eclipsePlatform", "").substr(0, 64);
-        bool invalid_eclipse_permission = false;
-        if (const auto scopes = args.find("eclipseScopes"); scopes != args.end()) {
-          sess.client.requested_eclipse_permissions = true;
-          sess.client.requested_permissions.scopes.clear();
-          std::stringstream values {scopes->second};
-          std::string scope;
-          while (std::getline(values, scope, ',')) {
-            if (eclipse_api::is_known_scope(scope)) {
-              sess.client.requested_permissions.scopes.emplace(std::move(scope));
-            } else if (!scope.empty()) {
-              invalid_eclipse_permission = true;
-            }
-          }
-        }
-        if (const auto inputs = args.find("eclipseInput"); inputs != args.end()) {
-          sess.client.requested_eclipse_permissions = true;
-          sess.client.requested_permissions.input = {};
-          sess.client.requested_permissions.input.keyboard = false;
-          sess.client.requested_permissions.input.mouse = false;
-          sess.client.requested_permissions.input.controller = false;
-          sess.client.requested_permissions.input.touch = false;
-          sess.client.requested_permissions.input.pen = false;
-          std::stringstream values {inputs->second};
-          std::string input_class;
-          while (std::getline(values, input_class, ',')) {
-            if (input_class == "keyboard") {
-              sess.client.requested_permissions.input.keyboard = true;
-            } else if (input_class == "mouse") {
-              sess.client.requested_permissions.input.mouse = true;
-            } else if (input_class == "controller") {
-              sess.client.requested_permissions.input.controller = true;
-            } else if (input_class == "touch") {
-              sess.client.requested_permissions.input.touch = true;
-            } else if (input_class == "pen") {
-              sess.client.requested_permissions.input.pen = true;
-            } else if (!input_class.empty()) {
-              invalid_eclipse_permission = true;
-            }
-          }
-        }
-        if (invalid_eclipse_permission) {
+        const auto scope_argument = args.find("eclipseScopes");
+        const auto input_argument = args.find("eclipseInput");
+        const auto pairing_policy = eclipse_api::parse_pairing_policy(
+          scope_argument == args.end() ? std::nullopt : std::optional<std::string_view> {scope_argument->second},
+          input_argument == args.end() ? std::nullopt : std::optional<std::string_view> {input_argument->second}
+        );
+        if (!pairing_policy.valid) {
           tree.put("root.paired", 0);
           tree.put("root.<xmlattr>.status_code", 400);
-          tree.put("root.<xmlattr>.status_message", "Pairing request contains an unknown Eclipse permission");
+          tree.put("root.<xmlattr>.status_message", "Pairing request contains incomplete or unknown Eclipse permissions");
           return;
         }
+        sess.client.requested_eclipse_permissions = pairing_policy.explicit_policy;
+        sess.client.requested_permissions = pairing_policy.permissions;
 
         const bool pin_stdin = config::sunshine.flags[config::flag::PIN_STDIN];
         if (!pin_stdin) {
@@ -1394,9 +1607,12 @@ namespace nvhttp {
     // Only include the MAC address for requests sent from paired clients over HTTPS.
     // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
-      tree.put("root.mac", platf::get_mac_address(net::addr_to_normalized_string(local_endpoint.address())));
+      const auto mac_address = platf::get_mac_address(net::addr_to_normalized_string(local_endpoint.address()));
+      if (eclipse_api::wake_on_lan_available(mac_address)) {
+        tree.put("root.mac", mac_address);
+      }
       tree.put("root.EclipseApiVersion", eclipse_api::API_VERSION);
-      tree.put("root.EclipseCapabilities", "client-permissions,catalog-v2,session-ids,structured-errors");
+      tree.put("root.EclipseCapabilities", eclipse_api::capabilities_csv());
       tree.put("root.EclipseApiPort", net::map_port(PORT_HTTPS));
     } else {
       tree.put("root.mac", "00:00:00:00:00:00");
@@ -1539,11 +1755,21 @@ namespace nvhttp {
     });
 
     auto args = request->parse_query_string();
+    const bool eclipse_v1 = eclipse_api::api_v1_requested(get_arg(args, "eclipseApiVersion", ""));
+    const auto client = verified_client(request);
+    if (!client || !scope_allowed(*client, "stream.launch")) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client certificate lacks stream.launch permission");
+      return;
+    }
+    const bool has_legacy_app_id = args.find("appid"s) != std::end(args);
+    const bool has_eclipse_app_id = eclipse_v1 && args.find("eclipseAppUuid"s) != std::end(args);
     if (
       args.find("rikey"s) == std::end(args) ||
       args.find("rikeyid"s) == std::end(args) ||
       args.find("localAudioPlayMode"s) == std::end(args) ||
-      args.find("appid"s) == std::end(args)
+      (!has_legacy_app_id && !has_eclipse_app_id)
     ) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 400);
@@ -1552,17 +1778,75 @@ namespace nvhttp {
       return;
     }
 
-    auto appid = util::from_view(get_arg(args, "appid"));
-    const auto client = verified_client(request);
     const auto catalog = proc::catalog_snapshot();
-    const auto app = std::ranges::find(catalog.apps, std::to_string(appid), &proc::ctx_t::id);
-    if (!client || !scope_allowed(*client, "stream.launch") || (app != catalog.apps.end() && !app_allowed(*client, app->uuid)) || (app == catalog.apps.end() && !client->permissions.allowed_apps.empty())) {
+    auto app = catalog.apps.end();
+    auto appid = has_legacy_app_id ? util::from_view(get_arg(args, "appid")) : 0;
+    if (has_eclipse_app_id) {
+      const auto app_uuid = get_arg(args, "eclipseAppUuid");
+      if (!uuid_util::is_valid(app_uuid)) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 400);
+        tree.put("root.<xmlattr>.status_message", "eclipseAppUuid must be a canonical UUID");
+        return;
+      }
+      app = std::ranges::find(catalog.apps, app_uuid, &proc::ctx_t::uuid);
+      if (app == catalog.apps.end() || (has_legacy_app_id && app->id != std::to_string(appid))) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 400);
+        tree.put("root.<xmlattr>.status_message", "appid and eclipseAppUuid must identify one catalog application");
+        return;
+      }
+      appid = std::stoi(app->id);
+      if (!has_legacy_app_id) {
+        args.emplace("appid", app->id);
+      }
+    } else {
+      app = std::ranges::find(catalog.apps, std::to_string(appid), &proc::ctx_t::id);
+    }
+
+    if ((app != catalog.apps.end() && !app_allowed(*client, app->uuid)) || (app == catalog.apps.end() && !client->permissions.allowed_apps.empty())) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "Client certificate lacks permission to launch this application");
       return;
     }
 
+    constexpr std::array eclipse_resource_arguments {
+      "eclipseDisplayProfileId",
+      "eclipseStreamProfileId",
+      "eclipseLaunchProfileId",
+      "eclipseSandboxProfileId",
+    };
+    if (eclipse_v1 && std::ranges::any_of(eclipse_resource_arguments, [&](const auto argument) {
+          return !get_arg(args, argument, "").empty();
+        })) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Requested Eclipse resource provider is unavailable");
+      return;
+    }
+
+#ifdef _WIN32
+    std::optional<eclipse_workspaces::resource_t> eclipse_workspace;
+    if (eclipse_v1) {
+      const auto workspace_id = get_arg(args, "eclipseWorkspaceId", "");
+      if (!workspace_id.empty()) {
+        eclipse_workspace = eclipse_workspace_manager ? eclipse_workspace_manager->get(workspace_id) : std::nullopt;
+        const bool app_permitted = eclipse_workspace && app != catalog.apps.end() && (app->uuid == eclipse_workspace->definition.desktop_app_uuid || std::ranges::contains(eclipse_workspace->definition.permitted_app_uuids, app->uuid));
+        if (!uuid_util::is_valid(workspace_id) || !eclipse_workspace || !eclipse_workspace_visible(*client, *eclipse_workspace, true) || eclipse_workspace->state != eclipse_workspaces::state_t::ready || !app_permitted) {
+          tree.put("root.resume", 0);
+          tree.put("root.<xmlattr>.status_code", 404);
+          tree.put("root.<xmlattr>.status_message", "Workspace does not exist, is not ready, or does not permit this application");
+          return;
+        }
+      }
+    }
+#endif
+
+    bool application_prelaunched = false;
+#ifdef _WIN32
+    application_prelaunched = eclipse_workspace && eclipse_workspace->sandbox_id.has_value();
+#endif
     auto current_appid = proc::proc.running();
     if (current_appid > 0) {
       tree.put("root.resume", 0);
@@ -1574,6 +1858,32 @@ namespace nvhttp {
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args, *client);
+
+    eclipse_session_binding_t binding;
+    if (eclipse_v1) {
+      std::string_view reference_error_code = "invalid_argument";
+      std::string reference_error_message;
+      const auto resolved = eclipse_resolve_launch_references(*client, *app, args, eclipse_workspace ? &*eclipse_workspace : nullptr, &reference_error_code, reference_error_message);
+      if (!resolved) {
+        tree.put("root.gamesession", 0);
+        tree.put("root.<xmlattr>.status_code", reference_error_code == "invalid_argument" ? 400 : reference_error_code == "resource_not_found" ? 404 :
+                                                                                                reference_error_code == "permission_denied"    ? 403 :
+                                                                                                                                                 422);
+        tree.put("root.<xmlattr>.status_message", reference_error_message);
+        return;
+      }
+      binding = *resolved;
+      std::string sandbox_error;
+      if (!eclipse_workspace && !eclipse_launch_direct_sandbox(*client, *app, binding, sandbox_error)) {
+        tree.put("root.gamesession", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", sandbox_error);
+        return;
+      }
+      if (eclipse_workspace) {
+        binding.sandbox_id = eclipse_workspace->sandbox_id ? *eclipse_workspace->sandbox_id : std::string {};
+      }
+    }
 
     if (rtsp_stream::session_count() == 0) {
       // The display should be restored in case something fails as there are no other sessions.
@@ -1592,6 +1902,9 @@ namespace nvhttp {
         tree.put("root.<xmlattr>.status_code", 503);
         tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");
         tree.put("root.gamesession", 0);
+        if (eclipse_v1) {
+          eclipse_destroy_session_sandbox(binding);
+        }
 
         return;
       }
@@ -1604,19 +1917,26 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
       tree.put("root.gamesession", 0);
+      if (eclipse_v1) {
+        eclipse_destroy_session_sandbox(binding);
+      }
 
       return;
     }
 
-    if (appid > 0) {
+    bool application_launched = false;
+    if (appid > 0 && !application_prelaunched && binding.sandbox_id.empty()) {
       auto err = proc::proc.execute((int) appid, launch_session);
       if (err) {
         tree.put("root.<xmlattr>.status_code", err);
         tree.put("root.<xmlattr>.status_message", "Failed to start the specified application");
         tree.put("root.gamesession", 0);
-
+        if (eclipse_v1) {
+          eclipse_destroy_session_sandbox(binding);
+        }
         return;
       }
+      application_launched = true;
     }
 
     {
@@ -1634,15 +1954,83 @@ namespace nvhttp {
       };
     }
 
+#ifdef _WIN32
+    if (eclipse_workspace) {
+      const auto activated = eclipse_workspace_manager->activate(eclipse_workspace->id, eclipse_workspace->revision, launch_session->session_id);
+      if (activated.status != eclipse_workspaces::status_t::success || !activated.resource) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Workspace session association could not be persisted");
+        if (application_launched) {
+          proc::proc.terminate();
+        }
+        const auto stopped = eclipse_workspace_manager->stop(eclipse_workspace->id, eclipse_workspace->revision, true);
+        static_cast<void>(stopped);
+        std::lock_guard lock {logical_session_mutex};
+        logical_session.reset();
+        eclipse_unregister_session(launch_session->session_id);
+        eclipse_destroy_session_sandbox(binding);
+        return;
+      }
+      eclipse_workspace = *activated.resource;
+    }
+#endif
+
+    if (eclipse_v1) {
+      const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+      nlohmann::json created_resource;
+      {
+        std::lock_guard lock {eclipse_session_tracking_mutex};
+        auto &entry = eclipse_session_tracking[launch_session->session_id];
+        if (!entry.announced) {
+          entry.binding = binding;
+          entry.owner_client_uuid = client->uuid;
+          entry.app_uuid = launch_session->app_uuid;
+          entry.state = "preparing";
+          entry.revision = 1;
+          entry.updated_at = now_ms;
+          entry.announced = true;
+          ++eclipse_session_collection_revision;
+        }
+        created_resource = eclipse_session_json(
+          {
+            .id = launch_session->session_id,
+            .client_uuid = client->uuid,
+            .app_uuid = launch_session->app_uuid,
+            .legacy_app_id = launch_session->appid,
+            .state = "preparing",
+            .started_at = std::chrono::system_clock::now(),
+            .width = launch_session->width,
+            .height = launch_session->height,
+            .fps = launch_session->fps,
+            .hdr = launch_session->enable_hdr,
+          },
+          &entry
+        );
+      }
+      publish_eclipse_event({"session.created", launch_session->session_id, 1, std::move(created_resource)}, "session.control", client->uuid, {launch_session->app_uuid});
+    }
     if (!rtsp_stream::launch_session_raise(launch_session)) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 409);
       tree.put("root.<xmlattr>.status_message", "Another stream launch is already pending");
-      if (appid > 0) {
+      if (application_launched) {
         proc::proc.terminate();
       }
-      std::lock_guard lock {logical_session_mutex};
-      logical_session.reset();
+      {
+        std::lock_guard lock {logical_session_mutex};
+        logical_session.reset();
+      }
+      if (eclipse_v1) {
+        eclipse_unregister_session(launch_session->session_id);
+        eclipse_destroy_session_sandbox(binding);
+      }
+#ifdef _WIN32
+      if (eclipse_workspace) {
+        const auto stopped = eclipse_workspace_manager->stop(eclipse_workspace->id, eclipse_workspace->revision, true);
+        static_cast<void>(stopped);
+      }
+#endif
       return;
     }
 
@@ -1657,6 +2045,9 @@ namespace nvhttp {
       )
     );
     tree.put("root.gamesession", 1);
+    if (eclipse_v1) {
+      tree.put("root.EclipseSessionId", launch_session->session_id);
+    }
 
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
@@ -1703,6 +2094,7 @@ namespace nvhttp {
     }
 
     auto args = request->parse_query_string();
+    const bool eclipse_v1 = eclipse_api::api_v1_requested(get_arg(args, "eclipseApiVersion", ""));
     if (
       args.find("rikey"s) == std::end(args) ||
       args.find("rikeyid"s) == std::end(args)
@@ -1816,6 +2208,9 @@ namespace nvhttp {
       )
     );
     tree.put("root.resume", 1);
+    if (eclipse_v1) {
+      tree.put("root.EclipseSessionId", launch_session->session_id);
+    }
   }
 
   /**
@@ -1911,12 +2306,16 @@ namespace nvhttp {
    * @param code Stable machine-readable error code.
    * @param message Human-readable error description.
    */
-  void send_eclipse_error(const resp_https_t &response, const SimpleWeb::StatusCode status, const std::string_view code, const std::string_view message) {
+  void send_eclipse_error(const resp_https_t &response, const SimpleWeb::StatusCode status, const std::string_view code, const std::string_view message, nlohmann::json details = {}) {
+    nlohmann::json error {
+      {"code", code},
+      {"message", message},
+    };
+    if (!details.is_null() && !details.empty()) {
+      error["details"] = std::move(details);
+    }
     send_eclipse_response(response, status, {
-                                              {"error", {
-                                                          {"code", code},
-                                                          {"message", message},
-                                                        }},
+                                              {"error", std::move(error)},
                                             });
   }
 
@@ -1942,6 +2341,212 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Flush one SSE header or payload and wait for socket completion.
+   *
+   * @param response Long-lived HTTPS response.
+   * @return True when queued bytes reached the asynchronous transport layer.
+   */
+  bool flush_eclipse_event_stream(const resp_https_t &response) {
+    auto completion = std::make_shared<std::promise<SimpleWeb::error_code>>();
+    auto completed = completion->get_future();
+    response->send([completion](const SimpleWeb::error_code &error) {
+      try {
+        completion->set_value(error);
+      } catch (const std::future_error &) {}
+    });
+    return completed.wait_for(std::chrono::seconds {5}) == std::future_status::ready && !completed.get();
+  }
+
+  /**
+   * @brief Project resynchronization collections from current client permissions.
+   *
+   * @param permissions Current certificate-bound policy.
+   * @return Collection names caller can read directly.
+   */
+  std::vector<std::string> eclipse_event_collections(const eclipse_api::client_permissions_t &permissions) {
+    std::vector<std::string> collections {"host", "capabilities", "operations"};
+    const auto &scopes = permissions.scopes;
+    if (scopes.contains("catalog.read")) {
+      collections.emplace_back("catalog");
+      collections.emplace_back("workspaces");
+    }
+    if (scopes.contains("session.control")) {
+      collections.emplace_back("sessions");
+    }
+    if (scopes.contains("display.read")) {
+      collections.emplace_back("displays");
+      collections.emplace_back("virtualDisplays");
+    }
+    if (scopes.contains("telemetry.read")) {
+      collections.emplace_back("telemetry");
+    }
+    if (scopes.contains("peripheral.forward")) {
+      collections.emplace_back("peripherals");
+    }
+    if (scopes.contains("sandbox.manage")) {
+      collections.emplace_back("sandboxes");
+    }
+    if (scopes.contains("catalog.read") || scopes.contains("display.read") || scopes.contains("sandbox.manage")) {
+      collections.emplace_back("profiles");
+    }
+    return collections;
+  }
+
+  /**
+   * @brief Return authenticated Eclipse events as replayable server-sent events.
+   */
+  void eclipse_events_stream(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request);
+    if (!client) {
+      return;
+    }
+    if (!eclipse_event_hub) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Event delivery is unavailable");
+      return;
+    }
+
+    auto *const hub = eclipse_event_hub.get();
+    const auto opened = hub->open(client->uuid, eclipse_header(request, "Last-Event-ID"), eclipse_event_collections(client->permissions));
+    std::lock_guard stream_lock {eclipse_event_stream_mutex};
+    std::erase_if(eclipse_event_streams, [](auto &stream) {
+      return stream.wait_for(std::chrono::seconds::zero()) == std::future_status::ready;
+    });
+    eclipse_event_streams.emplace_back(std::async(std::launch::async, [response = std::move(response), opened, hub]() mutable {
+      response->close_connection_after_response = true;
+      response->write(SimpleWeb::StatusCode::success_ok, {
+                                                           {"Content-Type", "text/event-stream; charset=utf-8"},
+                                                           {"Cache-Control", "no-store"},
+                                                           {"Connection", "keep-alive"},
+                                                         });
+      if (!flush_eclipse_event_stream(response)) {
+        hub->disconnect(opened.stream);
+        return;
+      }
+      for (const auto &record : opened.replay) {
+        *response << eclipse_events::to_sse(record);
+        if (!flush_eclipse_event_stream(response)) {
+          hub->disconnect(opened.stream);
+          return;
+        }
+      }
+      while (true) {
+        const auto next = hub->wait(opened.stream);
+        if (next.status == eclipse_events::wait_status_t::disconnected) {
+          return;
+        }
+        if (next.status == eclipse_events::wait_status_t::idle) {
+          *response << ": keep-alive\n\n";
+        } else {
+          *response << eclipse_events::to_sse(*next.record);
+        }
+        if (!flush_eclipse_event_stream(response)) {
+          hub->disconnect(opened.stream);
+          return;
+        }
+      }
+    }));
+  }
+
+  /**
+   * @brief Build authenticated Eclipse capability and discovery metadata.
+   *
+   * @param client_uuid Stable paired-client UUID.
+   * @param client_name Paired-client friendly name.
+   * @param permissions Certificate-bound client policy.
+   * @param host_uuid Stable Sunshine host UUID.
+   * @param host_name Sunshine host name.
+   * @param host_platform Sunshine platform identifier.
+   * @param host_version Sunshine build version.
+   * @param wake_available Whether usable Wake-on-LAN information exists.
+   * @return Complete Eclipse API v1 capability response body without `schemaVersion`.
+   *
+   * On Windows the `sandboxes-v1` capability is appended and marked available only
+   * when the live provider health probe succeeds; an unhealthy provider reports its
+   * stable failure code under `features.sandboxes-v1` instead.
+   */
+  nlohmann::json eclipse_capabilities_document(
+    const std::string_view client_uuid,
+    const std::string_view client_name,
+    const eclipse_api::client_permissions_t &permissions,
+    const std::string_view host_uuid,
+    const std::string_view host_name,
+    const std::string_view host_platform,
+    const std::string_view host_version,
+    const bool wake_available
+  ) {
+    nlohmann::json capabilities = nlohmann::json::array();
+    for (const auto capability : eclipse_api::CAPABILITIES) {
+      capabilities.emplace_back(capability);
+    }
+
+    nlohmann::json features = nlohmann::json::object();
+    for (const auto capability : eclipse_api::KNOWN_CAPABILITIES) {
+      const bool available = std::ranges::find(eclipse_api::CAPABILITIES, capability) != eclipse_api::CAPABILITIES.end();
+      features[capability] = {{"available", available}};
+      if (!available) {
+        features[capability]["reasonCode"] = "not_implemented";
+        features[capability]["reason"] = "Capability is not implemented by this Sunshine build";
+      }
+    }
+#ifdef _WIN32
+    const auto sandbox_health = eclipse::windows::sandbox::health();
+    if (sandbox_health.available) {
+      capabilities.emplace_back("sandboxes-v1");
+      features["sandboxes-v1"] = {{"available", true}};
+    } else {
+      features["sandboxes-v1"]["reasonCode"] = sandbox_health.reason_code;
+      features["sandboxes-v1"]["reason"] = sandbox_health.reason;
+    }
+#endif
+    if (eclipse_peripheral_manager) {
+      capabilities.emplace_back("peripherals-v1");
+      features["peripherals-v1"] = {{"available", true}};
+    } else {
+      features["peripherals-v1"]["reasonCode"] = "provider_unavailable";
+      features["peripherals-v1"]["reason"] = "Peripheral forwarding manager failed to start";
+    }
+#ifdef _WIN32
+    capabilities.emplace_back("displays-v1");
+    features["displays-v1"] = {{"available", true}};
+#endif
+
+    const bool sandboxes_operational = features.value("sandboxes-v1", nlohmann::json::object()).value("available", false);
+    const bool peripherals_operational = eclipse_peripheral_manager != nullptr;
+    return {
+      {"apiVersion", eclipse_api::API_VERSION},
+      {"capabilities", std::move(capabilities)},
+      {"client", {
+                   {"uuid", client_uuid},
+                   {"name", client_name},
+                   {"scopes", permissions.scopes},
+                   {"allowedApps", permissions.allowed_apps},
+                   {"expiresAt", permissions.expires_at},
+                 }},
+      {"host", {
+                 {"uuid", host_uuid},
+                 {"name", host_name},
+                 {"platform", host_platform},
+                 {"version", host_version},
+                 {"wakeOnLanAvailable", wake_available},
+               }},
+      {"features", std::move(features)},
+      {"limits", {
+                   {"sessions", {{"maxActive", 1}}},
+                   {"displays", {{"maxManaged", 0}}},
+                   {"virtualDisplays", {{"maxActive", 0}}},
+                   {"workspaces", {{"maxActive", 1}}},
+                   {"sandboxes", {{"maxActive", sandboxes_operational ? 4 : 0}}},
+                   {"peripherals", {
+                                     {"maxDevices", peripherals_operational ? 32 : 0},
+                                     {"maxClaims", peripherals_operational ? 32 : 0},
+                                     {"maxMessageBytes", peripherals_operational ? 65536 : 0},
+                                     {"maxPayloadBytes", peripherals_operational ? 49152 : 0},
+                                   }},
+                 }},
+    };
+  }
+
+  /**
    * @brief Convert configured application metadata to Eclipse Catalog V2 JSON.
    *
    * @param app Runtime application context.
@@ -1956,8 +2561,60 @@ namespace nvhttp {
     if (!classification.is_object()) {
       classification = nlohmann::json::object();
     }
-    classification["source"] = classification.value("source", metadata.contains("kind") ? "user" : "unknown");
-    classification["confidence"] = classification.value("confidence", metadata.contains("kind") ? 1.0 : 0.0);
+    const auto classification_source = classification.value("source", std::string {});
+    classification["source"] = classification_source.empty() ? (metadata.contains("kind") ? "user" : "unknown") : classification_source;
+    const auto classification_confidence = classification.value("confidence", metadata.contains("kind") ? 1.0 : 0.0);
+    classification["confidence"] = std::isfinite(classification_confidence) && classification_confidence >= 0.0 && classification_confidence <= 1.0 ? classification_confidence : 0.0;
+
+    const auto unique_strings = [](const nlohmann::json &source, const std::set<std::string, std::less<>> *allowed = nullptr) {
+      nlohmann::json result = nlohmann::json::array();
+      std::set<std::string, std::less<>> seen;
+      if (!source.is_array()) {
+        return result;
+      }
+      for (const auto &entry : source) {
+        if (!entry.is_string()) {
+          continue;
+        }
+        const auto value = entry.get<std::string>();
+        if ((allowed == nullptr || allowed->contains(value)) && seen.emplace(value).second) {
+          result.emplace_back(value);
+        }
+      }
+      return result;
+    };
+    static const std::set<std::string, std::less<>> input_classes {"keyboard", "mouse", "controller", "touch", "pen"};
+
+    nlohmann::json launch_profiles = nlohmann::json::array();
+    std::set<std::string, std::less<>> launch_profile_ids;
+    bool has_default_launch_profile = false;
+    for (const auto &profile : metadata.value("launchProfiles", nlohmann::json::array())) {
+      try {
+        const auto id = profile.at("id").get<std::string>();
+        const auto name = profile.at("name").get<std::string>();
+        const auto is_default = profile.at("default").get<bool>();
+        if (!profile.is_object() || !uuid_util::is_valid(id) || name.empty() || !launch_profile_ids.emplace(id).second || (is_default && has_default_launch_profile)) {
+          continue;
+        }
+        has_default_launch_profile = has_default_launch_profile || is_default;
+        launch_profiles.push_back({{"id", id}, {"name", name}, {"default", is_default}});
+      } catch (const std::exception &) {}
+    }
+
+    nlohmann::json assets = nlohmann::json::object();
+    const auto image_path = proc::validate_app_image_path(app.image_path);
+    for (const auto asset_id : {"poster", "icon"}) {
+      if (const auto asset = eclipse_assets::inspect(image_path, asset_id)) {
+        assets[asset->id] = {
+          {"id", asset->id},
+          {"mediaType", asset->media_type},
+          {"width", asset->width},
+          {"height", asset->height},
+          {"revision", asset->revision},
+          {"url", std::format("/eclipse/v1/apps/{}/assets/{}", app.uuid, asset->id)},
+        };
+      }
+    }
 
     return {
       {"uuid", app.uuid},
@@ -1965,41 +2622,469 @@ namespace nvhttp {
       {"name", app.name},
       {"kind", normalized_kind},
       {"classification", std::move(classification)},
-      {"tags", metadata.value("tags", nlohmann::json::array())},
+      {"tags", unique_strings(metadata.value("tags", nlohmann::json::array()))},
       {"description", metadata.value("description", "")},
       {"source", metadata.value("source", "unknown")},
       {"publisher", metadata.value("publisher", "")},
       {"installed", metadata.value("installed", true)},
       {"updateAvailable", metadata.value("updateAvailable", false)},
-      {"hdr", metadata.value("hdr", video::active_hevc_mode >= 3)},
-      {"inputRequirements", metadata.value("inputRequirements", nlohmann::json::array())},
-      {"launchProfiles", metadata.value("launchProfiles", nlohmann::json::array())},
-      {"assets", metadata.value("assets", nlohmann::json::object())},
-      {"displayProfileId", metadata.value("displayProfileId", "")},
-      {"streamProfileId", metadata.value("streamProfileId", "")},
-      {"sandboxProfileId", metadata.value("sandboxProfileId", "")},
+      {"hdr", metadata.value("hdr", false)},
+      {"inputRequirements", unique_strings(metadata.value("inputRequirements", nlohmann::json::array()), &input_classes)},
+      {"launchProfiles", std::move(launch_profiles)},
+      {"assets", std::move(assets)},
+      {"displayProfileId", nullptr},
+      {"streamProfileId", nullptr},
+      {"sandboxProfileId", nullptr},
     };
   }
 
   /**
-   * @brief Serialize an immutable stream-session snapshot.
+   * @brief Return one authenticated Eclipse catalog image asset.
+   *
+   * @param response HTTPS response to populate.
+   * @param request Paired-client HTTPS request.
+   */
+  void eclipse_app_asset(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "catalog.read");
+    if (!client) {
+      return;
+    }
+    const auto app_uuid = request->path_match[1].str();
+    const auto asset_id = request->path_match[2].str();
+    const auto catalog = proc::catalog_snapshot();
+    const auto app = std::ranges::find(catalog.apps, app_uuid, &proc::ctx_t::uuid);
+    if (!uuid_util::is_valid(app_uuid) || app == catalog.apps.end() || !app_allowed(*client, app_uuid)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "asset_not_found", "Asset does not exist or is not visible to this client");
+      return;
+    }
+    if (asset_id != "poster" && asset_id != "icon") {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "asset_not_found", "Asset does not exist or is not visible to this client");
+      return;
+    }
+    const auto asset = eclipse_assets::inspect(proc::validate_app_image_path(app->image_path), asset_id);
+    if (!asset) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "asset_not_found", "Asset does not exist or is not visible to this client");
+      return;
+    }
+
+    std::ifstream stream {asset->path, std::ios::binary};
+    if (!stream) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, "host_failure", "Asset became unavailable while opening it");
+      return;
+    }
+    const SimpleWeb::CaseInsensitiveMultimap headers {
+      {"Content-Type", asset->media_type},
+      {"Content-Length", std::to_string(asset->size)},
+      {"ETag", asset->etag},
+      {"Cache-Control", "no-store"},
+    };
+    response->write(SimpleWeb::StatusCode::success_ok, stream, headers);
+    response->close_connection_after_response = true;
+  }
+
+  /**
+   * @brief Resolve the machine-readable state reason for a session state.
+   *
+   * @param state Published session state.
+   * @return Stable state-reason token.
+   */
+  std::string_view eclipse_session_reason(std::string_view state) {
+    if (state == "preparing") {
+      return "queued";
+    }
+    if (state == "starting") {
+      return "transport-negotiating";
+    }
+    if (state == "running") {
+      return "streaming";
+    }
+    if (state == "disconnected") {
+      return "transport-disconnected";
+    }
+    if (state == "stopping") {
+      return "requested";
+    }
+    if (state == "stopped") {
+      return "terminated";
+    }
+    if (state == "failed") {
+      return "error";
+    }
+    return "unknown";
+  }
+
+  /**
+   * @brief Serialize an immutable stream-session snapshot with tracking metadata.
    *
    * @param session Session snapshot.
+   * @param tracking Published lifecycle tracking state, or null for untracked sessions.
    * @return Eclipse session resource.
    */
-  nlohmann::json eclipse_session_json(const rtsp_stream::session_info_t &session) {
+  nlohmann::json eclipse_session_json(const rtsp_stream::session_info_t &session, const eclipse_session_tracking_t *tracking) {
     const auto started_at = std::chrono::duration_cast<std::chrono::milliseconds>(session.started_at.time_since_epoch()).count();
+    const auto uuid_or_null = [](const std::string &value) {
+      return value.empty() ? nlohmann::json(nullptr) : nlohmann::json(value);
+    };
+    const auto updated_at = tracking && tracking->updated_at > 0 ? tracking->updated_at : started_at;
     return {
       {"id", session.id},
       {"ownerClientUuid", session.client_uuid},
       {"appUuid", session.app_uuid},
       {"legacyAppId", session.legacy_app_id},
+      {"workspaceId", uuid_or_null(tracking ? tracking->binding.workspace_id : std::string {})},
       {"state", session.state},
+      {"stateReason", std::string {eclipse_session_reason(session.state)}},
       {"startedAt", started_at},
+      {"updatedAt", updated_at},
       {"width", session.width},
       {"height", session.height},
       {"refreshRate", session.fps},
       {"hdr", session.hdr},
+      {"displayId", nullptr},
+      {"displayProfileId", uuid_or_null(tracking ? tracking->binding.display_profile_id : std::string {})},
+      {"streamProfileId", uuid_or_null(tracking ? tracking->binding.stream_profile_id : std::string {})},
+      {"launchProfileId", uuid_or_null(tracking ? tracking->binding.launch_profile_id : std::string {})},
+      {"sandboxProfileId", uuid_or_null(tracking ? tracking->binding.sandbox_profile_id : std::string {})},
+      {"sandboxId", uuid_or_null(tracking ? tracking->binding.sandbox_id : std::string {})},
+      {"peripheralClaimIds", nlohmann::json::array()},
+      {"revision", tracking ? tracking->revision : 1},
+    };
+  }
+
+  /**
+   * @brief Snapshot the published tracking state for one session.
+   *
+   * @param session_id Session UUID.
+   * @return Tracking snapshot, or no value when the session is untracked.
+   */
+  std::optional<eclipse_session_tracking_t> eclipse_session_tracking_for(const std::string &session_id) {
+    std::lock_guard lock {eclipse_session_tracking_mutex};
+    const auto found = eclipse_session_tracking.find(session_id);
+    return found == eclipse_session_tracking.end() ? std::nullopt : std::optional {found->second};
+  }
+
+  /**
+   * @brief Resolve and authorize profile references requested for a launch.
+   *
+   * Explicit `eclipse*ProfileId` query fields take precedence over workspace
+   * definition references, which take precedence over application metadata
+   * defaults. Every resolved reference is checked for canonical syntax, type,
+   * caller read authority, and application compatibility.
+   *
+   * @param client Authenticated caller.
+   * @param app Catalog application being launched.
+   * @param args Parsed launch query arguments.
+   * @param workspace Workspace launch association, or null for direct launches.
+   * @param error_code Receives the stable error code on failure.
+   * @param error_message Receives the human-readable failure description.
+   * @return Resolved references, or no value after failure.
+   */
+  std::optional<eclipse_session_binding_t> eclipse_resolve_launch_references(const verified_client_t &client, const proc::ctx_t &app, const args_t &args, const eclipse_workspaces::resource_t *workspace, std::string_view *error_code, std::string &error_message) {
+    static constexpr std::string_view SANDBOX_READ_SCOPE = "sandbox.manage";
+    const auto fail = [&](std::string_view code, std::string message) {
+      if (error_code) {
+        *error_code = code;
+      }
+      error_message = std::move(message);
+      return std::nullopt;
+    };
+    const auto explicit_reference = [&](const char *name) {
+      const auto found = args.find(name);
+      return found == args.end() || found->second.empty() ? std::optional<std::string> {} : std::optional<std::string> {found->second};
+    };
+    const auto resolve_one = [&](const char *name, const std::string &type, const std::string_view read_scope, const std::optional<std::string> &workspace_default, const std::function<bool(const nlohmann::json &)> &compatible, std::string &resolved) -> bool {
+      auto requested = explicit_reference(name);
+      if (!requested && workspace_default) {
+        requested = workspace_default;
+      }
+      if (!requested && type == "launch") {
+        for (const auto &profile : app.eclipse_metadata.value("launchProfiles", nlohmann::json::array())) {
+          if (profile.value("default", false) && profile.contains("id")) {
+            requested = profile.at("id").get<std::string>();
+          }
+        }
+      } else if (!requested) {
+        std::string metadata_key {name + std::char_traits<char>::length("eclipse")};
+        metadata_key[0] = static_cast<char>(std::tolower(static_cast<unsigned char>(metadata_key[0])));
+        const auto metadata_default = app.eclipse_metadata.value(metadata_key, "");
+        if (!metadata_default.empty()) {
+          requested = metadata_default;
+        }
+      }
+      if (!requested) {
+        resolved.clear();
+        return true;
+      }
+      if (!uuid_util::is_valid(*requested)) {
+        fail("invalid_argument", std::format("{} must be a canonical UUID", name));
+        return false;
+      }
+      const auto profile = eclipse_profile_manager ? eclipse_profile_manager->inspect(*requested) : std::nullopt;
+      if (!profile || profile->type != type) {
+        fail("resource_not_found", std::format("{} does not resolve to a readable {}", name, type));
+        return false;
+      }
+      if (!scope_allowed(client, read_scope)) {
+        fail("permission_denied", std::format("{} requires the {} scope", name, read_scope));
+        return false;
+      }
+      if (compatible && !compatible(profile->configuration)) {
+        fail("unsupported_configuration", std::format("{} is not compatible with this application", name));
+        return false;
+      }
+      resolved = *requested;
+      return true;
+    };
+    eclipse_session_binding_t binding;
+    if (workspace) {
+      binding.workspace_id = workspace->id;
+    }
+    if (!resolve_one("eclipseDisplayProfileId", "display", "display.read", workspace ? workspace->definition.display_profile_id : std::nullopt, {}, binding.display_profile_id)) {
+      return std::nullopt;
+    }
+    if (!resolve_one("eclipseStreamProfileId", "stream", "catalog.read", workspace ? workspace->definition.stream_profile_id : std::nullopt, {}, binding.stream_profile_id)) {
+      return std::nullopt;
+    }
+    if (!resolve_one("eclipseLaunchProfileId", "launch", "catalog.read", workspace ? workspace->definition.launch_profile_id : std::nullopt, [&](const nlohmann::json &configuration) {
+          return configuration.at("appUuid") == app.uuid;
+        },
+                     binding.launch_profile_id)) {
+      return std::nullopt;
+    }
+    if (!resolve_one("eclipseSandboxProfileId", "sandbox", SANDBOX_READ_SCOPE, workspace ? workspace->definition.sandbox_profile_id : std::nullopt, [&](const nlohmann::json &configuration) {
+          return eclipse_json_contains_string(configuration.at("allowedAppUuids"), app.uuid);
+        },
+                     binding.sandbox_profile_id)) {
+      return std::nullopt;
+    }
+    return binding;
+  }
+
+  /**
+   * @brief Create and start one session-scoped sandbox for a direct launch.
+   *
+   * @param client Authenticated caller.
+   * @param app Catalog application being launched.
+   * @param binding Resolved launch references; receives the sandbox UUID.
+   * @param error_message Receives the human-readable failure description.
+   * @return True when the sandbox is running.
+   */
+  bool eclipse_launch_direct_sandbox(const verified_client_t &client, const proc::ctx_t &app, eclipse_session_binding_t &binding, std::string &error_message) {
+    if (binding.sandbox_profile_id.empty() || !eclipse_sandbox_manager) {
+      return true;
+    }
+    const auto profile = eclipse_profile_manager ? eclipse_profile_manager->inspect(binding.sandbox_profile_id) : std::nullopt;
+    if (!profile) {
+      error_message = "Sandbox profile became unavailable before launch";
+      return false;
+    }
+    const auto created = eclipse_sandbox_manager->create(client.uuid, {
+                                                                        binding.sandbox_profile_id,
+                                                                        std::nullopt,
+                                                                        app.uuid,
+                                                                        false,
+                                                                        app.name,
+                                                                        profile->configuration,
+                                                                      });
+    if (created.status != eclipse_sandboxes::status_t::success || !created.resource) {
+      error_message = "Sandbox isolation could not be created for this launch";
+      return false;
+    }
+    publish_eclipse_sandbox_event("sandbox.created", *created.resource, eclipse_sandboxes::to_json(*created.resource), client.uuid);
+    const auto started = eclipse_sandbox_manager->start(created.resource->id, created.resource->revision, eclipse_sandboxes::start_t {.app_uuid = app.uuid});
+    if (started.status != eclipse_sandboxes::status_t::success || !started.resource) {
+      error_message = "Sandbox isolation could not be started for this launch";
+      eclipse_destroy_sandbox_by_id(created.resource->id);
+      return false;
+    }
+    publish_eclipse_sandbox_event("sandbox.updated", *started.resource, eclipse_sandboxes::to_json(*started.resource), client.uuid);
+    binding.sandbox_id = started.resource->id;
+    return true;
+  }
+
+  /**
+   * @brief Destroy one session-scoped sandbox, forcing termination when required.
+   *
+   * @param sandbox_id Canonical sandbox UUID.
+   */
+  void eclipse_destroy_sandbox_by_id(const std::string &sandbox_id) {
+    if (sandbox_id.empty() || !eclipse_sandbox_manager) {
+      return;
+    }
+    const auto sandbox = eclipse_sandbox_manager->get(sandbox_id);
+    if (!sandbox) {
+      return;
+    }
+    auto removed = eclipse_sandbox_manager->remove(sandbox->id, sandbox->revision);
+    if (removed.status != eclipse_sandboxes::status_t::success) {
+      const auto stopped = eclipse_sandbox_manager->stop(sandbox->id, sandbox->revision, true);
+      if (stopped.status == eclipse_sandboxes::status_t::success && stopped.resource) {
+        removed = eclipse_sandbox_manager->remove(sandbox->id, stopped.resource->revision);
+      }
+    }
+    if (removed.status != eclipse_sandboxes::status_t::success) {
+      BOOST_LOG(error) << "Failed to destroy session sandbox [" << sandbox_id << ']';
+    } else if (eclipse_peripheral_manager) {
+      eclipse_peripheral_manager->target_ended("sandbox", sandbox_id, true);
+    }
+  }
+
+  /**
+   * @brief Destroy the sandbox bound to one session binding.
+   *
+   * @param binding Resolved launch references.
+   */
+  void eclipse_destroy_session_sandbox(const eclipse_session_binding_t &binding) {
+    eclipse_destroy_sandbox_by_id(binding.sandbox_id);
+  }
+
+  /**
+   * @brief Forget published tracking state for one session without side effects.
+   *
+   * @param session_id Session UUID.
+   */
+  void eclipse_unregister_session(const std::string &session_id) {
+    std::lock_guard lock {eclipse_session_tracking_mutex};
+    if (eclipse_session_tracking.erase(session_id) > 0) {
+      ++eclipse_session_collection_revision;
+    }
+  }
+
+  /**
+   * @brief Serialize one session telemetry snapshot.
+   *
+   * @param session Session snapshot.
+   * @param tracking Published tracking state, or null when untracked.
+   * @return Session telemetry object following the telemetry-v1 schema.
+   */
+  nlohmann::json eclipse_telemetry_session_json(const rtsp_stream::session_info_t &session, const eclipse_session_tracking_t *tracking) {
+    const auto uuid_or_null = [](const std::string &value) {
+      return value.empty() ? nlohmann::json(nullptr) : nlohmann::json(value);
+    };
+    return {
+      {"sessionId", session.id},
+      {"generation", 1},
+      {"state", session.state},
+      {"codec", nullptr},
+      {"width", session.width},
+      {"height", session.height},
+      {"refreshRate", session.fps},
+      {"hdr", session.hdr},
+      {"captureFps", nullptr},
+      {"encodeFps", nullptr},
+      {"transmitFps", nullptr},
+      {"capturedFrames", nullptr},
+      {"encodedFrames", nullptr},
+      {"droppedFrames", nullptr},
+      {"transmittedFrames", nullptr},
+      {"captureLatencyMs", nullptr},
+      {"encodeLatencyMs", nullptr},
+      {"bitrateKbps", nullptr},
+      {"networkRttMs", nullptr},
+      {"networkJitterMs", nullptr},
+      {"networkLossPercent", nullptr},
+      {"videoBytes", nullptr},
+      {"audioBytes", nullptr},
+      {"controlBytes", nullptr},
+      {"inputBytes", nullptr},
+      {"queueDepth", nullptr},
+      {"queueDrops", nullptr},
+      {"displayId", nullptr},
+      {"sandboxId", uuid_or_null(tracking ? tracking->binding.sandbox_id : std::string {})},
+      {"workspaceId", uuid_or_null(tracking ? tracking->binding.workspace_id : std::string {})},
+      {"peripheralClaimIds", nlohmann::json::array()},
+    };
+  }
+
+  /**
+   * @brief Serialize host telemetry and the visible session telemetry collection.
+   *
+   * @param owner_filter When non-empty, restrict session entries to this owner UUID.
+   * @return Complete telemetry document without `schemaVersion`.
+   */
+  nlohmann::json eclipse_telemetry_document(const std::string &owner_filter) {
+    const auto snapshots = eclipse_session_snapshots();
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto uptime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - eclipse_start_time).count();
+    std::size_t transport_sessions = 0;
+    nlohmann::json sessions = nlohmann::json::array();
+    for (const auto &session : snapshots) {
+      if (!owner_filter.empty() && session.client_uuid != owner_filter) {
+        continue;
+      }
+      if (session.state == "starting" || session.state == "running") {
+        ++transport_sessions;
+      }
+      const auto tracking = eclipse_session_tracking_for(session.id);
+      sessions.push_back(eclipse_telemetry_session_json(session, tracking ? &*tracking : nullptr));
+    }
+#ifdef _WIN32
+    const auto display_snapshot = eclipse_display_snapshot();
+    const std::optional<std::uint64_t> healthy_displays = display_snapshot ? std::optional<std::uint64_t> {static_cast<std::uint64_t>(display_snapshot->second.size())} : std::nullopt;
+#else
+    const std::optional<std::uint64_t> healthy_displays;
+#endif
+#ifdef _WIN32
+    std::optional<std::uint64_t> healthy_virtual_displays;
+    if (eclipse_virtual_display_manager) {
+      healthy_virtual_displays = 0;
+      for (const auto &virtual_display : eclipse_virtual_display_manager->list().resources) {
+        if (virtual_display.state == eclipse_virtual_display::state_t::ready || virtual_display.state == eclipse_virtual_display::state_t::attached) {
+          ++*healthy_virtual_displays;
+        }
+      }
+    }
+#else
+    std::optional<std::uint64_t> healthy_virtual_displays;
+#endif
+#ifdef _WIN32
+    std::optional<std::uint64_t> running_sandboxes;
+    if (eclipse_sandbox_manager) {
+      running_sandboxes = 0;
+      for (const auto &sandbox : eclipse_sandbox_manager->list().resources) {
+        if (sandbox.state == eclipse_sandboxes::state_t::running || sandbox.state == eclipse_sandboxes::state_t::starting) {
+          ++*running_sandboxes;
+        }
+      }
+    }
+#else
+    std::optional<std::uint64_t> running_sandboxes;
+#endif
+    const auto count_or_null = [](const std::optional<std::uint64_t> &value) {
+      return value ? nlohmann::json(*value) : nlohmann::json(nullptr);
+    };
+    return {
+      {"timestamp", now_ms},
+      {
+        "host",
+        {
+          {"uptimeMs", uptime_ms},
+          {"healthy", true},
+          {"captureHealthy", nullptr},
+          {"captureFps", nullptr},
+          {"encoderHealthy", nullptr},
+          {"encoderName", nullptr},
+          {"encoderCodec", nullptr},
+          {"encoderPixelFormat", nullptr},
+          {"encoderUtilizationPercent", nullptr},
+          {"encoderLatencyMs", nullptr},
+          {"audioCaptureHealthy", nullptr},
+          {"audioQueueDepth", nullptr},
+          {"sunshineCpuPercent", nullptr},
+          {"sunshineMemoryBytes", nullptr},
+          {"gpuPercent", nullptr},
+          {"gpuMemoryBytes", nullptr},
+          {"gpuTemperatureC", nullptr},
+          {"gpuDriverReset", nullptr},
+          {"activeLogicalSessions", snapshots.size()},
+          {"activeTransportSessions", transport_sessions},
+          {"healthyDisplayCount", count_or_null(healthy_displays)},
+          {"healthyVirtualDisplayCount", count_or_null(healthy_virtual_displays)},
+          {"runningSandboxCount", count_or_null(running_sandboxes)},
+          {"activePeripheralClaimCount", nullptr},
+        },
+      },
+      {"sessions", std::move(sessions)},
     };
   }
 
@@ -2044,17 +3129,60 @@ namespace nvhttp {
     if (!client) {
       return;
     }
-    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                         {"apiVersion", eclipse_api::API_VERSION},
-                                                                         {"capabilities", eclipse_api::CAPABILITIES},
-                                                                         {"client", {
-                                                                                      {"uuid", client->uuid},
-                                                                                      {"name", client->name},
-                                                                                      {"scopes", client->permissions.scopes},
-                                                                                      {"allowedApps", client->permissions.allowed_apps},
-                                                                                      {"expiresAt", client->permissions.expires_at},
-                                                                                    }},
-                                                                       });
+    const auto local_address = net::addr_to_normalized_string(request->local_endpoint().address());
+    const auto wake_available = eclipse_api::wake_on_lan_available(platf::get_mac_address(local_address));
+    send_eclipse_response(
+      response,
+      SimpleWeb::StatusCode::success_ok,
+      eclipse_capabilities_document(
+        client->uuid,
+        client->name,
+        client->permissions,
+        http::unique_id,
+        config::nvhttp.sunshine_name,
+        SUNSHINE_PLATFORM,
+        PROJECT_VERSION,
+        wake_available
+      )
+    );
+  }
+
+  /**
+   * @brief Project one workspace as a first-class Catalog V2 entry.
+   *
+   * @param workspace Workspace resource.
+   * @return Catalog application resource with `kind: workspace` whose UUID is the workspace UUID.
+   */
+  nlohmann::json eclipse_workspace_catalog_json(const eclipse_workspaces::resource_t &workspace) {
+    const auto &definition = workspace.definition;
+    const auto uuid_or_null = [](const std::optional<std::string> &value) {
+      return value ? nlohmann::json(*value) : nlohmann::json(nullptr);
+    };
+    nlohmann::json tags = nlohmann::json::array();
+    tags.push_back("workspace");
+    return {
+      {"uuid", workspace.id},
+      {"legacyId", nullptr},
+      {"name", definition.name},
+      {"kind", "workspace"},
+      {"classification", {
+                           {"source", "user"},
+                           {"confidence", 1.0},
+                         }},
+      {"tags", std::move(tags)},
+      {"description", definition.description},
+      {"source", "eclipse"},
+      {"publisher", nullptr},
+      {"installed", true},
+      {"updateAvailable", false},
+      {"hdr", false},
+      {"inputRequirements", nlohmann::json::array()},
+      {"assets", nlohmann::json::object()},
+      {"launchProfiles", nlohmann::json::array()},
+      {"displayProfileId", uuid_or_null(definition.display_profile_id)},
+      {"streamProfileId", uuid_or_null(definition.stream_profile_id)},
+      {"sandboxProfileId", uuid_or_null(definition.sandbox_profile_id)},
+    };
   }
 
   /**
@@ -2089,6 +3217,19 @@ namespace nvhttp {
           apps.emplace_back(eclipse_app_json(app));
         }
       }
+#ifdef _WIN32
+      if (eclipse_workspace_manager) {
+        for (const auto &workspace : eclipse_workspace_manager->list().workspaces) {
+          if (workspace.definition.desktop_app_uuid.empty() || !app_allowed(*client, workspace.definition.desktop_app_uuid)) {
+            continue;
+          }
+          if (!eclipse_workspace_visible(*client, workspace, false)) {
+            continue;
+          }
+          apps.push_back(eclipse_workspace_catalog_json(workspace));
+        }
+      }
+#endif
     }
     send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {
                                                                          {"revision", catalog.revision},
@@ -2096,6 +3237,2406 @@ namespace nvhttp {
                                                                          {"fullSnapshot", changed},
                                                                          {"apps", std::move(apps)},
                                                                        });
+  }
+
+#ifdef _WIN32
+  /**
+   * @brief Enumerate displays and advance collection revision after observable changes.
+   *
+   * @return Current collection revision and serialized display resources, or no value
+   * when display enumeration is unavailable.
+   */
+  std::optional<std::pair<std::uint64_t, nlohmann::json>> eclipse_display_snapshot() {
+    const auto devices = display_device::enumerate_devices();
+    if (devices.empty()) {
+      return std::nullopt;
+    }
+    nlohmann::json displays = nlohmann::json::array();
+    for (const auto &snapshot : eclipse::windows::display::enumerate_snapshot(http::unique_id, devices)) {
+      displays.push_back(eclipse::windows::display::to_json(snapshot));
+    }
+    const auto fingerprint = displays.dump();
+    std::scoped_lock lock {physical_display_revision.mutex};
+    if (physical_display_revision.revision == 0 || physical_display_revision.fingerprint != fingerprint) {
+      physical_display_revision.fingerprint = fingerprint;
+      ++physical_display_revision.revision;
+    }
+    for (auto &display : displays) {
+      display["revision"] = physical_display_revision.revision;
+    }
+    return std::pair {physical_display_revision.revision, std::move(displays)};
+  }
+
+  /**
+   * @brief Project one virtual display resource into the unified inventory schema.
+   *
+   * @param resource Virtual display resource.
+   * @return Unified display resource with contract-required inventory fields.
+   */
+  nlohmann::json eclipse_unified_virtual_display_json(const eclipse_virtual_display::resource_t &resource) {
+    auto display = eclipse_virtual_display::to_json(resource);
+    const auto ready = resource.state == eclipse_virtual_display::state_t::ready || resource.state == eclipse_virtual_display::state_t::attached;
+    const auto actual_size = display.at("actualMode");
+    display["kind"] = "virtual";
+    display["platformId"] = nullptr;
+    display["connected"] = ready;
+    display["enabled"] = ready;
+    display["logicalSize"] = {
+      {"width", actual_size.at("width")},
+      {"height", actual_size.at("height")},
+    };
+    display["currentMode"] = std::move(actual_size);
+    display["supportedModes"] = nlohmann::json::array({display.at("currentMode")});
+    display["hdr"] = {
+      {"supported", resource.hdr},
+      {"enabled", resource.hdr},
+    };
+    display["captureEligible"] = resource.state == eclipse_virtual_display::state_t::attached;
+    return display;
+  }
+
+  /**
+   * @brief Build the unified physical and virtual display inventory.
+   *
+   * @return Unified collection revision and display resources, or no value when
+   * physical display enumeration is unavailable.
+   */
+  std::optional<std::pair<std::uint64_t, nlohmann::json>> eclipse_unified_displays() {
+    auto physical = eclipse_display_snapshot();
+    if (!physical) {
+      return std::nullopt;
+    }
+    std::uint64_t virtual_revision = 0;
+    if (eclipse_virtual_display_manager) {
+      const auto virtual_displays = eclipse_virtual_display_manager->list();
+      virtual_revision = virtual_displays.revision;
+      for (const auto &resource : virtual_displays.resources) {
+        physical->second.push_back(eclipse_unified_virtual_display_json(resource));
+      }
+    }
+    std::scoped_lock lock {eclipse_unified_display_revision.mutex};
+    if (eclipse_unified_display_revision.revision == 0 || eclipse_unified_display_revision.inputs != std::pair {physical->first, virtual_revision}) {
+      eclipse_unified_display_revision.inputs = {physical->first, virtual_revision};
+      ++eclipse_unified_display_revision.revision;
+    }
+    for (auto &display : physical->second) {
+      display["revision"] = eclipse_unified_display_revision.revision;
+    }
+    return std::pair {eclipse_unified_display_revision.revision, std::move(physical->second)};
+  }
+
+  /**
+   * @brief Serialize the current topology resource from the unified inventory.
+   *
+   * @param displays Unified display inventory resources.
+   * @return Topology object with stable identifier and revision.
+   */
+  nlohmann::json eclipse_topology_document(nlohmann::json displays) {
+    nlohmann::json entries = nlohmann::json::array();
+    for (const auto &display : displays) {
+      entries.push_back({
+        {"id", display.at("id")},
+        {"enabled", display.at("enabled")},
+        {"primary", display.at("primary")},
+        {"x", display.at("position").at("x")},
+        {"y", display.at("position").at("y")},
+        {"scale", static_cast<double>(display.at("scale").at("numerator").get<std::uint64_t>()) / static_cast<double>(display.at("scale").at("denominator").get<std::uint64_t>())},
+        {"rotation", display.value("rotation", 0)},
+        {"modeId", display.at("currentMode").is_null() ? nlohmann::json(nullptr) : nlohmann::json(display.at("currentMode").at("id"))},
+        {"hdr", display.at("hdr").is_object() ? nlohmann::json(display.at("hdr").value("enabled", false)) : nlohmann::json(nullptr)},
+      });
+    }
+    const auto fingerprint = entries.dump();
+    std::scoped_lock lock {eclipse_topology_state.mutex};
+    if (eclipse_topology_state.revision == 0 || eclipse_topology_state.fingerprint != fingerprint) {
+      eclipse_topology_state.fingerprint = fingerprint;
+      ++eclipse_topology_state.revision;
+    }
+    return {
+      {"id", eclipse::windows::display::display_resource_uuid(http::unique_id, "eclipse-display-topology")},
+      {"revision", eclipse_topology_state.revision},
+      {"displays", std::move(entries)},
+    };
+  }
+
+  /**
+   * @brief Return the current display topology resource.
+   */
+  void eclipse_display_topology_get(resp_https_t response, req_https_t request) {
+    if (!authorize_eclipse_request(response, request, "display.read")) {
+      return;
+    }
+    auto snapshot = eclipse_unified_displays();
+    if (!snapshot) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Windows display inventory is unavailable");
+      return;
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"topology", eclipse_topology_document(std::move(snapshot->second))}});
+  }
+
+  /**
+   * @brief Resolve one requested display mode by stable identifier.
+   *
+   * @param display Unified display resource.
+   * @param mode_id Requested stable mode identifier.
+   * @return Matching mode object, or null when the mode is unknown.
+   */
+  nlohmann::json eclipse_resolve_display_mode(const nlohmann::json &display, const std::string &mode_id) {
+    for (const auto &mode : display.at("supportedModes")) {
+      if (mode.at("id") == mode_id) {
+        return mode;
+      }
+    }
+    return nullptr;
+  }
+
+  /**
+   * @brief Apply one validated physical-display configuration and wait for observable change.
+   *
+   * @param device_id Stable libdisplaydevice identifier.
+   * @param mode Requested mode object, or null to leave the mode unchanged.
+   * @param primary Whether the display must become primary.
+   * @param hdr Requested HDR state, or no value to leave HDR unchanged.
+   * @param previous_fingerprint Inventory fingerprint observed before mutation.
+   * @return `true` when configuration was scheduled for application.
+   */
+  bool eclipse_apply_physical_display(const std::string &device_id, const nlohmann::json &mode, bool primary, std::optional<bool> hdr, const std::string &previous_fingerprint) {
+    display_device::SingleDisplayConfiguration configuration;
+    configuration.m_device_id = device_id;
+    configuration.m_device_prep = primary ? display_device::SingleDisplayConfiguration::DevicePreparation::EnsurePrimary : display_device::SingleDisplayConfiguration::DevicePreparation::EnsureActive;
+    if (!mode.is_null()) {
+      configuration.m_resolution = display_device::Resolution {
+        mode.at("width").get<unsigned int>(),
+        mode.at("height").get<unsigned int>(),
+      };
+      configuration.m_refresh_rate = display_device::Rational {
+        mode.at("refreshNumerator").get<unsigned int>(),
+        mode.at("refreshDenominator").get<unsigned int>(),
+      };
+    }
+    if (hdr) {
+      configuration.m_hdr_state = *hdr ? display_device::HdrState::Enabled : display_device::HdrState::Disabled;
+    }
+    if (configuration.m_device_prep == display_device::SingleDisplayConfiguration::DevicePreparation::EnsureActive && !configuration.m_resolution && !configuration.m_hdr_state) {
+      return true;
+    }
+    display_device::configure_display(configuration);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds {2};
+    while (std::chrono::steady_clock::now() < deadline) {
+      const auto snapshot = eclipse_display_snapshot();
+      if (!snapshot) {
+        return false;
+      }
+      if (snapshot->second.dump() != previous_fingerprint) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds {50});
+    }
+    return true;
+  }
+
+  /**
+   * @brief Replace the desired topology for managed physical displays.
+   */
+  void eclipse_display_topology_put(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "display.manage");
+    if (!client) {
+      return;
+    }
+    const auto body = eclipse_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    if (!body->contains("displays") || !body->at("displays").is_array()) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Body must contain a displays array");
+      return;
+    }
+    const auto if_match = eclipse_if_match(request);
+    if (!if_match) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_precondition_required, "precondition_required", "If-Match header with the current topology revision is required");
+      return;
+    }
+    auto before = eclipse_unified_displays();
+    if (!before) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Windows display inventory is unavailable");
+      return;
+    }
+    std::uint64_t topology_revision = 0;
+    {
+      std::scoped_lock lock {eclipse_topology_state.mutex};
+      topology_revision = eclipse_topology_state.revision;
+    }
+    if (topology_revision == 0 || *if_match != topology_revision) {
+      nlohmann::json details {{"currentRevision", topology_revision}};
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_conflict, "revision_conflict", "Topology revision does not match If-Match", std::move(details));
+      return;
+    }
+
+    struct requested_display_t {
+      nlohmann::json display;  ///< Matching unified inventory resource.
+      bool primary {};  ///< Requested primary state.
+      std::optional<bool> hdr;  ///< Requested HDR state.
+      nlohmann::json mode;  ///< Requested mode object or null.
+    };
+
+    std::vector<requested_display_t> requested;
+    for (const auto &entry : body->at("displays")) {
+      if (!entry.is_object() || !entry.contains("id") || !entry.at("id").is_string() || !entry.contains("enabled") || !entry.at("enabled").is_boolean() || !entry.contains("primary") || !entry.at("primary").is_boolean() || !entry.contains("x") || !entry.at("x").is_number_integer() || !entry.contains("y") || !entry.at("y").is_number_integer() || !entry.contains("scale") || !entry.at("scale").is_number() || !entry.contains("rotation") || !entry.at("rotation").is_number_integer()) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Each displays entry requires id, enabled, primary, x, y, scale, and rotation");
+        return;
+      }
+      const auto display_id = entry.at("id").get<std::string>();
+      const auto found = std::ranges::find_if(before->second, [&](const nlohmann::json &display) {
+        return display.at("id") == display_id;
+      });
+      if (found == before->second.end() || found->at("kind") != "physical") {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Topology entries may only list known physical displays");
+        return;
+      }
+      if (!entry.at("enabled").get<bool>()) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Disabling displays is not supported by this host");
+        return;
+      }
+      if (entry.at("rotation").get<int>() != 0) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Rotation values other than zero are not supported by this host");
+        return;
+      }
+      nlohmann::json mode = nullptr;
+      if (entry.contains("modeId") && !entry.at("modeId").is_null()) {
+        mode = eclipse_resolve_display_mode(*found, entry.at("modeId").get<std::string>());
+        if (mode.is_null()) {
+          send_eclipse_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Requested display mode is not supported by the display");
+          return;
+        }
+      }
+      requested.push_back({*found, entry.at("primary").get<bool>(), entry.contains("hdr") && !entry.at("hdr").is_null() ? std::optional<bool> {entry.at("hdr").get<bool>()} : std::nullopt, std::move(mode)});
+    }
+    if (std::ranges::count_if(requested, [](const auto &entry) {
+          return entry.primary;
+        }) > 1) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Only one display may be requested as primary");
+      return;
+    }
+    if (requested.empty()) {
+      const auto after = eclipse_unified_displays();
+      send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {
+                                                                           {"topology", eclipse_topology_document(after ? after->second : nlohmann::json::array())},
+                                                                           {"displays", after ? after->second : nlohmann::json::array()},
+                                                                         });
+      return;
+    }
+    const auto previous_fingerprint = before->second.dump();
+    bool applied = true;
+    for (const auto &entry : requested) {
+      std::string libdevice_id;
+      for (const auto &snapshot : eclipse::windows::display::enumerate_snapshot(http::unique_id, display_device::enumerate_devices())) {
+        if (entry.display.at("id") == snapshot.resource_uuid) {
+          libdevice_id = snapshot.device_id;
+        }
+      }
+      if (libdevice_id.empty()) {
+        applied = false;
+        break;
+      }
+      if (!eclipse_apply_physical_display(libdevice_id, entry.mode, entry.primary, entry.hdr, previous_fingerprint)) {
+        applied = false;
+        break;
+      }
+    }
+    const auto after = eclipse_unified_displays();
+    if (!applied || !after) {
+      display_device::revert_configuration();
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "host_failure", "Topology could not be applied; requested state was reverted");
+      return;
+    }
+    BOOST_LOG(info) << "Audit: client ["sv << client->uuid << "] applied display topology";
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {
+                                                                         {"topology", eclipse_topology_document(after->second)},
+                                                                         {"displays", after->second},
+                                                                       });
+  }
+
+  /**
+   * @brief Patch one managed display resource.
+   */
+  void eclipse_patch_display(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "display.manage");
+    if (!client) {
+      return;
+    }
+    const auto display_id = request->path_match[1].str();
+    const auto body = eclipse_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    auto before = eclipse_unified_displays();
+    if (!before) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Windows display inventory is unavailable");
+      return;
+    }
+    const auto found = std::ranges::find_if(before->second, [&](const nlohmann::json &display) {
+      return display.at("id") == display_id;
+    });
+    if (found == before->second.end()) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "display_not_found", "Display does not exist or is not visible to this client");
+      return;
+    }
+    if (found->at("kind") == "virtual") {
+      eclipse_patch_virtual_display(response, request);
+      return;
+    }
+    for (const auto &field : body->items()) {
+      if (field.key() == "position" || field.key() == "scale" || field.key() == "rotation") {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", std::format("{} is immutable on this host", field.key()));
+        return;
+      }
+      if (field.key() != "enabled" && field.key() != "primary" && field.key() != "modeId" && field.key() != "hdr") {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", std::format("{} is not a mutable display field", field.key()));
+        return;
+      }
+    }
+    if (body->contains("enabled") && !body->at("enabled").get<bool>()) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Disabling displays is not supported by this host");
+      return;
+    }
+    nlohmann::json mode = nullptr;
+    if (body->contains("modeId") && !body->at("modeId").is_null()) {
+      mode = eclipse_resolve_display_mode(*found, body->at("modeId").get<std::string>());
+      if (mode.is_null()) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Requested display mode is not supported by the display");
+        return;
+      }
+    }
+    std::string libdevice_id;
+    for (const auto &snapshot : eclipse::windows::display::enumerate_snapshot(http::unique_id, display_device::enumerate_devices())) {
+      if (snapshot.resource_uuid == display_id) {
+        libdevice_id = snapshot.device_id;
+      }
+    }
+    if (libdevice_id.empty()) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "host_failure", "Display could not be resolved for mutation");
+      return;
+    }
+    const auto applied = eclipse_apply_physical_display(
+      libdevice_id,
+      mode,
+      body->contains("primary") && body->at("primary").get<bool>(),
+      body->contains("hdr") && !body->at("hdr").is_null() ? std::optional<bool> {body->at("hdr").get<bool>()} : std::nullopt,
+      before->second.dump()
+    );
+    const auto after = eclipse_unified_displays();
+    if (!applied || !after) {
+      display_device::revert_configuration();
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "host_failure", "Display state could not be applied; requested state was reverted");
+      return;
+    }
+    const auto updated = std::ranges::find_if(after->second, [&](const nlohmann::json &display) {
+      return display.at("id") == display_id;
+    });
+    if (updated == after->second.end()) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, "host_failure", "Display disappeared during mutation");
+      return;
+    }
+    BOOST_LOG(info) << "Audit: client ["sv << client->uuid << "] patched display ["sv << display_id << ']';
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"display", *updated}});
+  }
+
+  /**
+   * @brief Return physical display resources visible to caller.
+   */
+  void eclipse_displays(resp_https_t response, req_https_t request) {
+    if (!authorize_eclipse_request(response, request, "display.read")) {
+      return;
+    }
+    std::optional<std::uint64_t> since;
+    const auto args = request->parse_query_string();
+    if (const auto value = args.find("since"); value != args.end()) {
+      try {
+        std::size_t consumed {};
+        since = std::stoull(value->second, &consumed);
+        if (consumed != value->second.size()) {
+          throw std::invalid_argument("trailing characters");
+        }
+      } catch (const std::exception &) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "since must be an unsigned display revision");
+        return;
+      }
+    }
+    auto snapshot = eclipse_unified_displays();
+    if (!snapshot) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Windows display inventory is unavailable");
+      return;
+    }
+    const bool changed = !since || *since != snapshot->first;
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {
+                                                                         {"revision", snapshot->first},
+                                                                         {"changed", changed},
+                                                                         {"fullSnapshot", changed},
+                                                                         {"displays", changed ? std::move(snapshot->second) : nlohmann::json::array()},
+                                                                       });
+  }
+
+  /**
+   * @brief Return one physical display resource.
+   */
+  void eclipse_display(resp_https_t response, req_https_t request) {
+    if (!authorize_eclipse_request(response, request, "display.read")) {
+      return;
+    }
+    const auto display_id = request->path_match[1].str();
+    auto snapshot = eclipse_unified_displays();
+    if (snapshot) {
+      for (auto &display : snapshot->second) {
+        if (display.at("id") == display_id) {
+          send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"display", std::move(display)}});
+          return;
+        }
+      }
+    }
+    send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "display_not_found", "Display does not exist or is not visible to this client");
+  }
+#endif
+
+  /**
+   * @brief Read one request header.
+   *
+   * @param request HTTPS request.
+   * @param name Case-insensitive header name.
+   * @return Header value, or no value when absent.
+   */
+  std::optional<std::string> eclipse_header(const req_https_t &request, const std::string_view name) {
+    const auto found = request->header.find(std::string {name});
+    return found == request->header.end() ? std::nullopt : std::optional<std::string> {found->second};
+  }
+
+  /**
+   * @brief Parse required strong numeric `If-Match` revision.
+   *
+   * @param request HTTPS request.
+   * @return Parsed revision, or no value for absent or malformed input.
+   */
+  std::optional<std::uint64_t> eclipse_if_match(const req_https_t &request) {
+    auto value = eclipse_header(request, "If-Match");
+    if (!value || value->size() < 3 || value->front() != '"' || value->back() != '"') {
+      return std::nullopt;
+    }
+    value->erase(value->begin());
+    value->pop_back();
+    try {
+      std::size_t consumed {};
+      const auto revision = std::stoull(*value, &consumed);
+      return consumed == value->size() && revision > 0 ? std::optional<std::uint64_t> {revision} : std::nullopt;
+    } catch (const std::exception &) {
+      return std::nullopt;
+    }
+  }
+
+  /**
+   * @brief Parse bounded Eclipse JSON request body.
+   *
+   * @param response HTTPS response used for structured errors.
+   * @param request HTTPS request.
+   * @return Parsed object with schema version one, or no value after sending error.
+   */
+  std::optional<nlohmann::json> eclipse_request_json(const resp_https_t &response, const req_https_t &request) {
+    constexpr std::size_t MAX_BODY_BYTES = 64 * 1024;
+    if (const auto content_length = eclipse_header(request, "Content-Length")) {
+      std::uint64_t length {};
+      const auto [end, error] = std::from_chars(content_length->data(), content_length->data() + content_length->size(), length);
+      if (error != std::errc {} || end != content_length->data() + content_length->size()) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Content-Length must be an unsigned integer");
+        return std::nullopt;
+      }
+      if (length > MAX_BODY_BYTES) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_payload_too_large, "payload_too_large", "Request body exceeds 64 KiB");
+        return std::nullopt;
+      }
+    }
+
+    auto body = eclipse_api::read_bounded_body(request->content, MAX_BODY_BYTES);
+    if (body.status == eclipse_api::body_read_status_t::too_large) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_payload_too_large, "payload_too_large", "Request body exceeds 64 KiB");
+      return std::nullopt;
+    }
+    try {
+      auto json = nlohmann::json::parse(body.text);
+      if (!json.is_object() || json.value("schemaVersion", 0) != eclipse_api::API_VERSION) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Request body must be a schemaVersion 1 JSON object");
+        return std::nullopt;
+      }
+      return json;
+    } catch (const std::exception &) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Request body is not valid JSON");
+      return std::nullopt;
+    }
+  }
+
+#ifdef _WIN32
+  /**
+   * @brief Parse exact virtual-display mode object.
+   *
+   * @param value JSON mode object.
+   * @return Parsed mode, or no value for invalid shape or type.
+   */
+  std::optional<eclipse_virtual_display::mode_t> eclipse_virtual_mode(const nlohmann::json &value) {
+    try {
+      if (!value.is_object()) {
+        return std::nullopt;
+      }
+      return eclipse_virtual_display::mode_t {
+        value.at("width").get<int>(),
+        value.at("height").get<int>(),
+        value.at("refreshNumerator").get<std::uint32_t>(),
+        value.at("refreshDenominator").get<std::uint32_t>(),
+        value.at("bitDepth").get<int>(),
+        value.at("hdr").get<bool>(),
+      };
+    } catch (const std::exception &) {
+      return std::nullopt;
+    }
+  }
+
+  /**
+   * @brief Parse complete virtual-display creation specification.
+   *
+   * @param value Schema-versioned request object.
+   * @return Parsed specification, or no value for invalid shape or type.
+   */
+  std::optional<eclipse_virtual_display::specification_t> eclipse_virtual_specification(const nlohmann::json &value) {
+    try {
+      const auto mode = eclipse_virtual_mode(value.at("mode"));
+      const auto &position = value.at("position");
+      if (!mode || !position.is_object()) {
+        return std::nullopt;
+      }
+      eclipse_virtual_display::specification_t result {
+        value.at("name").get<std::string>(),
+        *mode,
+        {position.at("x").get<int>(), position.at("y").get<int>()},
+        value.at("scale").get<double>(),
+        value.at("rotation").get<int>(),
+        value.at("primary").get<bool>(),
+        value.at("hdr").get<bool>(),
+        value.at("persistent").get<bool>(),
+        std::nullopt,
+      };
+      if (value.contains("workspaceId") && !value.at("workspaceId").is_null()) {
+        result.workspace_id = value.at("workspaceId").get<std::string>();
+      }
+      return result;
+    } catch (const std::exception &) {
+      return std::nullopt;
+    }
+  }
+
+  /**
+   * @brief Parse virtual-display patch fields.
+   *
+   * @param value Schema-versioned request object.
+   * @return Parsed nonempty patch, or no value for invalid shape or type.
+   */
+  std::optional<eclipse_virtual_display::patch_t> eclipse_virtual_patch(const nlohmann::json &value) {
+    eclipse_virtual_display::patch_t result;
+    try {
+      if (value.contains("name")) {
+        result.name = value.at("name").get<std::string>();
+      }
+      if (value.contains("mode")) {
+        result.mode = eclipse_virtual_mode(value.at("mode"));
+        if (!result.mode) {
+          return std::nullopt;
+        }
+      }
+      if (value.contains("position")) {
+        result.position = eclipse_virtual_display::position_t {value.at("position").at("x").get<int>(), value.at("position").at("y").get<int>()};
+      }
+      if (value.contains("scale")) {
+        result.scale = value.at("scale").get<double>();
+      }
+      if (value.contains("rotation")) {
+        result.rotation = value.at("rotation").get<int>();
+      }
+      if (value.contains("primary")) {
+        result.primary = value.at("primary").get<bool>();
+      }
+      if (value.contains("hdr")) {
+        result.hdr = value.at("hdr").get<bool>();
+      }
+      if (value.contains("persistent")) {
+        result.persistent = value.at("persistent").get<bool>();
+      }
+      if (value.contains("workspaceId")) {
+        result.workspace_id = value.at("workspaceId").is_null() ? std::optional<std::string> {} : std::optional<std::string> {value.at("workspaceId").get<std::string>()};
+      }
+    } catch (const std::exception &) {
+      return std::nullopt;
+    }
+    if (!result.name && !result.mode && !result.position && !result.scale && !result.rotation && !result.primary && !result.hdr && !result.persistent && !result.workspace_id) {
+      return std::nullopt;
+    }
+    return result;
+  }
+
+  /**
+   * @brief Check virtual-display visibility under owner masking.
+   *
+   * @param client Authenticated client.
+   * @param resource Virtual-display resource.
+   * @return `true` for owner or host administrator.
+   */
+  bool eclipse_virtual_visible(const verified_client_t &client, const eclipse_virtual_display::resource_t &resource) {
+    return scope_allowed(client, "host.control") || (resource.owner_client_uuid && *resource.owner_client_uuid == client.uuid);
+  }
+
+  /**
+   * @brief Convert virtual-display mutation status to operation failure object.
+   *
+   * @param status Mutation status.
+   * @return Stable structured operation error.
+   */
+  nlohmann::json eclipse_virtual_error(const eclipse_virtual_display::status_t status) {
+    using eclipse_virtual_display::status_t;
+    switch (status) {
+      case status_t::not_found:
+        return {{"code", "resource_not_found"}, {"message", "Virtual display no longer exists"}};
+      case status_t::invalid:
+        return {{"code", "invalid_argument"}, {"message", "Virtual display request is invalid"}};
+      case status_t::conflict:
+        return {{"code", "revision_conflict"}, {"message", "Virtual display state or revision changed"}};
+      case status_t::provider_error:
+        return {{"code", "provider_failure"}, {"message", "MttVDD or Windows display operation failed"}};
+      case status_t::persistence_error:
+        return {{"code", "persistence_failure"}, {"message", "Virtual display state could not be persisted"}};
+      case status_t::unavailable:
+        return {{"code", "provider_unavailable"}, {"message", "Virtual display provider is unavailable"}};
+      case status_t::success:
+        break;
+    }
+    return nullptr;
+  }
+
+  /** @brief Completed result from one deferred Eclipse mutation. */
+  struct eclipse_operation_completion_t {
+    bool succeeded {};  ///< Whether operation reached `succeeded`.
+    std::optional<std::string> resource_id;  ///< Created or changed resource UUID.
+    nlohmann::json result;  ///< Success result document.
+    nlohmann::json error;  ///< Structured failure document.
+  };
+
+  /**
+   * @brief Submit and schedule one idempotent Eclipse mutation.
+   *
+   * @param response HTTPS response.
+   * @param client Authenticated client.
+   * @param request HTTPS request carrying idempotency key.
+   * @param action Stable mutation action used for authorization and replay.
+   * @param body Canonical request body.
+   * @param mutation Deferred mutation receiving current client authorization.
+   */
+  void submit_eclipse_operation(const resp_https_t &response, const verified_client_t &client, const req_https_t &request, std::string action, const nlohmann::json &body, std::function<eclipse_operation_completion_t(const verified_client_t &)> mutation) {
+    const auto key = eclipse_header(request, "Idempotency-Key");
+    if (!key || key->empty()) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "idempotency_key_required", "Idempotency-Key header is required");
+      return;
+    }
+    if (!eclipse_operation_store) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Operation store is unavailable");
+      return;
+    }
+    const auto submission = eclipse_operation_store->submit(client.uuid, action, *key, body, [](const auto &operation) {
+      return nlohmann::json {
+        {"operation", eclipse_operations::to_json(operation)},
+        {"operationUrl", std::format("/eclipse/v1/operations/{}", operation.id)},
+      };
+    });
+    if (submission.status == eclipse_operations::submission_status_t::conflict) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_conflict, "idempotency_conflict", "Idempotency-Key was already used with different request content");
+      return;
+    }
+    if (submission.status == eclipse_operations::submission_status_t::persistence_failed || !submission.operation) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, "persistence_failure", "Operation could not be persisted");
+      return;
+    }
+    if (submission.status == eclipse_operations::submission_status_t::created) {
+      const auto operation_id = submission.operation->id;
+      const auto required_scope = std::string {eclipse_operation_scope(action)};
+      eclipse_operation_pool.push([operation_id, client_uuid = client.uuid, required_scope, mutation = std::move(mutation)]() mutable {
+        if (!eclipse_operation_store || !eclipse_operation_store->transition(operation_id, eclipse_operations::state_t::running)) {
+          return;
+        }
+
+        std::optional<verified_client_t> current_client;
+        {
+          std::lock_guard authorization_lock {client_auth_mutex};
+          const auto paired_client = std::ranges::find(client_root.named_devices, client_uuid, &named_cert_t::uuid);
+          if (paired_client != client_root.named_devices.end() && paired_client->enabled && !permissions_expired(paired_client->permissions) && !required_scope.empty() && paired_client->permissions.scopes.contains(required_scope)) {
+            current_client = verified_client_t {
+              .uuid = paired_client->uuid,
+              .name = paired_client->name,
+              .cert = paired_client->cert,
+              .permissions = paired_client->permissions,
+            };
+          }
+        }
+        if (!current_client) {
+          eclipse_operation_store->transition(operation_id, eclipse_operations::state_t::failed, std::nullopt, nullptr, {
+                                                                                                                          {"code", "authorization_revoked"},
+                                                                                                                          {"message", "Client authorization was revoked before operation execution"},
+                                                                                                                        });
+          return;
+        }
+        const auto result = mutation(*current_client);
+        if (result.succeeded) {
+          eclipse_operation_store->transition(operation_id, eclipse_operations::state_t::succeeded, result.resource_id, std::move(result.result));
+        } else {
+          eclipse_operation_store->transition(operation_id, eclipse_operations::state_t::failed, std::nullopt, nullptr, std::move(result.error));
+        }
+      });
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_accepted, submission.response);
+  }
+
+  /**
+   * @brief Submit and schedule idempotent virtual-display mutation.
+   *
+   * @param response HTTPS response.
+   * @param client Authenticated client.
+   * @param request HTTPS request carrying idempotency key.
+   * @param action Stable mutation action.
+   * @param body Canonical request body.
+   * @param mutation Deferred manager mutation.
+   */
+  void submit_virtual_operation(const resp_https_t &response, const verified_client_t &client, const req_https_t &request, std::string action, const nlohmann::json &body, std::function<eclipse_virtual_display::result_t()> mutation) {
+    submit_eclipse_operation(response, client, request, std::move(action), body, [mutation = std::move(mutation)](const verified_client_t &) mutable {
+      const auto result = mutation();
+      if (result.status == eclipse_virtual_display::status_t::success && result.resource) {
+        return eclipse_operation_completion_t {true, result.resource->id, {{"resource", eclipse_virtual_display::to_json(*result.resource)}}, nullptr};
+      }
+      return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_virtual_error(result.status)};
+    });
+  }
+
+  /**
+   * @brief Return virtual displays visible to caller.
+   */
+  void eclipse_virtual_displays(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "display.read");
+    if (!client) {
+      return;
+    }
+    if (!eclipse_virtual_display_manager || !eclipse_virtual_display_manager->available()) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "MttVDD virtual display provider is unavailable");
+      return;
+    }
+    std::optional<std::uint64_t> since;
+    const auto args = request->parse_query_string();
+    if (const auto value = args.find("since"); value != args.end()) {
+      try {
+        std::size_t consumed {};
+        since = std::stoull(value->second, &consumed);
+        if (consumed != value->second.size()) {
+          throw std::invalid_argument("trailing characters");
+        }
+      } catch (const std::exception &) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "since must be an unsigned virtual-display revision");
+        return;
+      }
+    }
+    auto listed = eclipse_virtual_display_manager->list(since);
+    nlohmann::json resources = nlohmann::json::array();
+    if (listed.changed) {
+      for (const auto &resource : listed.resources) {
+        if (eclipse_virtual_visible(*client, resource)) {
+          resources.push_back(eclipse_virtual_display::to_json(resource));
+        }
+      }
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"revision", listed.revision}, {"changed", listed.changed}, {"fullSnapshot", listed.changed}, {"virtualDisplays", std::move(resources)}});
+  }
+
+  /**
+   * @brief Return one owner-visible virtual display.
+   */
+  void eclipse_virtual_display(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "display.read");
+    if (!client) {
+      return;
+    }
+    const auto resource = eclipse_virtual_display_manager ? eclipse_virtual_display_manager->get(request->path_match[1].str()) : std::nullopt;
+    if (!resource || !eclipse_virtual_visible(*client, *resource)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
+      return;
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"virtualDisplay", eclipse_virtual_display::to_json(*resource)}});
+  }
+
+  /**
+   * @brief Create one managed MttVDD display asynchronously.
+   */
+  void eclipse_create_virtual_display(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "virtual-display.manage");
+    if (!client) {
+      return;
+    }
+    const auto body = eclipse_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    const auto specification = eclipse_virtual_specification(*body);
+    if (!specification || specification->scale != 1.0) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "unsupported_configuration", "Virtual display request is invalid or uses unsupported scale");
+      return;
+    }
+    submit_virtual_operation(response, *client, request, "virtual-display.create", *body, [owner = client->uuid, specification = *specification]() {
+      return eclipse_virtual_display_manager->create(owner, specification);
+    });
+  }
+
+  /**
+   * @brief Patch owner-visible virtual display asynchronously.
+   */
+  void eclipse_patch_virtual_display(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "virtual-display.manage");
+    if (!client) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto resource = eclipse_virtual_display_manager ? eclipse_virtual_display_manager->get(id) : std::nullopt;
+    if (!resource || !eclipse_virtual_visible(*client, *resource)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_precondition_required, "revision_required", "Strong numeric If-Match header is required");
+      return;
+    }
+    if (*revision != resource->revision) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_precondition_failed, "revision_conflict", "Virtual display revision does not match");
+      return;
+    }
+    const auto body = eclipse_request_json(response, request);
+    const auto patch = body ? eclipse_virtual_patch(*body) : std::nullopt;
+    if (!body || !patch || (patch->scale && *patch->scale != 1.0)) {
+      if (body) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "unsupported_configuration", "Virtual display patch is empty, invalid, or uses unsupported scale");
+      }
+      return;
+    }
+    submit_virtual_operation(response, *client, request, "virtual-display.patch", *body, [id, revision = *revision, patch = *patch]() {
+      return eclipse_virtual_display_manager->patch(id, revision, patch);
+    });
+  }
+
+  /**
+   * @brief Delete owner-visible virtual display asynchronously.
+   */
+  void eclipse_delete_virtual_display(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "virtual-display.manage");
+    if (!client) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto resource = eclipse_virtual_display_manager ? eclipse_virtual_display_manager->get(id) : std::nullopt;
+    if (!resource || !eclipse_virtual_visible(*client, *resource)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_precondition_required, "revision_required", "Strong numeric If-Match header is required");
+      return;
+    }
+    if (*revision != resource->revision) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_precondition_failed, "revision_conflict", "Virtual display revision does not match");
+      return;
+    }
+    const nlohmann::json body {{"id", id}, {"revision", *revision}};
+    submit_virtual_operation(response, *client, request, "virtual-display.delete", body, [id, revision = *revision]() {
+      return eclipse_virtual_display_manager->remove(id, revision);
+    });
+  }
+
+  /**
+   * @brief Attach virtual display to exactly one runtime owner asynchronously.
+   */
+  void eclipse_attach_virtual_display(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "virtual-display.manage");
+    if (!client) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto resource = eclipse_virtual_display_manager ? eclipse_virtual_display_manager->get(id) : std::nullopt;
+    if (!resource || !eclipse_virtual_visible(*client, *resource)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != resource->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Virtual display revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const auto body = eclipse_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    eclipse_virtual_display::attachment_t attachment;
+    try {
+      if (body->contains("sessionId") && !body->at("sessionId").is_null()) {
+        attachment.session_id = body->at("sessionId").get<std::string>();
+      }
+      if (body->contains("workspaceId") && !body->at("workspaceId").is_null()) {
+        attachment.workspace_id = body->at("workspaceId").get<std::string>();
+      }
+    } catch (const std::exception &) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Attachment target is invalid");
+      return;
+    }
+    if (attachment.session_id.has_value() == attachment.workspace_id.has_value()) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Exactly one sessionId or workspaceId is required");
+      return;
+    }
+    submit_virtual_operation(response, *client, request, "virtual-display.attach", *body, [id, revision = *revision, attachment]() {
+      return eclipse_virtual_display_manager->attach(id, revision, attachment);
+    });
+  }
+
+  /**
+   * @brief Detach owner-visible virtual display asynchronously.
+   */
+  void eclipse_detach_virtual_display(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "virtual-display.manage");
+    if (!client) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto resource = eclipse_virtual_display_manager ? eclipse_virtual_display_manager->get(id) : std::nullopt;
+    if (!resource || !eclipse_virtual_visible(*client, *resource)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != resource->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Virtual display revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const nlohmann::json body {{"id", id}, {"revision", *revision}};
+    submit_virtual_operation(response, *client, request, "virtual-display.detach", body, [id, revision = *revision]() {
+      return eclipse_virtual_display_manager->detach(id, revision);
+    });
+  }
+
+  /**
+   * @brief Claim an orphaned persistent virtual display asynchronously.
+   */
+  void eclipse_adopt_virtual_display(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "virtual-display.manage");
+    if (!client) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto resource = eclipse_virtual_display_manager ? eclipse_virtual_display_manager->get(id) : std::nullopt;
+    if (!resource || resource->owner_client_uuid) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Orphaned virtual display does not exist");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != resource->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Virtual display revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const nlohmann::json body {{"id", id}, {"revision", *revision}};
+    submit_virtual_operation(response, *client, request, "virtual-display.adopt", body, [id, revision = *revision, owner = client->uuid]() {
+      return eclipse_virtual_display_manager->adopt(id, revision, owner);
+    });
+  }
+
+  /**
+   * @brief Resolve profile-domain scope for reads or mutations.
+   *
+   * @param type Profile type.
+   * @param mutation Whether caller will mutate resource.
+   * @return Required scope, or empty for unknown type.
+   */
+  std::string_view eclipse_profile_scope(const std::string_view type, const bool mutation) {
+    if (type == "display") {
+      return mutation ? "display.manage" : "display.read";
+    }
+    if (type == "sandbox") {
+      return "sandbox.manage";
+    }
+    if (type == "stream" || type == "launch") {
+      return mutation ? "host.control" : "catalog.read";
+    }
+    return {};
+  }
+
+  /**
+   * @brief Convert current paired-client policy to profile actor context.
+   *
+   * @param client Current client identity and permissions.
+   * @return Profile manager actor.
+   */
+  eclipse::profiles::actor_t eclipse_profile_actor(const verified_client_t &client) {
+    return {
+      client.uuid,
+      {client.permissions.scopes.begin(), client.permissions.scopes.end()},
+      {client.permissions.allowed_apps.begin(), client.permissions.allowed_apps.end()},
+    };
+  }
+
+  /**
+   * @brief Convert profile manager failure to stable operation error.
+   *
+   * @param status Profile manager status.
+   * @param message Diagnostic detail.
+   * @return Structured operation error.
+   */
+  nlohmann::json eclipse_profile_error(const eclipse::profiles::status_t status, const std::string_view message) {
+    using eclipse::profiles::status_t;
+    std::string_view code = "internal_error";
+    switch (status) {
+      case status_t::invalid:
+        code = "invalid_argument";
+        break;
+      case status_t::unsupported:
+        code = "unsupported_configuration";
+        break;
+      case status_t::not_found:
+        code = "profile_not_found";
+        break;
+      case status_t::forbidden:
+        code = "permission_denied";
+        break;
+      case status_t::resource_busy:
+        code = "resource_busy";
+        break;
+      case status_t::conflict:
+        code = "revision_conflict";
+        break;
+      case status_t::persistence:
+        code = "persistence_failure";
+        break;
+      case status_t::unavailable:
+        code = "provider_unavailable";
+        break;
+      case status_t::success:
+        break;
+    }
+    return {{"code", code}, {"message", message}};
+  }
+
+  /**
+   * @brief Return application associations used for profile event projection.
+   *
+   * @param profile Profile resource.
+   * @return Associated application UUIDs.
+   */
+  std::vector<std::string> eclipse_profile_apps(const eclipse::profiles::profile_t &profile) {
+    std::vector<std::string> result;
+    if (profile.type == "launch") {
+      result.push_back(profile.configuration.at("appUuid"));
+    } else if (profile.type == "sandbox") {
+      for (const auto &app_uuid : profile.configuration.at("allowedAppUuids")) {
+        result.push_back(app_uuid);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * @brief Check owner and application projection for a profile mutation.
+   *
+   * @param client Current client authorization.
+   * @param profile Stored profile.
+   * @return `true` when caller may observe profile for mutation.
+   */
+  bool eclipse_profile_mutable_visible(const verified_client_t &client, const eclipse::profiles::profile_t &profile) {
+    if (!profile.owner_client_uuid || (*profile.owner_client_uuid != client.uuid && !scope_allowed(client, "host.control"))) {
+      return false;
+    }
+    return std::ranges::all_of(eclipse_profile_apps(profile), [&](const auto &app_uuid) {
+      return app_allowed(client, app_uuid);
+    });
+  }
+
+  /**
+   * @brief Verify profile manager startup availability.
+   *
+   * @param response HTTPS response used for structured failure.
+   * @return `true` when profile manager is usable.
+   */
+  bool eclipse_profiles_available(const resp_https_t &response) {
+    if (eclipse_profile_manager && eclipse_profile_manager->availability() == eclipse::profiles::status_t::success) {
+      return true;
+    }
+    send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Profile store is unavailable");
+    return false;
+  }
+
+  /**
+   * @brief Publish profile event using current scope, ownership, and allowlist policy.
+   *
+   * @param type Event type.
+   * @param profile Resulting or removed profile.
+   * @param data Event data.
+   */
+  void publish_eclipse_profile_event(const std::string &type, const eclipse::profiles::profile_t &profile, nlohmann::json data) {
+    publish_eclipse_event({type, profile.id, profile.revision, std::move(data)}, eclipse_profile_scope(profile.type, false), profile.shared ? std::string {} : profile.owner_client_uuid.value_or(""), eclipse_profile_apps(profile));
+  }
+
+  /**
+   * @brief Orphan profiles after client removal or policy replacement.
+   *
+   * @param owner Previous owner UUID.
+   * @param permissions Current policy, or no value when identity is revoked.
+   */
+  void revoke_eclipse_profiles(const std::string &owner, const std::optional<eclipse_api::client_permissions_t> &permissions) {
+    if (!eclipse_profile_manager) {
+      return;
+    }
+    eclipse::profiles::result_t result;
+    if (permissions) {
+      verified_client_t client {.uuid = owner, .permissions = *permissions};
+      result = eclipse_profile_manager->revoke_unauthorized(eclipse_profile_actor(client));
+    } else {
+      result = eclipse_profile_manager->revoke_owner(owner);
+    }
+    if (result.status != eclipse::profiles::status_t::success) {
+      BOOST_LOG(error) << "Failed to persist profile revocation for client [" << owner << ']';
+      return;
+    }
+    for (const auto &profile : result.profiles) {
+      const auto event_owner = profile.shared ? std::string {} : owner;
+      publish_eclipse_event({"profile.updated", profile.id, profile.revision, eclipse::profiles::to_json(profile)}, eclipse_profile_scope(profile.type, false), event_owner, eclipse_profile_apps(profile));
+    }
+  }
+
+  /** @brief Return profiles visible to caller. */
+  void eclipse_profiles(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request);
+    if (!client) {
+      return;
+    }
+    if (!eclipse_profiles_available(response)) {
+      return;
+    }
+    const auto args = request->parse_query_string();
+    std::optional<std::string> type;
+    if (const auto value = args.find("type"); value != args.end()) {
+      type = value->second;
+      const auto scope = eclipse_profile_scope(*type, false);
+      if (scope.empty()) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Unknown profile type");
+        return;
+      }
+      if (!scope_allowed(*client, scope)) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", std::format("Client certificate lacks {} permission", scope));
+        return;
+      }
+    }
+    std::optional<std::uint64_t> since;
+    if (const auto value = args.find("since"); value != args.end()) {
+      std::uint64_t parsed {};
+      const auto [end, error] = std::from_chars(value->second.data(), value->second.data() + value->second.size(), parsed);
+      if (error != std::errc {} || end != value->second.data() + value->second.size()) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "since must be an unsigned profile revision");
+        return;
+      }
+      since = parsed;
+    }
+    const auto listed = eclipse_profile_manager->list(eclipse_profile_actor(*client), type);
+    if (listed.status == eclipse::profiles::status_t::forbidden) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", "Client certificate lacks profile read permission");
+      return;
+    }
+    const bool changed = !since || *since != listed.collection_revision;
+    nlohmann::json profiles = nlohmann::json::array();
+    if (changed) {
+      for (const auto &profile : listed.profiles) {
+        profiles.push_back(eclipse::profiles::to_json(profile));
+      }
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"revision", listed.collection_revision}, {"changed", changed}, {"fullSnapshot", changed}, {"profiles", std::move(profiles)}});
+  }
+
+  /** @brief Return one profile after type-specific authorization and visibility masking. */
+  void eclipse_profile(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request);
+    if (!client) {
+      return;
+    }
+    if (!eclipse_profiles_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto type = eclipse_profile_manager->type(id);
+    if (!type) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
+      return;
+    }
+    const auto scope = eclipse_profile_scope(*type, false);
+    if (!scope_allowed(*client, scope)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", std::format("Client certificate lacks {} permission", scope));
+      return;
+    }
+    const auto result = eclipse_profile_manager->get(eclipse_profile_actor(*client), id);
+    if (result.status != eclipse::profiles::status_t::success || !result.profile) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
+      return;
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"profile", eclipse::profiles::to_json(*result.profile)}});
+  }
+
+  /** @brief Create one profile through durable idempotent operation handling. */
+  void eclipse_create_profile(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request);
+    if (!client) {
+      return;
+    }
+    if (!eclipse_profiles_available(response)) {
+      return;
+    }
+    auto body = eclipse_request_json(response, request);
+    if (!body || !body->contains("type") || !body->at("type").is_string()) {
+      if (body) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Profile type is required");
+      }
+      return;
+    }
+    const auto type = body->at("type").get<std::string>();
+    const auto scope = eclipse_profile_scope(type, true);
+    if (scope.empty()) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Unknown profile type");
+      return;
+    }
+    if (!scope_allowed(*client, scope)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", std::format("Client certificate lacks {} permission", scope));
+      return;
+    }
+    auto mutation = *body;
+    mutation.erase("schemaVersion");
+    submit_eclipse_operation(response, *client, request, std::format("profile.{}.create", type), *body, [mutation = std::move(mutation)](const verified_client_t &current_client) {
+      const auto result = eclipse_profile_manager->create(eclipse_profile_actor(current_client), mutation);
+      if (result.status != eclipse::profiles::status_t::success || !result.profile) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_profile_error(result.status, result.message)};
+      }
+      publish_eclipse_profile_event("profile.created", *result.profile, eclipse::profiles::to_json(*result.profile));
+      return eclipse_operation_completion_t {true, result.profile->id, {{"profile", eclipse::profiles::to_json(*result.profile)}}, nullptr};
+    });
+  }
+
+  /** @brief Patch one owner-visible profile through durable operation handling. */
+  void eclipse_patch_profile(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request);
+    if (!client) {
+      return;
+    }
+    if (!eclipse_profiles_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto stored = eclipse_profile_manager->inspect(id);
+    if (!stored) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
+      return;
+    }
+    const auto scope = eclipse_profile_scope(stored->type, true);
+    if (!scope_allowed(*client, scope)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", std::format("Client certificate lacks {} permission", scope));
+      return;
+    }
+    if (!eclipse_profile_mutable_visible(*client, *stored)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != stored->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Profile revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    auto body = eclipse_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    auto mutation = *body;
+    mutation.erase("schemaVersion");
+    submit_eclipse_operation(response, *client, request, std::format("profile.{}.patch", stored->type), *body, [id, revision = *revision, mutation = std::move(mutation)](const verified_client_t &current_client) {
+      const auto result = eclipse_profile_manager->patch(eclipse_profile_actor(current_client), id, revision, mutation);
+      if (result.status != eclipse::profiles::status_t::success || !result.profile) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_profile_error(result.status, result.message)};
+      }
+      publish_eclipse_profile_event("profile.updated", *result.profile, eclipse::profiles::to_json(*result.profile));
+      return eclipse_operation_completion_t {true, result.profile->id, {{"profile", eclipse::profiles::to_json(*result.profile)}}, nullptr};
+    });
+  }
+
+  /** @brief Delete one owner-visible profile through durable operation handling. */
+  void eclipse_delete_profile(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request);
+    if (!client) {
+      return;
+    }
+    if (!eclipse_profiles_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto stored = eclipse_profile_manager->inspect(id);
+    if (!stored) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
+      return;
+    }
+    const auto scope = eclipse_profile_scope(stored->type, true);
+    if (!scope_allowed(*client, scope)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", std::format("Client certificate lacks {} permission", scope));
+      return;
+    }
+    if (!eclipse_profile_mutable_visible(*client, *stored)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != stored->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Profile revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const nlohmann::json body {{"id", id}, {"revision", *revision}};
+    submit_eclipse_operation(response, *client, request, std::format("profile.{}.delete", stored->type), body, [id, revision = *revision, removed = *stored](const verified_client_t &current_client) {
+      const auto result = eclipse_profile_manager->erase(eclipse_profile_actor(current_client), id, revision);
+      if (result.status != eclipse::profiles::status_t::success) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_profile_error(result.status, result.message)};
+      }
+      publish_eclipse_profile_event("profile.removed", removed, {{"id", id}, {"revision", result.collection_revision}});
+      return eclipse_operation_completion_t {true, id, {{"removed", true}, {"id", id}}, nullptr};
+    });
+  }
+
+  /** @brief Adopt one orphaned profile through durable operation handling. */
+  void eclipse_adopt_profile(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "host.control");
+    if (!client) {
+      return;
+    }
+    if (!eclipse_profiles_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto stored = eclipse_profile_manager->inspect(id);
+    if (!stored || stored->owner_client_uuid) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Orphaned profile does not exist");
+      return;
+    }
+    const auto scope = eclipse_profile_scope(stored->type, true);
+    if (!scope_allowed(*client, scope)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", std::format("Client certificate lacks {} permission", scope));
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != stored->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Profile revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const nlohmann::json body {{"id", id}, {"revision", *revision}};
+    submit_eclipse_operation(response, *client, request, std::format("profile.{}.adopt", stored->type), body, [id, revision = *revision](const verified_client_t &current_client) {
+      const auto result = eclipse_profile_manager->adopt(eclipse_profile_actor(current_client), id, revision);
+      if (result.status != eclipse::profiles::status_t::success || !result.profile) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_profile_error(result.status, result.message)};
+      }
+      publish_eclipse_profile_event("profile.updated", *result.profile, eclipse::profiles::to_json(*result.profile));
+      return eclipse_operation_completion_t {true, result.profile->id, {{"profile", eclipse::profiles::to_json(*result.profile)}}, nullptr};
+    });
+  }
+
+  /**
+   * @brief Return application UUIDs associated with workspace definition.
+   *
+   * @param definition Workspace definition.
+   * @return Deduplicated application UUIDs.
+   */
+  std::vector<std::string> eclipse_workspace_apps(const eclipse_workspaces::definition_t &definition) {
+    std::set<std::string> apps {definition.desktop_app_uuid};
+    apps.insert(definition.permitted_app_uuids.begin(), definition.permitted_app_uuids.end());
+    return {apps.begin(), apps.end()};
+  }
+
+  /**
+   * @brief Apply workspace patch to definition snapshot.
+   *
+   * @param definition Existing definition.
+   * @param patch Complete field replacements.
+   * @return Candidate definition.
+   */
+  eclipse_workspaces::definition_t eclipse_workspace_apply_patch(eclipse_workspaces::definition_t definition, const eclipse_workspaces::patch_t &patch) {
+  #define ECLIPSE_WORKSPACE_PATCH(field) \
+    if (patch.field) { \
+      definition.field = *patch.field; \
+    }
+    ECLIPSE_WORKSPACE_PATCH(name)
+    ECLIPSE_WORKSPACE_PATCH(description)
+    ECLIPSE_WORKSPACE_PATCH(shared)
+    ECLIPSE_WORKSPACE_PATCH(desktop_app_uuid)
+    ECLIPSE_WORKSPACE_PATCH(permitted_app_uuids)
+    ECLIPSE_WORKSPACE_PATCH(display_profile_id)
+    ECLIPSE_WORKSPACE_PATCH(stream_profile_id)
+    ECLIPSE_WORKSPACE_PATCH(launch_profile_id)
+    ECLIPSE_WORKSPACE_PATCH(sandbox_profile_id)
+    ECLIPSE_WORKSPACE_PATCH(virtual_displays)
+    ECLIPSE_WORKSPACE_PATCH(peripheral_policy)
+    ECLIPSE_WORKSPACE_PATCH(persistent)
+    ECLIPSE_WORKSPACE_PATCH(cleanup_policy)
+  #undef ECLIPSE_WORKSPACE_PATCH
+    return definition;
+  }
+
+  /**
+   * @brief Check workspace ownership, sharing, and application allowlist projection.
+   *
+   * @param client Current client authorization.
+   * @param workspace Workspace resource.
+   * @param lifecycle Whether cross-client lifecycle control is requested.
+   * @return `true` when workspace is visible for requested operation.
+   */
+  bool eclipse_workspace_visible(const verified_client_t &client, const eclipse_workspaces::resource_t &workspace, const bool lifecycle = false) {
+    if (!workspace.owner_client_uuid) {
+      return false;
+    }
+    const bool owner = *workspace.owner_client_uuid == client.uuid;
+    if ((!workspace.definition.shared && !owner && !scope_allowed(client, "host.control")) || (lifecycle && !owner && !scope_allowed(client, "host.control"))) {
+      return false;
+    }
+    return std::ranges::all_of(eclipse_workspace_apps(workspace.definition), [&](const auto &app_uuid) {
+      return app_allowed(client, app_uuid);
+    });
+  }
+
+  /**
+   * @brief Validate workspace profile references against caller visibility.
+   *
+   * @param client Current client authorization.
+   * @param definition Candidate workspace definition.
+   * @return `true` when every referenced profile is visible with matching type.
+   */
+  bool eclipse_workspace_profiles_visible(const verified_client_t &client, const eclipse_workspaces::definition_t &definition) {
+    if (!eclipse_profile_manager) {
+      return !definition.display_profile_id && !definition.stream_profile_id && !definition.launch_profile_id && !definition.sandbox_profile_id;
+    }
+    const auto actor = eclipse_profile_actor(client);
+    const std::pair<std::string_view, const std::optional<std::string> *> profiles[] {
+      {"display", &definition.display_profile_id},
+      {"stream", &definition.stream_profile_id},
+      {"launch", &definition.launch_profile_id},
+      {"sandbox", &definition.sandbox_profile_id},
+    };
+    return std::ranges::all_of(profiles, [&](const auto &entry) {
+      const auto &[type, id] = entry;
+      if (!*id) {
+        return true;
+      }
+      const auto result = eclipse_profile_manager->get(actor, **id);
+      return result.status == eclipse::profiles::status_t::success && result.profile && result.profile->type == type;
+    });
+  }
+
+  /**
+   * @brief Validate complete workspace definition against current caller policy.
+   *
+   * @param client Current client authorization.
+   * @param definition Candidate definition.
+   * @return `true` when applications and profiles remain authorized.
+   */
+  bool eclipse_workspace_definition_authorized(const verified_client_t &client, const eclipse_workspaces::definition_t &definition) {
+    return std::ranges::all_of(eclipse_workspace_apps(definition), [&](const auto &app_uuid) {
+             return app_allowed(client, app_uuid);
+           }) &&
+           eclipse_workspace_profiles_visible(client, definition);
+  }
+
+  /**
+   * @brief Convert workspace status to stable operation error.
+   *
+   * @param status Workspace manager status.
+   * @return Structured error object.
+   */
+  nlohmann::json eclipse_workspace_error(const eclipse_workspaces::status_t status) {
+    using eclipse_workspaces::status_t;
+    switch (status) {
+      case status_t::not_found:
+        return {{"code", "workspace_not_found"}, {"message", "Workspace no longer exists"}};
+      case status_t::invalid:
+        return {{"code", "invalid_argument"}, {"message", "Workspace request is invalid or references unavailable resources"}};
+      case status_t::conflict:
+        return {{"code", "revision_conflict"}, {"message", "Workspace revision or lifecycle state changed"}};
+      case status_t::resource_busy:
+        return {{"code", "resource_busy"}, {"message", "Workspace is already owned"}};
+      case status_t::preparation_error:
+        return {{"code", "preparation_failed"}, {"message", "Workspace resources could not be prepared"}};
+      case status_t::provider_error:
+        return {{"code", "provider_failure"}, {"message", "Workspace provider operation failed"}};
+      case status_t::persistence_error:
+        return {{"code", "persistence_failure"}, {"message", "Workspace state could not be persisted"}};
+      case status_t::unavailable:
+        return {{"code", "provider_unavailable"}, {"message", "Workspace manager is unavailable"}};
+      case status_t::success:
+        break;
+    }
+    return nullptr;
+  }
+
+  /**
+   * @brief Publish workspace event through current read projection.
+   *
+   * @param type Event type.
+   * @param workspace Resulting or removed workspace.
+   * @param data Event payload.
+   */
+  void publish_eclipse_workspace_event(const std::string &type, const eclipse_workspaces::resource_t &workspace, nlohmann::json data) {
+    publish_eclipse_event({type, workspace.id, workspace.revision, std::move(data)}, "catalog.read", workspace.definition.shared ? std::string {} : workspace.owner_client_uuid.value_or(""), eclipse_workspace_apps(workspace.definition));
+  }
+
+  /**
+   * @brief Stop and revoke all workspaces for removed authorization identity.
+   *
+   * @param owner Revoked owner UUID.
+   */
+  void revoke_eclipse_workspaces(const std::string &owner) {
+    if (!eclipse_workspace_manager) {
+      return;
+    }
+    const auto status = eclipse_workspace_manager->revoke_owner(owner);
+    if (status != eclipse_workspaces::status_t::success) {
+      BOOST_LOG(error) << "Failed to revoke workspaces for client [" << owner << ']';
+      return;
+    }
+  }
+
+  /**
+   * @brief Verify workspace manager startup availability.
+   *
+   * @param response HTTPS response used for structured failure.
+   * @return `true` when manager is usable.
+   */
+  bool eclipse_workspaces_available(const resp_https_t &response) {
+    if (eclipse_workspace_manager && eclipse_workspace_manager->available()) {
+      return true;
+    }
+    send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Workspace manager is unavailable");
+    return false;
+  }
+
+  /** @brief Return caller-visible workspace collection. */
+  void eclipse_workspaces(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "catalog.read");
+    if (!client || !eclipse_workspaces_available(response)) {
+      return;
+    }
+    std::optional<std::uint64_t> since;
+    const auto args = request->parse_query_string();
+    if (const auto value = args.find("since"); value != args.end()) {
+      std::uint64_t parsed {};
+      const auto [end, error] = std::from_chars(value->second.data(), value->second.data() + value->second.size(), parsed);
+      if (error != std::errc {} || end != value->second.data() + value->second.size()) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "since must be an unsigned workspace revision");
+        return;
+      }
+      since = parsed;
+    }
+    const auto listed = eclipse_workspace_manager->list(since);
+    nlohmann::json workspaces = nlohmann::json::array();
+    if (listed.changed) {
+      for (const auto &workspace : listed.workspaces) {
+        if (eclipse_workspace_visible(*client, workspace)) {
+          workspaces.push_back(eclipse_workspaces::to_json(workspace));
+        }
+      }
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"revision", listed.revision}, {"changed", listed.changed}, {"fullSnapshot", listed.changed}, {"workspaces", std::move(workspaces)}});
+  }
+
+  /** @brief Return one caller-visible workspace. */
+  void eclipse_workspace(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "catalog.read");
+    if (!client || !eclipse_workspaces_available(response)) {
+      return;
+    }
+    const auto workspace = eclipse_workspace_manager->get(request->path_match[1].str());
+    if (!workspace || !eclipse_workspace_visible(*client, *workspace)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace does not exist or is not visible to this client");
+      return;
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"workspace", eclipse_workspaces::to_json(*workspace)}});
+  }
+
+  /** @brief Create workspace through durable idempotent operation handling. */
+  void eclipse_create_workspace(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "host.control");
+    if (!client || !eclipse_workspaces_available(response)) {
+      return;
+    }
+    auto body = eclipse_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    auto mutation = *body;
+    mutation.erase("schemaVersion");
+    const auto definition = eclipse_workspaces::parse_definition(mutation);
+    if (!definition) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Workspace creation object is invalid");
+      return;
+    }
+    submit_eclipse_operation(response, *client, request, "workspace.create", *body, [definition = *definition](const verified_client_t &current_client) {
+      if (!eclipse_workspace_definition_authorized(current_client, definition)) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, {{"code", "resource_not_found"}, {"message", "Workspace references are not visible to this client"}}};
+      }
+      const auto result = eclipse_workspace_manager->create(current_client.uuid, definition);
+      if (result.status != eclipse_workspaces::status_t::success || !result.resource) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_workspace_error(result.status)};
+      }
+      return eclipse_operation_completion_t {true, result.resource->id, {{"workspace", eclipse_workspaces::to_json(*result.resource)}}, nullptr};
+    });
+  }
+
+  /** @brief Patch workspace definition through durable operation handling. */
+  void eclipse_patch_workspace(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "host.control");
+    if (!client || !eclipse_workspaces_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto workspace = eclipse_workspace_manager->get(id);
+    if (!workspace || !eclipse_workspace_visible(*client, *workspace, true)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace does not exist or is not visible to this client");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != workspace->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Workspace revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    auto body = eclipse_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    auto mutation = *body;
+    mutation.erase("schemaVersion");
+    const auto patch = eclipse_workspaces::parse_patch(mutation);
+    if (!patch) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Workspace patch is empty or invalid");
+      return;
+    }
+    submit_eclipse_operation(response, *client, request, "workspace.patch", *body, [id, revision = *revision, patch = *patch](const verified_client_t &current_client) {
+      const auto current = eclipse_workspace_manager->get(id);
+      if (!current || !eclipse_workspace_visible(current_client, *current, true) || !eclipse_workspace_definition_authorized(current_client, eclipse_workspace_apply_patch(current->definition, patch))) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, {{"code", "workspace_not_found"}, {"message", "Workspace or references are not visible to this client"}}};
+      }
+      const auto result = eclipse_workspace_manager->patch(id, revision, patch);
+      if (result.status != eclipse_workspaces::status_t::success || !result.resource) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_workspace_error(result.status)};
+      }
+      return eclipse_operation_completion_t {true, id, {{"workspace", eclipse_workspaces::to_json(*result.resource)}}, nullptr};
+    });
+  }
+
+  /** @brief Delete stopped workspace through durable operation handling. */
+  void eclipse_delete_workspace(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "host.control");
+    if (!client || !eclipse_workspaces_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto workspace = eclipse_workspace_manager->get(id);
+    if (!workspace || !eclipse_workspace_visible(*client, *workspace, true)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace does not exist or is not visible to this client");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != workspace->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Workspace revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const nlohmann::json body {{"id", id}, {"revision", *revision}};
+    submit_eclipse_operation(response, *client, request, "workspace.delete", body, [id, revision = *revision](const verified_client_t &current_client) {
+      const auto current = eclipse_workspace_manager->get(id);
+      if (!current || !eclipse_workspace_visible(current_client, *current, true)) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, {{"code", "workspace_not_found"}, {"message", "Workspace does not exist or is not visible to this client"}}};
+      }
+      const auto result = eclipse_workspace_manager->remove(id, revision);
+      if (result.status != eclipse_workspaces::status_t::success) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_workspace_error(result.status)};
+      }
+      return eclipse_operation_completion_t {true, id, {{"deleted", true}, {"id", id}}, nullptr};
+    });
+  }
+
+  /** @brief Prepare workspace runtime through durable operation handling. */
+  void eclipse_start_workspace(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "stream.launch");
+    if (!client || !eclipse_workspaces_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto workspace = eclipse_workspace_manager->get(id);
+    if (!workspace || !eclipse_workspace_visible(*client, *workspace, true)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace does not exist or is not controllable by this client");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != workspace->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Workspace revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    auto body = eclipse_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    auto mutation = *body;
+    mutation.erase("schemaVersion");
+    const auto start = eclipse_workspaces::parse_start_request(mutation);
+    if (!start) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Workspace start object is invalid");
+      return;
+    }
+    submit_eclipse_operation(response, *client, request, "workspace.start", *body, [id, revision = *revision, start = *start](const verified_client_t &current_client) {
+      const auto current = eclipse_workspace_manager->get(id);
+      const auto app_uuid = start.app_uuid.value_or(current ? current->definition.desktop_app_uuid : std::string {});
+      if (!current || !eclipse_workspace_visible(current_client, *current, true) || !app_allowed(current_client, app_uuid) || !eclipse_workspace_definition_authorized(current_client, current->definition)) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, {{"code", "workspace_not_found"}, {"message", "Workspace or application is not visible to this client"}}};
+      }
+      const auto result = eclipse_workspace_manager->start(id, revision, start);
+      if (result.status != eclipse_workspaces::status_t::success || !result.resource) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_workspace_error(result.status)};
+      }
+      return eclipse_operation_completion_t {true, id, {{"workspace", eclipse_workspaces::to_json(*result.resource)}}, nullptr};
+    });
+  }
+
+  /** @brief Stop or disconnect workspace runtime through durable operation handling. */
+  void eclipse_stop_workspace(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "session.control");
+    if (!client || !eclipse_workspaces_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto workspace = eclipse_workspace_manager->get(id);
+    if (!workspace || !eclipse_workspace_visible(*client, *workspace, true)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace does not exist or is not controllable by this client");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != workspace->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Workspace revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const auto body = eclipse_request_json(response, request);
+    if (!body || body->size() != 2 || !body->contains("terminateApplication") || !body->at("terminateApplication").is_boolean()) {
+      if (body) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Workspace stop requires terminateApplication boolean");
+      }
+      return;
+    }
+    const bool terminate = body->at("terminateApplication");
+    submit_eclipse_operation(response, *client, request, "workspace.stop", *body, [id, revision = *revision, terminate](const verified_client_t &current_client) {
+      const auto current = eclipse_workspace_manager->get(id);
+      if (!current || !eclipse_workspace_visible(current_client, *current, true)) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, {{"code", "workspace_not_found"}, {"message", "Workspace does not exist or is not controllable by this client"}}};
+      }
+      const auto result = eclipse_workspace_manager->stop(id, revision, terminate);
+      if (result.status != eclipse_workspaces::status_t::success || !result.resource) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_workspace_error(result.status)};
+      }
+      if (eclipse_peripheral_manager) {
+        eclipse_peripheral_manager->target_ended("workspace", id, terminate);
+      }
+      return eclipse_operation_completion_t {true, id, {{"workspace", eclipse_workspaces::to_json(*result.resource)}}, nullptr};
+    });
+  }
+
+  /** @brief Adopt orphaned persistent workspace through durable operation handling. */
+  void eclipse_adopt_workspace(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "host.control");
+    if (!client || !eclipse_workspaces_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto workspace = eclipse_workspace_manager->get(id);
+    if (!workspace || workspace->owner_client_uuid) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Orphaned workspace does not exist");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != workspace->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Workspace revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const nlohmann::json body {{"id", id}, {"revision", *revision}};
+    submit_eclipse_operation(response, *client, request, "workspace.adopt", body, [id, revision = *revision](const verified_client_t &current_client) {
+      const auto current = eclipse_workspace_manager->get(id);
+      if (!current || current->owner_client_uuid || !eclipse_workspace_definition_authorized(current_client, current->definition)) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, {{"code", "workspace_not_found"}, {"message", "Orphaned workspace or references are unavailable"}}};
+      }
+      const auto result = eclipse_workspace_manager->adopt(id, revision, current_client.uuid);
+      if (result.status != eclipse_workspaces::status_t::success || !result.resource) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_workspace_error(result.status)};
+      }
+      return eclipse_operation_completion_t {true, id, {{"workspace", eclipse_workspaces::to_json(*result.resource)}}, nullptr};
+    });
+  }
+
+  /**
+   * @brief Return whether text is a canonical lowercase UUID.
+   * @param value Candidate UUID text.
+   * @return `true` for canonical lowercase UUID text.
+   */
+  bool eclipse_canonical_uuid(const std::string &value) {
+    return uuid_util::is_valid(value) && std::ranges::none_of(value, [](const unsigned char character) {
+             return character >= 'A' && character <= 'F';
+           });
+  }
+
+  /**
+   * @brief Find exact string in validated JSON string array.
+   * @param values JSON string array.
+   * @param value String to find.
+   * @return `true` when array contains value.
+   */
+  bool eclipse_json_contains_string(const nlohmann::json &values, const std::string &value) {
+    return std::ranges::any_of(values, [&](const auto &entry) {
+      return entry.template get<std::string>() == value;
+    });
+  }
+
+  /**
+   * @brief Return application associations used for sandbox visibility and events.
+   * @param sandbox Sandbox resource.
+   * @return Deduplicated associated application UUIDs.
+   */
+  std::vector<std::string> eclipse_sandbox_apps(const eclipse_sandboxes::resource_t &sandbox) {
+    std::set<std::string> apps;
+    if (sandbox.app_uuid) {
+      apps.emplace(*sandbox.app_uuid);
+    }
+    for (const auto &app_uuid : sandbox.effective_policy.at("allowedAppUuids")) {
+      apps.emplace(app_uuid.get<std::string>());
+    }
+    return {apps.begin(), apps.end()};
+  }
+
+  /**
+   * @brief Check sandbox ownership and application allowlist projection.
+   * @param client Current authenticated client.
+   * @param sandbox Sandbox resource.
+   * @return `true` when resource is visible to caller.
+   */
+  bool eclipse_sandbox_visible(const verified_client_t &client, const eclipse_sandboxes::resource_t &sandbox) {
+    if (!sandbox.owner_client_uuid || (*sandbox.owner_client_uuid != client.uuid && !scope_allowed(client, "host.control"))) {
+      return false;
+    }
+    return std::ranges::all_of(eclipse_sandbox_apps(sandbox), [&](const auto &app_uuid) {
+      return app_allowed(client, app_uuid);
+    });
+  }
+
+  /**
+   * @brief Resolve caller-visible profile with required type.
+   * @param client Current authenticated client.
+   * @param id Profile UUID.
+   * @param type Required profile type.
+   * @return Visible matching profile, or no value.
+   */
+  std::optional<eclipse::profiles::profile_t> eclipse_sandbox_profile(const verified_client_t &client, const std::string &id, const std::string_view type) {
+    if (!eclipse_profile_manager) {
+      return std::nullopt;
+    }
+    const auto result = eclipse_profile_manager->get(eclipse_profile_actor(client), id);
+    return result.status == eclipse::profiles::status_t::success && result.profile && result.profile->type == type ? result.profile : std::nullopt;
+  }
+
+  /**
+   * @brief Resolve configured Sunshine application into exact native launch metadata.
+   * @param app_uuid Stable application UUID.
+   * @param launch_profile_id Optional launch-profile UUID.
+   * @return Resolved executable and launch fields, or no value.
+   */
+  std::optional<eclipse_sandboxes::application_t> eclipse_resolve_sandbox_application(const std::string &app_uuid, const std::optional<std::string> &launch_profile_id) {
+    const auto &apps = proc::proc.get_apps();
+    const auto app = std::ranges::find(apps, app_uuid, &proc::ctx_t::uuid);
+    if (app == apps.end() || app->cmd.empty() || app->elevated) {
+      return std::nullopt;
+    }
+    std::vector<std::string> command;
+    try {
+      command = boost::program_options::split_winmain(app->cmd);
+    } catch (const std::exception &) {
+      return std::nullopt;
+    }
+    if (command.empty() || !fs::path(command.front()).is_absolute()) {
+      return std::nullopt;
+    }
+    nlohmann::json arguments = nlohmann::json::array();
+    for (auto entry = std::next(command.begin()); entry != command.end(); ++entry) {
+      arguments.push_back(*entry);
+    }
+    nlohmann::json launch_data {{"arguments", std::move(arguments)}};
+    if (!app->working_dir.empty()) {
+      launch_data["workingDirectory"] = app->working_dir;
+    }
+    if (launch_profile_id) {
+      const auto profile = eclipse_profile_manager ? eclipse_profile_manager->inspect(*launch_profile_id) : std::nullopt;
+      if (!profile || profile->type != "launch" || profile->configuration.at("appUuid") != app_uuid) {
+        return std::nullopt;
+      }
+      for (const auto &argument : profile->configuration.at("arguments")) {
+        launch_data["arguments"].push_back(argument);
+      }
+      launch_data["environment"] = profile->configuration.at("environment");
+      if (!profile->configuration.at("workingDirectory").is_null()) {
+        launch_data["workingDirectory"] = profile->configuration.at("workingDirectory");
+      }
+    }
+    return eclipse_sandboxes::application_t {app_uuid, launch_profile_id, command.front(), std::move(launch_data)};
+  }
+
+  /**
+   * @brief Validate sandbox launch configuration semantics supported by native provider.
+   * @param configuration Complete launch profile configuration.
+   * @param app_uuid Selected application UUID.
+   * @param sandbox_profile_id Sandbox policy profile UUID.
+   * @return `true` when all launch semantics can be honored.
+   */
+  bool eclipse_sandbox_launch_configuration_supported(const nlohmann::json &configuration, const std::string &app_uuid, const std::string &sandbox_profile_id) {
+    return configuration.at("appUuid") == app_uuid && configuration.at("displayProfileId").is_null() && configuration.at("streamProfileId").is_null() && (configuration.at("sandboxProfileId").is_null() || configuration.at("sandboxProfileId") == sandbox_profile_id) && !configuration.at("elevated").get<bool>() && configuration.at("preLaunchPolicy").empty() && configuration.at("postExitPolicy").empty() && configuration.at("cleanupPolicy") == "on-stop" && configuration.at("resumePolicy") == "deny" && configuration.at("concurrentLaunchPolicy") == "deny";
+  }
+
+  /**
+   * @brief Validate stored sandbox launch-profile semantics supported by native provider.
+   * @param profile Launch profile.
+   * @param app_uuid Selected application UUID.
+   * @param sandbox_profile_id Sandbox policy profile UUID.
+   * @return `true` when all launch semantics can be honored.
+   */
+  bool eclipse_sandbox_launch_profile_supported(const eclipse::profiles::profile_t &profile, const std::string &app_uuid, const std::string &sandbox_profile_id) {
+    return profile.type == "launch" && eclipse_sandbox_launch_configuration_supported(profile.configuration, app_uuid, sandbox_profile_id);
+  }
+
+  /** @brief Verify sandbox manager startup availability. */
+  bool eclipse_sandboxes_available(const resp_https_t &response) {
+    if (eclipse_sandbox_manager && eclipse_sandbox_manager->available()) {
+      return true;
+    }
+    send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Sandbox provider is unavailable");
+    return false;
+  }
+
+  /** @brief Convert sandbox lifecycle status to stable operation error. */
+  nlohmann::json eclipse_sandbox_error(const eclipse_sandboxes::status_t status) {
+    using eclipse_sandboxes::status_t;
+    switch (status) {
+      case status_t::not_found:
+        return {{"code", "sandbox_not_found"}, {"message", "Sandbox no longer exists"}};
+      case status_t::invalid:
+        return {{"code", "invalid_argument"}, {"message", "Sandbox request is invalid"}};
+      case status_t::unsupported_configuration:
+        return {{"code", "unsupported_configuration"}, {"message", "Sandbox policy cannot be enforced by this host"}};
+      case status_t::conflict:
+        return {{"code", "revision_conflict"}, {"message", "Sandbox revision or lifecycle state changed"}};
+      case status_t::application_not_found:
+        return {{"code", "application_not_found"}, {"message", "Sandbox application or launch profile is unavailable"}};
+      case status_t::provider_error:
+        return {{"code", "provider_failure"}, {"message", "Sandbox provider operation failed"}};
+      case status_t::persistence_error:
+        return {{"code", "persistence_failure"}, {"message", "Sandbox state could not be persisted"}};
+      case status_t::unavailable:
+        return {{"code", "feature_unavailable"}, {"message", "Sandbox provider is unavailable"}};
+      case status_t::success:
+        break;
+    }
+    return nullptr;
+  }
+
+  /** @brief Publish sandbox event through current ownership and allowlist projection. */
+  void publish_eclipse_sandbox_event(const std::string &type, const eclipse_sandboxes::resource_t &sandbox, nlohmann::json data, const std::string &owner) {
+    publish_eclipse_event({type, sandbox.id, sandbox.revision, std::move(data)}, "sandbox.manage", owner, eclipse_sandbox_apps(sandbox));
+  }
+
+  /** @brief Stop and orphan or remove sandboxes owned by revoked client. */
+  void revoke_eclipse_sandboxes(const std::string &owner) {
+    if (eclipse_sandbox_manager && eclipse_sandbox_manager->revoke_owner(owner) != eclipse_sandboxes::status_t::success) {
+      BOOST_LOG(error) << "Failed to revoke sandboxes for client [" << owner << ']';
+    }
+  }
+
+  /**
+   * @brief Stop and delete one workspace-owned sandbox.
+   * @param id Sandbox UUID.
+   * @return `true` when resource no longer exists.
+   */
+  bool eclipse_destroy_workspace_sandbox(const std::string &id) {
+    if (!eclipse_sandbox_manager) {
+      return false;
+    }
+    auto sandbox = eclipse_sandbox_manager->get(id);
+    if (!sandbox) {
+      return true;
+    }
+    return eclipse_sandbox_manager->remove(id, sandbox->revision).status == eclipse_sandboxes::status_t::success;
+  }
+
+  /**
+   * @brief Stop one workspace sandbox while retaining its definition for rollback.
+   * @param id Sandbox UUID.
+   * @param force Whether provider termination should be forced.
+   * @return `true` when sandbox is stopped.
+   */
+  bool eclipse_stop_workspace_sandbox(const std::string &id, const bool force) {
+    if (!eclipse_sandbox_manager) {
+      return false;
+    }
+    const auto sandbox = eclipse_sandbox_manager->get(id);
+    if (!sandbox) {
+      return false;
+    }
+    if (sandbox->state == eclipse_sandboxes::state_t::stopped || sandbox->state == eclipse_sandboxes::state_t::created) {
+      return true;
+    }
+    const auto stopped = eclipse_sandbox_manager->stop(id, sandbox->revision, force);
+    return stopped.status == eclipse_sandboxes::status_t::success;
+  }
+
+  /** @brief Return caller-visible sandbox collection. */
+  void eclipse_sandboxes_route(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "sandbox.manage");
+    if (!client || !eclipse_sandboxes_available(response)) {
+      return;
+    }
+    std::optional<std::uint64_t> since;
+    const auto args = request->parse_query_string();
+    if (const auto value = args.find("since"); value != args.end()) {
+      std::uint64_t parsed {};
+      const auto [end, error] = std::from_chars(value->second.data(), value->second.data() + value->second.size(), parsed);
+      if (error != std::errc {} || end != value->second.data() + value->second.size()) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "since must be an unsigned sandbox revision");
+        return;
+      }
+      since = parsed;
+    }
+    const auto listed = eclipse_sandbox_manager->list(since);
+    nlohmann::json sandboxes = nlohmann::json::array();
+    if (listed.changed) {
+      for (const auto &sandbox : listed.resources) {
+        if (eclipse_sandbox_visible(*client, sandbox)) {
+          sandboxes.push_back(eclipse_sandboxes::to_json(sandbox));
+        }
+      }
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"revision", listed.revision}, {"changed", listed.changed}, {"fullSnapshot", listed.changed}, {"sandboxes", std::move(sandboxes)}});
+  }
+
+  /** @brief Return one caller-visible sandbox. */
+  void eclipse_sandbox_route(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "sandbox.manage");
+    if (!client || !eclipse_sandboxes_available(response)) {
+      return;
+    }
+    const auto sandbox = eclipse_sandbox_manager->get(request->path_match[1].str());
+    if (!sandbox || !eclipse_sandbox_visible(*client, *sandbox)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Sandbox does not exist or is not visible to this client");
+      return;
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"sandbox", eclipse_sandboxes::to_json(*sandbox)}});
+  }
+
+  /** @brief Create sandbox through durable idempotent operation handling. */
+  void eclipse_create_sandbox(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "sandbox.manage");
+    if (!client || !eclipse_sandboxes_available(response)) {
+      return;
+    }
+    const auto body = eclipse_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    eclipse_sandboxes::create_t creation;
+    try {
+      if (body->size() != 6 || !body->contains("profileId") || !body->contains("workspaceId") || !body->contains("appUuid") || !body->contains("persistent") || !body->contains("name")) {
+        throw std::invalid_argument("shape");
+      }
+      creation.profile_id = body->at("profileId").get<std::string>();
+      if (!body->at("workspaceId").is_null()) {
+        creation.workspace_id = body->at("workspaceId").get<std::string>();
+      }
+      if (!body->at("appUuid").is_null()) {
+        creation.app_uuid = body->at("appUuid").get<std::string>();
+      }
+      creation.persistent = body->at("persistent").get<bool>();
+      creation.name = body->at("name").get<std::string>();
+    } catch (const std::exception &) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Sandbox creation object is invalid");
+      return;
+    }
+    const auto profile = eclipse_canonical_uuid(creation.profile_id) ? eclipse_sandbox_profile(*client, creation.profile_id, "sandbox") : std::nullopt;
+    if (creation.workspace_id) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Workspace-bound sandboxes are created through workspace lifecycle operations");
+      return;
+    }
+    const bool app_valid = !creation.app_uuid || (eclipse_canonical_uuid(*creation.app_uuid) && app_allowed(*client, *creation.app_uuid) && profile && eclipse_json_contains_string(profile->configuration.at("allowedAppUuids"), *creation.app_uuid));
+    if (!profile || !app_valid) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "resource_not_found", "Sandbox references are unavailable to this client");
+      return;
+    }
+    creation.profile_configuration = profile->configuration;
+    submit_eclipse_operation(response, *client, request, "sandbox.create", *body, [creation = std::move(creation)](const verified_client_t &current_client) {
+      const auto profile = eclipse_sandbox_profile(current_client, creation.profile_id, "sandbox");
+      if (!profile || creation.workspace_id || (creation.app_uuid && (!app_allowed(current_client, *creation.app_uuid) || !eclipse_json_contains_string(profile->configuration.at("allowedAppUuids"), *creation.app_uuid)))) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, {{"code", "resource_not_found"}, {"message", "Sandbox references are unavailable to this client"}}};
+      }
+      auto current_creation = creation;
+      current_creation.profile_configuration = profile->configuration;
+      const auto result = eclipse_sandbox_manager->create(current_client.uuid, current_creation);
+      if (result.status != eclipse_sandboxes::status_t::success || !result.resource) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_sandbox_error(result.status)};
+      }
+      BOOST_LOG(info) << "Audit: client [" << current_client.uuid << "] created sandbox [" << result.resource->id << ']';
+      return eclipse_operation_completion_t {true, result.resource->id, {{"sandbox", eclipse_sandboxes::to_json(*result.resource)}}, nullptr};
+    });
+  }
+
+  /** @brief Start sandbox through durable idempotent operation handling. */
+  void eclipse_start_sandbox(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "sandbox.manage");
+    if (!client || !eclipse_sandboxes_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto sandbox = eclipse_sandbox_manager->get(id);
+    if (!sandbox || !eclipse_sandbox_visible(*client, *sandbox)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Sandbox does not exist or is not visible to this client");
+      return;
+    }
+    if (sandbox->workspace_id) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "Workspace-bound sandbox must be controlled through its workspace");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != sandbox->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_conflict : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "precondition_required", revision ? "Sandbox revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const auto body = eclipse_request_json(response, request);
+    eclipse_sandboxes::start_t start;
+    try {
+      if (!body || body->size() > 3 || std::ranges::any_of(body->items(), [](const auto &item) {
+            return item.key() != "schemaVersion" && item.key() != "appUuid" && item.key() != "launchProfileId";
+          })) {
+        throw std::invalid_argument("shape");
+      }
+      if (body->contains("appUuid") && !body->at("appUuid").is_null()) {
+        start.app_uuid = body->at("appUuid").get<std::string>();
+      }
+      if (body->contains("launchProfileId") && !body->at("launchProfileId").is_null()) {
+        start.launch_profile_id = body->at("launchProfileId").get<std::string>();
+      }
+    } catch (const std::exception &) {
+      if (body) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Sandbox start object is invalid");
+      }
+      return;
+    }
+    const auto app_uuid = start.app_uuid ? start.app_uuid : sandbox->app_uuid;
+    const auto launch_profile = start.launch_profile_id && eclipse_canonical_uuid(*start.launch_profile_id) ? eclipse_sandbox_profile(*client, *start.launch_profile_id, "launch") : std::nullopt;
+    if (!app_uuid || !eclipse_canonical_uuid(*app_uuid) || !app_allowed(*client, *app_uuid) || !eclipse_json_contains_string(sandbox->effective_policy.at("allowedAppUuids"), *app_uuid) || (start.launch_profile_id && (!launch_profile || !eclipse_sandbox_launch_profile_supported(*launch_profile, *app_uuid, sandbox->profile_id))) || !eclipse_resolve_sandbox_application(*app_uuid, start.launch_profile_id)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Sandbox application or launch profile cannot be executed under this policy");
+      return;
+    }
+    submit_eclipse_operation(response, *client, request, "sandbox.start", *body, [id, revision = *revision, start](const verified_client_t &current_client) {
+      const auto current = eclipse_sandbox_manager->get(id);
+      const auto app_uuid = start.app_uuid ? start.app_uuid : (current ? current->app_uuid : std::nullopt);
+      const auto launch_profile = start.launch_profile_id && eclipse_canonical_uuid(*start.launch_profile_id) ? eclipse_sandbox_profile(current_client, *start.launch_profile_id, "launch") : std::nullopt;
+      if (!current || current->workspace_id || !eclipse_sandbox_visible(current_client, *current) || !app_uuid || !app_allowed(current_client, *app_uuid) || !eclipse_json_contains_string(current->effective_policy.at("allowedAppUuids"), *app_uuid) || (start.launch_profile_id && (!launch_profile || !eclipse_sandbox_launch_profile_supported(*launch_profile, *app_uuid, current->profile_id)))) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, {{"code", "sandbox_not_found"}, {"message", "Sandbox or launch references are unavailable to this client"}}};
+      }
+      const auto result = eclipse_sandbox_manager->start(id, revision, start);
+      if (result.status != eclipse_sandboxes::status_t::success || !result.resource) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_sandbox_error(result.status)};
+      }
+      BOOST_LOG(info) << "Audit: client [" << current_client.uuid << "] started sandbox [" << id << ']';
+      return eclipse_operation_completion_t {true, id, {{"sandbox", eclipse_sandboxes::to_json(*result.resource)}}, nullptr};
+    });
+  }
+
+  /** @brief Stop or restart sandbox through durable operation handling. */
+  void eclipse_stop_or_restart_sandbox(resp_https_t response, req_https_t request, const bool restart) {
+    const auto client = authorize_eclipse_request(response, request, "sandbox.manage");
+    if (!client || !eclipse_sandboxes_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto sandbox = eclipse_sandbox_manager->get(id);
+    if (!sandbox || !eclipse_sandbox_visible(*client, *sandbox)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Sandbox does not exist or is not visible to this client");
+      return;
+    }
+    if (sandbox->workspace_id) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "Workspace-bound sandbox must be controlled through its workspace");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != sandbox->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_conflict : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "precondition_required", revision ? "Sandbox revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const auto body = eclipse_request_json(response, request);
+    if (!body || body->size() != 2 || !body->contains("force") || !body->at("force").is_boolean()) {
+      if (body) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Sandbox stop and restart require force boolean");
+      }
+      return;
+    }
+    const bool force = body->at("force");
+    const auto action = restart ? "sandbox.restart" : "sandbox.stop";
+    submit_eclipse_operation(response, *client, request, action, *body, [id, revision = *revision, force, restart](const verified_client_t &current_client) {
+      const auto current = eclipse_sandbox_manager->get(id);
+      if (!current || current->workspace_id || !eclipse_sandbox_visible(current_client, *current)) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, {{"code", "sandbox_not_found"}, {"message", "Sandbox does not exist or is not visible to this client"}}};
+      }
+      const auto result = restart ? eclipse_sandbox_manager->restart(id, revision, force) : eclipse_sandbox_manager->stop(id, revision, force);
+      if (result.status != eclipse_sandboxes::status_t::success || !result.resource) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_sandbox_error(result.status)};
+      }
+      BOOST_LOG(info) << "Audit: client [" << current_client.uuid << "] " << (restart ? "restarted" : "stopped") << " sandbox [" << id << ']';
+      return eclipse_operation_completion_t {true, id, {{"sandbox", eclipse_sandboxes::to_json(*result.resource)}}, nullptr};
+    });
+  }
+
+  /** @brief Stop sandbox through durable operation handling. */
+  void eclipse_stop_sandbox(resp_https_t response, req_https_t request) {
+    eclipse_stop_or_restart_sandbox(std::move(response), std::move(request), false);
+  }
+
+  /** @brief Restart sandbox through durable operation handling. */
+  void eclipse_restart_sandbox(resp_https_t response, req_https_t request) {
+    eclipse_stop_or_restart_sandbox(std::move(response), std::move(request), true);
+  }
+
+  /** @brief Delete sandbox through durable operation handling. */
+  void eclipse_delete_sandbox(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "sandbox.manage");
+    if (!client || !eclipse_sandboxes_available(response)) {
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto sandbox = eclipse_sandbox_manager->get(id);
+    if (!sandbox || !eclipse_sandbox_visible(*client, *sandbox)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Sandbox does not exist or is not visible to this client");
+      return;
+    }
+    if (sandbox->workspace_id) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "Workspace-bound sandbox must be controlled through its workspace");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != sandbox->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_conflict : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "precondition_required", revision ? "Sandbox revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const nlohmann::json body {{"id", id}, {"revision", *revision}};
+    submit_eclipse_operation(response, *client, request, "sandbox.delete", body, [id, revision = *revision](const verified_client_t &current_client) {
+      const auto current = eclipse_sandbox_manager->get(id);
+      if (!current || current->workspace_id || !eclipse_sandbox_visible(current_client, *current)) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, {{"code", "sandbox_not_found"}, {"message", "Sandbox does not exist or is not visible to this client"}}};
+      }
+      const auto result = eclipse_sandbox_manager->remove(id, revision);
+      if (result.status != eclipse_sandboxes::status_t::success) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_sandbox_error(result.status)};
+      }
+      if (eclipse_peripheral_manager) {
+        eclipse_peripheral_manager->target_ended("sandbox", id, true);
+      }
+      BOOST_LOG(info) << "Audit: client [" << current_client.uuid << "] deleted sandbox [" << id << ']';
+      return eclipse_operation_completion_t {true, id, {{"deleted", true}, {"id", id}}, nullptr};
+    });
+  }
+
+  /** @brief Adopt orphaned persistent sandbox through durable operation handling. */
+  void eclipse_adopt_sandbox(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "sandbox.manage");
+    if (!client || !scope_allowed(*client, "host.control") || !eclipse_sandboxes_available(response)) {
+      if (client && !scope_allowed(*client, "host.control")) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", "Client certificate lacks host.control permission");
+      }
+      return;
+    }
+    const auto id = request->path_match[1].str();
+    const auto sandbox = eclipse_sandbox_manager->get(id);
+    if (!sandbox) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Orphaned sandbox does not exist");
+      return;
+    }
+    if (sandbox->owner_client_uuid) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "Sandbox is already owned");
+      return;
+    }
+    if (sandbox->workspace_id) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "Workspace-bound sandbox must be controlled through its workspace");
+      return;
+    }
+    if (!std::ranges::all_of(eclipse_sandbox_apps(*sandbox), [&](const auto &app_uuid) {
+          return app_allowed(*client, app_uuid);
+        })) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Orphaned sandbox does not exist or is not visible to this client");
+      return;
+    }
+    const auto revision = eclipse_if_match(request);
+    if (!revision || *revision != sandbox->revision) {
+      send_eclipse_error(response, revision ? SimpleWeb::StatusCode::client_error_conflict : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "precondition_required", revision ? "Sandbox revision does not match" : "Strong numeric If-Match header is required");
+      return;
+    }
+    const auto body = eclipse_request_json(response, request);
+    if (!body || body->size() != 1) {
+      if (body) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Sandbox adoption requires an empty object");
+      }
+      return;
+    }
+    submit_eclipse_operation(response, *client, request, "sandbox.adopt", *body, [id, revision = *revision](const verified_client_t &current_client) {
+      const auto current = eclipse_sandbox_manager->get(id);
+      if (!current || current->workspace_id || current->owner_client_uuid || !std::ranges::all_of(eclipse_sandbox_apps(*current), [&](const auto &app_uuid) {
+            return app_allowed(current_client, app_uuid);
+          })) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, {{"code", "sandbox_not_found"}, {"message", "Orphaned sandbox is unavailable to this client"}}};
+      }
+      const auto result = eclipse_sandbox_manager->adopt(id, revision, current_client.uuid);
+      if (result.status != eclipse_sandboxes::status_t::success || !result.resource) {
+        return eclipse_operation_completion_t {false, std::nullopt, nullptr, eclipse_sandbox_error(result.status)};
+      }
+      BOOST_LOG(info) << "Audit: client [" << current_client.uuid << "] adopted sandbox [" << id << ']';
+      return eclipse_operation_completion_t {true, id, {{"sandbox", eclipse_sandboxes::to_json(*result.resource)}}, nullptr};
+    });
+  }
+#endif
+
+  /**
+   * @brief Return one asynchronous operation visible to caller.
+   */
+  void eclipse_operation(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request);
+    if (!client) {
+      return;
+    }
+    const auto operation_id = request->path_match[1].str();
+    const auto operation = eclipse_operation_store ? eclipse_operation_store->get(operation_id) : std::nullopt;
+    if (!operation) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "operation_not_found", "Operation does not exist or is not visible to this client");
+      return;
+    }
+    const auto operation_scope = eclipse_operation_scope(operation->action);
+    if (operation_scope.empty() || !scope_allowed(*client, operation_scope)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", "Client certificate lacks operation domain permission");
+      return;
+    }
+    if (operation->client_uuid != client->uuid && !scope_allowed(*client, "host.control")) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "operation_not_found", "Operation does not exist or is not visible to this client");
+      return;
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"operation", eclipse_operations::to_json(*operation)}});
   }
 
   /**
@@ -2106,14 +5647,42 @@ namespace nvhttp {
     if (!client) {
       return;
     }
-    const bool administer = scope_allowed(*client, "host.control");
-    nlohmann::json sessions = nlohmann::json::array();
-    for (const auto &session : eclipse_session_snapshots()) {
-      if (administer || session.client_uuid == client->uuid) {
-        sessions.emplace_back(eclipse_session_json(session));
+    std::optional<std::uint64_t> since;
+    const auto args = request->parse_query_string();
+    if (const auto value = args.find("since"); value != args.end()) {
+      try {
+        std::size_t consumed {};
+        since = std::stoull(value->second, &consumed);
+        if (consumed != value->second.size()) {
+          throw std::invalid_argument("trailing characters");
+        }
+      } catch (const std::exception &) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "since must be an unsigned session revision");
+        return;
       }
     }
-    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"sessions", std::move(sessions)}});
+    const bool administer = scope_allowed(*client, "host.control");
+    std::uint64_t revision = 0;
+    nlohmann::json sessions = nlohmann::json::array();
+    {
+      std::lock_guard lock {eclipse_session_tracking_mutex};
+      revision = eclipse_session_collection_revision;
+    }
+    const bool changed = !since || *since != revision;
+    if (changed) {
+      for (const auto &session : eclipse_session_snapshots()) {
+        if (administer || session.client_uuid == client->uuid) {
+          const auto tracking = eclipse_session_tracking_for(session.id);
+          sessions.emplace_back(eclipse_session_json(session, tracking ? &*tracking : nullptr));
+        }
+      }
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {
+                                                                         {"revision", revision},
+                                                                         {"changed", changed},
+                                                                         {"fullSnapshot", changed},
+                                                                         {"sessions", std::move(sessions)},
+                                                                       });
   }
 
   /**
@@ -2128,7 +5697,8 @@ namespace nvhttp {
     const bool administer = scope_allowed(*client, "host.control");
     for (const auto &session : eclipse_session_snapshots()) {
       if (session.id == session_id && (administer || session.client_uuid == client->uuid)) {
-        send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"session", eclipse_session_json(session)}});
+        const auto tracking = eclipse_session_tracking_for(session.id);
+        send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"session", eclipse_session_json(session, tracking ? &*tracking : nullptr)}});
         return;
       }
     }
@@ -2136,8 +5706,1048 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Disconnect one logical session without stopping its host application.
+   * @brief Close any live forwarding channels for claims bound to one target.
+   *
+   * @param target_type Target type filter.
+   * @param target_id Canonical target UUID.
    */
+  void eclipse_close_target_channels(const std::string &target_type, const std::string &target_id) {
+    if (!eclipse_peripheral_manager) {
+      return;
+    }
+    for (const auto &claim : eclipse_peripheral_manager->list_claims({})) {
+      if (claim.target.type == target_type && claim.target.id == target_id) {
+        eclipse_close_peripheral_channel(claim.id);
+      }
+    }
+  }
+
+  /**
+   * @brief Close any live forwarding channels owned by one client.
+   *
+   * @param owner_uuid Canonical owner UUID.
+   */
+  void eclipse_close_owner_channels(const std::string &owner_uuid) {
+    if (!eclipse_peripheral_manager) {
+      return;
+    }
+    for (const auto &claim : eclipse_peripheral_manager->list_claims(owner_uuid)) {
+      eclipse_close_peripheral_channel(claim.id);
+    }
+  }
+
+  /**
+   * @brief Advance the peripherals collection revision.
+   */
+  void eclipse_bump_peripheral_revision() {
+    std::lock_guard lock {eclipse_peripheral_revision_mutex};
+    ++eclipse_peripheral_collection_revision;
+  }
+
+  /**
+   * @brief Publish one peripherals-v1 event to authorized subscribers.
+   *
+   * @param type Event type name.
+   * @param data Event payload.
+   */
+  void publish_eclipse_peripheral_event(const std::string &type, nlohmann::json data) {
+    publish_eclipse_event({type, data.contains("id") ? std::optional<std::string> {data.at("id").get<std::string>()} : std::nullopt, data.contains("revision") ? std::optional<std::uint64_t> {data.at("revision").get<std::uint64_t>()} : std::nullopt, std::move(data)}, "peripheral.forward");
+  }
+
+  /**
+   * @brief Resolve caller visibility for peripheral resources.
+   *
+   * @param client Authenticated caller.
+   * @return Owner filter; empty grants administrative visibility.
+   */
+  std::string eclipse_peripheral_owner_filter(const verified_client_t &client) {
+    return scope_allowed(client, "host.control") ? std::string {} : std::string {client.uuid};
+  }
+
+  /**
+   * @brief Report whether workspaces, launch profiles, or applications reference a profile.
+   *
+   * @param profile_id Canonical profile UUID.
+   * @return True when at least one published reference resolves to the profile.
+   */
+  bool eclipse_profile_referenced(const std::string &profile_id) {
+    if (profile_id.empty()) {
+      return false;
+    }
+    if (eclipse_workspace_manager) {
+      for (const auto &workspace : eclipse_workspace_manager->list().workspaces) {
+        const auto &definition = workspace.definition;
+        if (definition.display_profile_id == profile_id || definition.stream_profile_id == profile_id || definition.launch_profile_id == profile_id || definition.sandbox_profile_id == profile_id) {
+          return true;
+        }
+      }
+    }
+    if (eclipse_profile_manager && eclipse_profile_manager->launch_profile_references(profile_id)) {
+      return true;
+    }
+    for (const auto &app : proc::catalog_snapshot().apps) {
+      const auto &metadata = app.eclipse_metadata;
+      if (metadata.value("displayProfileId", "") == profile_id || metadata.value("streamProfileId", "") == profile_id || metadata.value("sandboxProfileId", "") == profile_id) {
+        return true;
+      }
+      for (const auto &launch_profile : metadata.value("launchProfiles", nlohmann::json::array())) {
+        if (launch_profile.value("id", "") == profile_id) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * @brief Return registered peripheral devices visible to the caller.
+   */
+  void eclipse_peripherals_list(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "peripheral.forward");
+    if (!client) {
+      return;
+    }
+    if (!eclipse_peripheral_manager) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
+      return;
+    }
+    std::uint64_t revision = 0;
+    {
+      std::lock_guard lock {eclipse_peripheral_revision_mutex};
+      revision = eclipse_peripheral_collection_revision;
+    }
+    std::optional<std::uint64_t> since;
+    const auto args = request->parse_query_string();
+    if (const auto value = args.find("since"); value != args.end()) {
+      try {
+        std::size_t consumed {};
+        since = std::stoull(value->second, &consumed);
+        if (consumed != value->second.size()) {
+          throw std::invalid_argument("trailing characters");
+        }
+      } catch (const std::exception &) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "since must be an unsigned peripheral revision");
+        return;
+      }
+    }
+    const bool changed = !since || *since != revision;
+    nlohmann::json peripherals = nlohmann::json::array();
+    if (changed) {
+      for (const auto &[device, active_claim] : eclipse_peripheral_manager->list_devices(eclipse_peripheral_owner_filter(*client))) {
+        peripherals.push_back(eclipse_peripherals::device_json(device, active_claim));
+      }
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {
+                                                                         {"revision", revision},
+                                                                         {"changed", changed},
+                                                                         {"fullSnapshot", changed},
+                                                                         {"peripherals", std::move(peripherals)},
+                                                                       });
+  }
+
+  /**
+   * @brief Parse a peripheral device registration body.
+   *
+   * @param response HTTPS response used for structured errors.
+   * @param body Parsed request body.
+   * @return Creation fields, or no value after sending an error.
+   */
+  std::optional<eclipse_peripherals::create_device_t> eclipse_peripheral_create_body(const resp_https_t &response, const nlohmann::json &body) {
+    for (const char *field : {"class", "platformId", "name", "vendorId", "productId", "capabilities"}) {
+      if (!body.contains(field)) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", std::format("{} is required", field));
+        return std::nullopt;
+      }
+    }
+    if (!body.at("class").is_string() || !body.at("platformId").is_string() || !body.at("name").is_string() || !body.at("vendorId").is_number_unsigned() || !body.at("productId").is_number_unsigned() || !body.at("capabilities").is_array()) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Peripheral fields have invalid types");
+      return std::nullopt;
+    }
+    eclipse_peripherals::create_device_t creation;
+    creation.device_class = body.at("class").get<std::string>();
+    creation.platform_id = body.at("platformId").get<std::string>();
+    creation.name = body.at("name").get<std::string>();
+    creation.vendor_id = body.at("vendorId").get<std::uint32_t>();
+    creation.product_id = body.at("productId").get<std::uint32_t>();
+    if (body.contains("serial") && body.at("serial").is_string()) {
+      creation.serial = body.at("serial").get<std::string>();
+    }
+    if (body.contains("reportDescriptorBase64") && body.at("reportDescriptorBase64").is_string()) {
+      creation.report_descriptor_base64 = body.at("reportDescriptorBase64").get<std::string>();
+    }
+    for (const auto &capability : body.at("capabilities")) {
+      if (!capability.is_string()) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "capabilities must be strings");
+        return std::nullopt;
+      }
+      creation.capabilities.push_back(capability.get<std::string>());
+    }
+    return creation;
+  }
+
+  /**
+   * @brief Register one peripheral device descriptor.
+   */
+  void eclipse_peripherals_create(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "peripheral.forward");
+    if (!client) {
+      return;
+    }
+    if (!eclipse_peripheral_manager) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
+      return;
+    }
+    const auto body = eclipse_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    const auto creation = eclipse_peripheral_create_body(response, *body);
+    if (!creation) {
+      return;
+    }
+    const auto created = eclipse_peripheral_manager->create_device(client->uuid, *creation);
+    if (created.status == eclipse_peripherals::status_t::invalid) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Peripheral registration fields are invalid");
+      return;
+    }
+    if (created.status == eclipse_peripherals::status_t::unsupported_configuration || !created.resource) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Peripheral class or capabilities are not supported by this host");
+      return;
+    }
+    eclipse_bump_peripheral_revision();
+    publish_eclipse_peripheral_event("peripheral.added", eclipse_peripherals::device_json(*created.resource));
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_created, {{"peripheral", eclipse_peripherals::device_json(*created.resource)}});
+  }
+
+  /**
+   * @brief Return one peripheral device resource.
+   */
+  void eclipse_peripheral_get(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "peripheral.forward");
+    if (!client) {
+      return;
+    }
+    if (!eclipse_peripheral_manager) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
+      return;
+    }
+    const auto found = eclipse_peripheral_manager->get_device(eclipse_peripheral_owner_filter(*client), request->path_match[1].str());
+    if (!found) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "peripheral_not_found", "Peripheral does not exist or is not visible to this client");
+      return;
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"peripheral", eclipse_peripherals::device_json(found->first, found->second)}});
+  }
+
+  /**
+   * @brief Unregister one peripheral device and release its claims.
+   */
+  void eclipse_peripheral_delete(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "peripheral.forward");
+    if (!client) {
+      return;
+    }
+    if (!eclipse_peripheral_manager) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
+      return;
+    }
+    const auto removed = eclipse_peripheral_manager->delete_device(eclipse_peripheral_owner_filter(*client), request->path_match[1].str());
+    if (removed.status != eclipse_peripherals::status_t::success || !removed.resource) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "peripheral_not_found", "Peripheral does not exist or is not visible to this client");
+      return;
+    }
+    eclipse_bump_peripheral_revision();
+    publish_eclipse_peripheral_event("peripheral.removed", {{"id", removed.resource->id}, {"revision", removed.resource->revision + 1}});
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"deleted", true}, {"id", removed.resource->id}});
+  }
+
+  /**
+   * @brief Return registered peripheral claims visible to the caller.
+   */
+  void eclipse_peripheral_claims_list(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "peripheral.forward");
+    if (!client) {
+      return;
+    }
+    if (!eclipse_peripheral_manager) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
+      return;
+    }
+    std::uint64_t revision = 0;
+    {
+      std::lock_guard lock {eclipse_peripheral_revision_mutex};
+      revision = eclipse_peripheral_collection_revision;
+    }
+    std::optional<std::uint64_t> since;
+    const auto args = request->parse_query_string();
+    if (const auto value = args.find("since"); value != args.end()) {
+      try {
+        std::size_t consumed {};
+        since = std::stoull(value->second, &consumed);
+        if (consumed != value->second.size()) {
+          throw std::invalid_argument("trailing characters");
+        }
+      } catch (const std::exception &) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "since must be an unsigned peripheral revision");
+        return;
+      }
+    }
+    const bool changed = !since || *since != revision;
+    nlohmann::json claims = nlohmann::json::array();
+    if (changed) {
+      for (const auto &claim : eclipse_peripheral_manager->list_claims(eclipse_peripheral_owner_filter(*client))) {
+        claims.push_back(eclipse_peripherals::claim_json(claim));
+      }
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {
+                                                                         {"revision", revision},
+                                                                         {"changed", changed},
+                                                                         {"fullSnapshot", changed},
+                                                                         {"claims", std::move(claims)},
+                                                                       });
+  }
+
+  /**
+   * @brief Create one peripheral claim bound to a visible target.
+   */
+  void eclipse_peripheral_claims_create(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "peripheral.forward");
+    if (!client) {
+      return;
+    }
+    if (!eclipse_peripheral_manager) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
+      return;
+    }
+    const auto body = eclipse_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    for (const char *field : {"deviceId", "target", "requestedCapabilities", "exclusive", "disconnectPolicy"}) {
+      if (!body->contains(field)) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", std::format("{} is required", field));
+        return;
+      }
+    }
+    if (!body->at("deviceId").is_string() || !body->at("target").is_object() || !body->at("target").contains("type") || !body->at("target").contains("id") || !body->at("target").at("type").is_string() || !body->at("target").at("id").is_string() || !body->at("requestedCapabilities").is_array() || !body->at("exclusive").is_boolean() || !body->at("disconnectPolicy").is_string()) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Claim fields have invalid types");
+      return;
+    }
+    eclipse_peripherals::create_claim_t creation;
+    creation.device_id = body->at("deviceId").get<std::string>();
+    creation.target.type = body->at("target").at("type").get<std::string>();
+    creation.target.id = body->at("target").at("id").get<std::string>();
+    creation.exclusive = body->at("exclusive").get<bool>();
+    creation.disconnect_policy = body->at("disconnectPolicy").get<std::string>();
+    for (const auto &capability : body->at("requestedCapabilities")) {
+      if (!capability.is_string()) {
+        send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "requestedCapabilities must be strings");
+        return;
+      }
+      creation.requested_capabilities.push_back(capability.get<std::string>());
+    }
+    if (!uuid_util::is_valid(creation.device_id) || !uuid_util::is_valid(creation.target.id)) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Claim identifiers must be canonical UUIDs");
+      return;
+    }
+
+    // Bind to a visible target before granting anything.
+    bool target_visible = false;
+    if (creation.target.type == "session") {
+      const auto owner = scope_allowed(*client, "host.control") ? std::string_view {} : std::string_view {client->uuid};
+      target_visible = std::ranges::any_of(eclipse_session_snapshots(), [&](const auto &session) {
+        return session.id == creation.target.id && (owner.empty() || session.client_uuid == owner);
+      });
+    }
+#ifdef _WIN32
+    if (creation.target.type == "workspace" && eclipse_workspace_manager) {
+      const auto workspace = eclipse_workspace_manager->get(creation.target.id);
+      target_visible = workspace && eclipse_workspace_visible(*client, *workspace, true);
+    }
+    if (creation.target.type == "sandbox" && eclipse_sandbox_manager) {
+      const auto sandbox = eclipse_sandbox_manager->get(creation.target.id);
+      target_visible = sandbox && eclipse_sandbox_visible(*client, *sandbox);
+    }
+#endif
+    if (!target_visible) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "claim_target_not_found", "Claim target does not exist or is not visible to this client");
+      return;
+    }
+
+    const auto created = eclipse_peripheral_manager->create_claim(client->uuid, creation);
+    if (created.status == eclipse_peripherals::status_t::not_found) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "peripheral_not_found", "Peripheral does not exist or is not visible to this client");
+      return;
+    }
+    if (created.status == eclipse_peripherals::status_t::conflict) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "An exclusive claim already exists for this peripheral");
+      return;
+    }
+    if (created.status == eclipse_peripherals::status_t::invalid) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Claim fields are invalid");
+      return;
+    }
+    if (created.status != eclipse_peripherals::status_t::success || !created.resource) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Requested claim capabilities are not supported by this host");
+      return;
+    }
+    eclipse_bump_peripheral_revision();
+    const auto device = eclipse_peripheral_manager->get_device({}, creation.device_id);
+    if (device) {
+      publish_eclipse_peripheral_event("peripheral.updated", eclipse_peripherals::device_json(device->first, device->second));
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_created, {{"claim", eclipse_peripherals::claim_json(*created.resource)}});
+  }
+
+  /**
+   * @brief Return one peripheral claim resource.
+   */
+  void eclipse_peripheral_claim_get(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "peripheral.forward");
+    if (!client) {
+      return;
+    }
+    if (!eclipse_peripheral_manager) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
+      return;
+    }
+    const auto claim = eclipse_peripheral_manager->get_claim(eclipse_peripheral_owner_filter(*client), request->path_match[1].str());
+    if (!claim) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "claim_not_found", "Claim does not exist or is not visible to this client");
+      return;
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"claim", eclipse_peripherals::claim_json(*claim)}});
+  }
+
+  /**
+   * @brief Release one peripheral claim idempotently.
+   */
+  void eclipse_peripheral_claim_delete(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "peripheral.forward");
+    if (!client) {
+      return;
+    }
+    if (!eclipse_peripheral_manager) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
+      return;
+    }
+    const auto released = eclipse_peripheral_manager->release_claim(eclipse_peripheral_owner_filter(*client), request->path_match[1].str());
+    if (released.status != eclipse_peripherals::status_t::success || !released.resource) {
+      send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "claim_not_found", "Claim does not exist or is not visible to this client");
+      return;
+    }
+    eclipse_bump_peripheral_revision();
+    publish_eclipse_peripheral_event("peripheral.updated", eclipse_peripherals::claim_json(*released.resource));
+    if (released.resource->state == eclipse_peripherals::claim_state_t::released) {
+      eclipse_close_peripheral_channel(request->path_match[1].str());
+    }
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"released", true}, {"id", released.resource->id}});
+  }
+
+  /**
+   * @brief Derive an RFC 6455 handshake accept key from a client key.
+   *
+   * @param key Raw `Sec-WebSocket-Key` header value.
+   * @return Base64 accept key.
+   */
+  std::string websocket_accept_key(std::string_view key) {
+    static const std::string_view GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    std::string material;
+    material.reserve(key.size() + GUID.size());
+    material.append(key);
+    material.append(GUID);
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_length = 0;
+    if (!EVP_Digest(material.data(), material.size(), digest, &digest_length, EVP_sha1(), nullptr) || digest_length != 20) {
+      return {};
+    }
+    return SimpleWeb::Crypto::Base64::encode(std::string {reinterpret_cast<const char *>(digest), digest_length});
+  }
+
+  /**
+   * @brief Encode one unmasked server WebSocket frame.
+   *
+   * @param opcode Frame opcode.
+   * @param payload Frame payload.
+   * @return Complete encoded frame.
+   */
+  std::vector<std::uint8_t> websocket_frame(int opcode, std::string_view payload) {
+    std::vector<std::uint8_t> frame;
+    frame.push_back(static_cast<std::uint8_t>(0x80 | opcode));
+    if (payload.size() < 126) {
+      frame.push_back(static_cast<std::uint8_t>(payload.size()));
+    } else if (payload.size() < 65536) {
+      frame.push_back(126);
+      frame.push_back(static_cast<std::uint8_t>((payload.size() >> 8) & 0xFF));
+      frame.push_back(static_cast<std::uint8_t>(payload.size() & 0xFF));
+    } else {
+      frame.push_back(127);
+      for (int shift = 56; shift >= 0; shift -= 8) {
+        frame.push_back(static_cast<std::uint8_t>((payload.size() >> shift) & 0xFF));
+      }
+    }
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    return frame;
+  }
+
+  /**
+   * @brief Decode one complete masked client WebSocket frame.
+   *
+   * @param frame Complete frame bytes.
+   * @return Opcode and unmasked payload, or no value for malformed input.
+   */
+  std::optional<std::pair<int, std::string>> websocket_decode_frame(const std::vector<std::uint8_t> &frame) {
+    if (frame.size() < 2) {
+      return std::nullopt;
+    }
+    const bool masked = (frame[1] & 0x80) != 0;
+    std::size_t length = frame[1] & 0x7F;
+    std::size_t offset = 2;
+    if (length == 126) {
+      if (frame.size() < offset + 2) {
+        return std::nullopt;
+      }
+      length = (static_cast<std::size_t>(frame[2]) << 8) | frame[3];
+      offset += 2;
+    } else if (length == 127) {
+      if (frame.size() < offset + 8) {
+        return std::nullopt;
+      }
+      length = 0;
+      for (std::size_t index = 0; index < 8; ++index) {
+        length = (length << 8) | frame[offset + index];
+      }
+      offset += 8;
+    }
+    if (!masked || frame.size() < offset + 4 + length) {
+      return std::nullopt;
+    }
+    std::string payload(length, '\0');
+    for (std::size_t index = 0; index < length; ++index) {
+      payload[index] = static_cast<char>(frame[offset + 4 + index] ^ frame[offset + (index % 4)]);
+    }
+    return std::pair {frame[0] & 0x0F, std::move(payload)};
+  }
+
+  /**
+   * @brief One live peripheral-forwarding WebSocket channel.
+   */
+  struct eclipse_peripheral_channel_t {
+    std::shared_ptr<SunshineHTTPS> socket;  ///< Upgraded TLS socket.
+    std::shared_ptr<input::input_t> input;  ///< Injection context bound to claim identity.
+    std::vector<std::uint8_t> keyboard_state {};  ///< Last keyboard boot report.
+    std::uint8_t mouse_buttons = 0;  ///< Last mouse button bitmap.
+  };
+
+  std::mutex eclipse_peripheral_channels_mutex;  ///< Protects the live channel registry.
+  std::map<std::string, eclipse_peripheral_channel_t> eclipse_peripheral_channels;  ///< Live channels keyed by claim UUID.
+  std::map<std::string, std::jthread> eclipse_peripheral_channel_threads;  ///< Channel worker threads keyed by claim UUID.
+
+  /**
+   * @brief Release channel resources after its worker thread ends.
+   *
+   * @param claim_id Canonical claim UUID.
+   * @param socket Channel socket used for ownership comparison.
+   */
+  void eclipse_peripheral_channel_finish(const std::string &claim_id, const std::shared_ptr<SunshineHTTPS> &socket) {
+    static_cast<void>(eclipse_peripheral_manager->close_channel(claim_id));
+    eclipse_bump_peripheral_revision();
+    std::jthread worker;
+    {
+      std::lock_guard lock {eclipse_peripheral_channels_mutex};
+      const auto channel = eclipse_peripheral_channels.find(claim_id);
+      if (channel != eclipse_peripheral_channels.end() && channel->second.socket == socket) {
+        eclipse_peripheral_channels.erase(channel);
+      }
+      const auto thread = eclipse_peripheral_channel_threads.find(claim_id);
+      if (thread != eclipse_peripheral_channel_threads.end()) {
+        worker = std::move(thread->second);
+        eclipse_peripheral_channel_threads.erase(thread);
+      }
+    }
+    if (worker.joinable()) {
+      // The worker jthread wraps the calling thread; detaching avoids self-join.
+      worker.detach();
+    }
+  }
+
+  /**
+   * @brief Translate one HID keyboard usage byte into a Windows virtual-key code.
+   *
+   * @param usage HID usage identifier 0x04 through 0xE7.
+   * @return Virtual-key code, or zero when the usage has no mapping.
+   */
+  std::uint16_t eclipse_hid_usage_to_vk(std::uint8_t usage) {
+    if (usage >= 0x04 && usage <= 0x1D) {
+      return usage - 0x04 + 'A';
+    }
+    if (usage >= 0x1E && usage <= 0x26) {
+      return usage - 0x1E + '1';
+    }
+    if (usage == 0x27) {
+      return '0';
+    }
+    if (usage >= 0x3A && usage <= 0x45) {
+      return usage - 0x3A + VK_F1;
+    }
+    if (usage >= 0x54 && usage <= 0x63) {
+      return usage - 0x54 + VK_NUMPAD0;
+    }
+    switch (usage) {
+      case 0x28:
+        return VK_RETURN;
+      case 0x29:
+        return VK_ESCAPE;
+      case 0x2A:
+        return VK_BACK;
+      case 0x2B:
+        return VK_TAB;
+      case 0x2C:
+        return VK_SPACE;
+      case 0x2D:
+        return VK_OEM_MINUS;
+      case 0x2E:
+        return VK_OEM_PLUS;
+      case 0x2F:
+        return VK_OEM_4;
+      case 0x30:
+        return VK_OEM_6;
+      case 0x31:
+        return VK_OEM_5;
+      case 0x33:
+        return VK_OEM_1;
+      case 0x34:
+        return VK_OEM_7;
+      case 0x35:
+        return VK_OEM_3;
+      case 0x36:
+        return VK_OEM_COMMA;
+      case 0x37:
+        return VK_OEM_PERIOD;
+      case 0x38:
+        return VK_OEM_2;
+      case 0x39:
+        return VK_CAPITAL;
+      case 0x46:
+        return VK_PRIOR;
+      case 0x47:
+        return VK_HOME;
+      case 0x48:
+        return VK_UP;
+      case 0x49:
+        return VK_NEXT;
+      case 0x4A:
+        return VK_LEFT;
+      case 0x4B:
+        return VK_DOWN;
+      case 0x4C:
+        return VK_DELETE;
+      case 0x4D:
+        return VK_RIGHT;
+      case 0x4E:
+        return VK_END;
+      case 0x4F:
+        return VK_NEXT;
+      case 0x50:
+        return VK_LEFT;
+      case 0x51:
+        return VK_DOWN;
+      case 0x52:
+        return VK_UP;
+      default:
+        return 0;
+    }
+  }
+
+  /**
+   * @brief Apply one HID keyboard boot report by injecting key and modifier diffs.
+   *
+   * @param channel Live channel owning the previous report state.
+   * @param report Eight-byte HID boot keyboard report.
+   */
+  void eclipse_inject_hid_keyboard(eclipse_peripheral_channel_t &channel, const std::vector<std::uint8_t> &report) {
+    static constexpr std::uint8_t HID_MODIFIERS[8] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+    const auto &previous = channel.keyboard_state;
+    std::uint8_t modifiers = 0;
+    for (std::size_t bit = 0; bit < 8; ++bit) {
+      if (report[0] & (1u << bit)) {
+        modifiers = HID_MODIFIERS[bit];
+      }
+    }
+    if (previous.size() == report.size()) {
+      for (std::size_t index = 2; index < report.size(); ++index) {
+        const auto usage = previous[index];
+        const bool still_down = usage != 0 && std::ranges::find(report.begin() + 2, report.end(), usage) != report.end();
+        if (!still_down) {
+          const auto key = eclipse_hid_usage_to_vk(usage);
+          if (key) {
+            input::peripheral_forward_keyboard(channel.input, key, modifiers, true);
+          }
+        }
+      }
+    }
+    for (std::size_t index = 2; index < report.size(); ++index) {
+      const auto usage = report[index];
+      if (usage == 0) {
+        break;
+      }
+      const bool was_down = previous.size() == report.size() && std::ranges::find(previous.begin() + 2, previous.end(), usage) != previous.end();
+      if (!was_down) {
+        const auto key = eclipse_hid_usage_to_vk(usage);
+        if (key) {
+          input::peripheral_forward_keyboard(channel.input, key, modifiers, false);
+        }
+      }
+    }
+    channel.keyboard_state = report;
+  }
+
+  /**
+   * @brief Apply one HID mouse boot report by injecting button and motion diffs.
+   *
+   * @param channel Live channel owning the previous button state.
+   * @param report Four-byte HID boot mouse report.
+   */
+  void eclipse_inject_hid_mouse(eclipse_peripheral_channel_t &channel, const std::vector<std::uint8_t> &report) {
+    static constexpr std::uint8_t HID_BUTTONS[3] = {0x01, 0x02, 0x04};
+    static constexpr std::uint8_t NV_BUTTONS[3] = {1, 2, 3};
+    const auto buttons = report[0];
+    for (std::size_t index = 0; index < 3; ++index) {
+      const bool down = (buttons & HID_BUTTONS[index]) != 0;
+      const bool was_down = (channel.mouse_buttons & HID_BUTTONS[index]) != 0;
+      if (down != was_down) {
+        input::peripheral_forward_mouse_button(channel.input, NV_BUTTONS[index], !down);
+      }
+    }
+    channel.mouse_buttons = buttons;
+    const auto delta_x = static_cast<std::int8_t>(report[1]);
+    const auto delta_y = static_cast<std::int8_t>(report[2]);
+    if (delta_x != 0 || delta_y != 0) {
+      input::peripheral_forward_mouse_move(channel.input, delta_x, delta_y);
+    }
+    if (report.size() > 3 && report[3] != 0) {
+      input::peripheral_forward_scroll(channel.input, static_cast<std::int8_t>(report[3]) > 0 ? 1 : -1);
+    }
+  }
+
+  /**
+   * @brief Write one text frame to a channel socket.
+   *
+   * @param socket Upgraded TLS socket.
+   * @param payload JSON text payload.
+   * @return True when the frame was written completely.
+   */
+  bool eclipse_channel_write(const std::shared_ptr<SunshineHTTPS> &socket, std::string_view payload) {
+    boost::system::error_code error;
+    const auto frame = websocket_frame(0x1, payload);
+    asio::write(*socket, asio::buffer(frame), error);
+    return !error;
+  }
+
+  /**
+   * @brief Send a close frame and shut down the channel socket.
+   *
+   * @param socket Upgraded TLS socket.
+   * @param code RFC 6455 close status code.
+   */
+  void eclipse_channel_close(const std::shared_ptr<SunshineHTTPS> &socket, std::uint16_t code) {
+    const std::string payload {static_cast<char>(code >> 8), static_cast<char>(code & 0xFF)};
+    boost::system::error_code error;
+    const auto frame = websocket_frame(0x8, payload);
+    asio::write(*socket, asio::buffer(frame), error);
+    error.clear();
+    socket->lowest_layer().shutdown(asio::ip::tcp::socket::shutdown_both, error);
+  }
+
+  /**
+   * @brief Read exactly the requested byte count from a channel socket.
+   *
+   * @param socket Upgraded TLS socket.
+   * @param size Byte count to read.
+   * @return Bytes read, or empty on EOF or error.
+   */
+  std::vector<std::uint8_t> eclipse_channel_read_exact(const std::shared_ptr<SunshineHTTPS> &socket, std::size_t size) {
+    std::vector<std::uint8_t> buffer(size);
+    std::size_t total = 0;
+    while (total < size) {
+      boost::system::error_code error;
+      const auto read = asio::read(*socket, asio::buffer(buffer.data() + total, size - total), error);
+      if (error) {
+        return {};
+      }
+      total += read;
+    }
+    return buffer;
+  }
+
+  /**
+   * @brief Read one complete WebSocket frame from a channel socket.
+   *
+   * Control frames are answered inline; text frames are returned.
+   *
+   * @param socket Upgraded TLS socket.
+   * @return Opcode and raw (still masked) payload bytes, or empty on EOF or protocol failure.
+   */
+  std::optional<std::pair<int, std::vector<std::uint8_t>>> eclipse_channel_read_frame(const std::shared_ptr<SunshineHTTPS> &socket) {
+    const auto header = eclipse_channel_read_exact(socket, 2);
+    if (header.size() < 2) {
+      return std::nullopt;
+    }
+    const int opcode = header[0] & 0x0F;
+    const bool masked = (header[1] & 0x80) != 0;
+    std::size_t length = header[1] & 0x7F;
+    if (length == 126) {
+      const auto extended = eclipse_channel_read_exact(socket, 2);
+      if (extended.size() < 2) {
+        return std::nullopt;
+      }
+      length = (static_cast<std::size_t>(extended[0]) << 8) | extended[1];
+    } else if (length == 127) {
+      const auto extended = eclipse_channel_read_exact(socket, 8);
+      if (extended.size() < 8) {
+        return std::nullopt;
+      }
+      length = 0;
+      for (std::size_t index = 0; index < 8; ++index) {
+        length = (length << 8) | extended[index];
+      }
+    }
+    if (length > 64 * 1024) {
+      eclipse_channel_close(socket, 1009);
+      return std::nullopt;
+    }
+    std::vector<std::uint8_t> mask;
+    if (masked) {
+      mask = eclipse_channel_read_exact(socket, 4);
+      if (mask.size() < 4) {
+        return std::nullopt;
+      }
+    }
+    auto payload = eclipse_channel_read_exact(socket, length);
+    if (payload.size() < length) {
+      return std::nullopt;
+    }
+    if (masked) {
+      for (std::size_t index = 0; index < payload.size(); ++index) {
+        payload[index] ^= mask[index % 4];
+      }
+    }
+    if (opcode == 0x9) {
+      const auto pong = websocket_frame(0xA, std::string_view {reinterpret_cast<const char *>(payload.data()), payload.size()});
+      boost::system::error_code error;
+      asio::write(*socket, asio::buffer(pong), error);
+      return eclipse_channel_read_frame(socket);
+    }
+    return std::pair {opcode, std::move(payload)};
+  }
+
+  /**
+   * @brief Close the live channel for one claim, if any.
+   *
+   * @param claim_id Canonical claim UUID.
+   */
+  void eclipse_close_peripheral_channel(const std::string &claim_id) {
+    std::shared_ptr<SunshineHTTPS> socket;
+    {
+      std::lock_guard lock {eclipse_peripheral_channels_mutex};
+      const auto found = eclipse_peripheral_channels.find(claim_id);
+      if (found == eclipse_peripheral_channels.end()) {
+        return;
+      }
+      socket = found->second.socket;
+    }
+    eclipse_channel_close(socket, 1000);
+  }
+
+  /**
+   * @brief Run one authenticated peripheral-forwarding channel to completion.
+   *
+   * Exchanges the `eclipse-peripheral-json` v1 protocol: `claim.open` activates the
+   * claim, `hid.input` reports inject forwarded keyboard and mouse state, and
+   * `claim.closed` ends the channel. Closing applies the claim disconnect policy.
+   *
+   * @param claim_id Canonical claim UUID.
+   * @param socket Upgraded TLS socket.
+   */
+  void eclipse_peripheral_channel_loop(const std::string &claim_id, std::shared_ptr<SunshineHTTPS> socket) {
+    bool activated = false;
+    while (true) {
+      const auto frame = eclipse_channel_read_frame(socket);
+      if (!frame) {
+        break;
+      }
+      const auto &[opcode, payload] = *frame;
+      if (opcode == 0x8) {
+        break;
+      }
+      if (opcode != 0x1) {
+        eclipse_channel_close(socket, 1002);
+        break;
+      }
+      nlohmann::json message;
+      try {
+        message = nlohmann::json::parse(payload);
+      } catch (const std::exception &) {
+        eclipse_channel_close(socket, 1002);
+        break;
+      }
+      const auto type = message.value("type", "");
+      if (type == "claim.open") {
+        std::shared_ptr<input::input_t> injected_input;
+        if (message.value("payload", nlohmann::json::object()).value("claimId", "") != claim_id) {
+          eclipse_channel_close(socket, 1002);
+          break;
+        }
+        {
+          std::lock_guard lock {eclipse_peripheral_channels_mutex};
+          injected_input = eclipse_peripheral_channels[claim_id].input;
+        }
+        if (activated || !injected_input) {
+          eclipse_channel_close(socket, 1002);
+          break;
+        }
+        const auto opened = eclipse_peripheral_manager->open_channel(claim_id);
+        if (opened.status != eclipse_peripherals::status_t::success || !opened.resource) {
+          eclipse_channel_close(socket, 1008);
+          break;
+        }
+        activated = true;
+        eclipse_bump_peripheral_revision();
+        nlohmann::json granted = nlohmann::json::array();
+        for (const auto &capability : opened.resource->granted_capabilities) {
+          granted.push_back(capability);
+        }
+        const nlohmann::json ready {{"schemaVersion", 1}, {"sequence", 1}, {"type", "claim.ready"}, {"deviceId", opened.resource->device_id}, {"payload", {{"claimId", claim_id}, {"grantedCapabilities", granted}}}};
+        if (!eclipse_channel_write(socket, ready.dump())) {
+          break;
+        }
+        const nlohmann::json attached {{"schemaVersion", 1}, {"sequence", 2}, {"type", "device.attached"}, {"deviceId", opened.resource->device_id}, {"payload", {{"claimId", claim_id}}}};
+        static_cast<void>(eclipse_channel_write(socket, attached.dump()));
+        continue;
+      }
+      if (type == "hid.input") {
+        const auto payload_object = message.value("payload", nlohmann::json::object());
+        const auto encoded = payload_object.value("dataBase64", "");
+        if (encoded.empty() || !activated) {
+          continue;
+        }
+        std::vector<std::uint8_t> report;
+        try {
+          const auto decoded = SimpleWeb::Crypto::Base64::decode(encoded);
+          report.assign(decoded.begin(), decoded.end());
+        } catch (const std::exception &) {
+          eclipse_channel_close(socket, 1002);
+          break;
+        }
+        const auto device = eclipse_peripheral_manager->get_claim({}, claim_id);
+        if (device && device->device_class == "keyboard" && report.size() >= 8) {
+          std::lock_guard lock {eclipse_peripheral_channels_mutex};
+          auto &channel = eclipse_peripheral_channels[claim_id];
+          if (channel.input) {
+            eclipse_inject_hid_keyboard(channel, report);
+          }
+        } else if (device && device->device_class == "mouse" && report.size() >= 3) {
+          std::lock_guard lock {eclipse_peripheral_channels_mutex};
+          auto &channel = eclipse_peripheral_channels[claim_id];
+          if (channel.input) {
+            eclipse_inject_hid_mouse(channel, report);
+          }
+        }
+        continue;
+      }
+      if (type == "device.error") {
+        BOOST_LOG(warning) << "Peripheral claim [" << claim_id << "] reported a device error";
+        continue;
+      }
+      if (type == "claim.closed") {
+        break;
+      }
+      eclipse_channel_close(socket, 1002);
+      break;
+    }
+    eclipse_peripheral_channel_finish(claim_id, socket);
+  }
+
+  /**
+   * @brief Authorize and upgrade one peripheral-forwarding WebSocket request.
+   *
+   * @param socket Upgraded TLS connection socket.
+   * @param request Original upgrade request.
+   */
+  void eclipse_peripheral_channel_upgrade(std::unique_ptr<SunshineHTTPS> &socket, std::shared_ptr<SimpleWeb::ServerBase<SunshineHTTPS>::Request> request) {
+    static const std::regex CHANNEL_PATTERN {"^/eclipse/v1/peripherals/claims/([0-9a-fA-F-]+)/channel$"};
+    const std::string path = request->path;
+    std::smatch match;
+    const auto client = verified_client(request);
+    const auto token = eclipse_header(request, "X-Eclipse-Claim-Token");
+    std::string claim_id;
+    if (std::regex_match(path, match, CHANNEL_PATTERN)) {
+      claim_id = match[1].str();
+    }
+    const auto deny = [&](std::string_view code, std::string_view message) {
+      const nlohmann::json body {{"schemaVersion", 1}, {"error", {{"code", code}, {"message", message}}}};
+      const std::string text = body.dump();
+      const std::string response = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(text.size()) + "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + text;
+      boost::system::error_code write_error;
+      asio::write(*socket, asio::buffer(response), write_error);
+    };
+    if (!client || !token) {
+      deny("authentication_required", "Peripheral channel requires a paired client and claim credential");
+      return;
+    }
+    if (claim_id.empty() || !eclipse_peripheral_manager || !eclipse_peripheral_manager->authenticate_claim(claim_id, *token)) {
+      deny("claim_not_found", "Claim does not exist or credential is invalid");
+      return;
+    }
+    if (!scope_allowed(*client, "peripheral.forward")) {
+      deny("permission_denied", "Client certificate lacks peripheral.forward permission");
+      return;
+    }
+    const auto key_header = request->header.find("Sec-WebSocket-Key");
+    if (key_header == request->header.end()) {
+      return;
+    }
+    const std::string handshake = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + websocket_accept_key(key_header->second) + "\r\n\r\n";
+    boost::system::error_code error;
+    asio::write(*socket, asio::buffer(handshake), error);
+    if (error) {
+      return;
+    }
+    auto channel = std::make_shared<eclipse_peripheral_channel_t>();
+    channel->socket = std::shared_ptr<SunshineHTTPS>(socket.release());
+    const auto claim = eclipse_peripheral_manager->authenticate_claim(claim_id, *token);
+    if (claim && claim->owner_client_uuid) {
+      std::lock_guard clients_lock {client_auth_mutex};
+      const auto found = std::find_if(client_root.named_devices.begin(), client_root.named_devices.end(), [&](const auto &entry) {
+        return entry.uuid == *claim->owner_client_uuid;
+      });
+      if (found != client_root.named_devices.end()) {
+        channel->input = input::alloc(std::make_shared<safe::mail_raw_t>(), "eclipse-claim-" + claim_id, found->permissions.input);
+      }
+    }
+    std::jthread previous_worker;
+    {
+      std::lock_guard lock {eclipse_peripheral_channels_mutex};
+      const auto previous_socket = eclipse_peripheral_channels[claim_id].socket;
+      if (previous_socket) {
+        eclipse_channel_close(previous_socket, 1000);
+      }
+      eclipse_peripheral_channels[claim_id] = *channel;
+      const auto thread = eclipse_peripheral_channel_threads.find(claim_id);
+      if (thread != eclipse_peripheral_channel_threads.end()) {
+        previous_worker = std::move(thread->second);
+        eclipse_peripheral_channel_threads.erase(thread);
+      }
+      eclipse_peripheral_channel_threads.emplace(claim_id, std::jthread([claim_id, owned = channel->socket]() {
+                                                   platf::set_thread_name("eclipse-claim");
+                                                   eclipse_peripheral_channel_loop(claim_id, owned);
+                                                 }));
+    }
+    if (previous_worker.joinable()) {
+      previous_worker.join();
+    }
+  }
+
   void eclipse_disconnect_session(resp_https_t response, req_https_t request) {
     const auto client = authorize_eclipse_request(response, request, "session.control");
     if (!client) {
@@ -2154,6 +6764,26 @@ namespace nvhttp {
       return;
     }
     static_cast<void>(rtsp_stream::terminate_session(session_id, owner));
+    if (eclipse_peripheral_manager) {
+      eclipse_peripheral_manager->target_ended("session", session_id, false);
+    }
+#ifdef _WIN32
+    if (eclipse_workspace_manager) {
+      for (const auto &workspace : eclipse_workspace_manager->list().workspaces) {
+        if (workspace.session_id == session_id && workspace.definition.cleanup_policy == eclipse_workspaces::cleanup_policy_t::on_disconnect) {
+          const auto stopped = eclipse_workspace_manager->stop(workspace.id, workspace.revision, true);
+          if (stopped.status != eclipse_workspaces::status_t::success) {
+            send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Workspace resources could not be cleaned after disconnect");
+            return;
+          }
+          if (eclipse_peripheral_manager) {
+            eclipse_peripheral_manager->target_ended("workspace", workspace.id, true);
+          }
+          break;
+        }
+      }
+    }
+#endif
     BOOST_LOG(info) << "Audit: client ["sv << client->uuid << "] disconnected session ["sv << session_id << ']';
     send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"disconnected", true}, {"sessionId", session_id}});
   }
@@ -2177,6 +6807,26 @@ namespace nvhttp {
       return;
     }
     static_cast<void>(rtsp_stream::terminate_session(session_id, owner));
+    if (eclipse_peripheral_manager) {
+      eclipse_peripheral_manager->target_ended("session", session_id, true);
+    }
+#ifdef _WIN32
+    if (eclipse_workspace_manager) {
+      for (const auto &workspace : eclipse_workspace_manager->list().workspaces) {
+        if (workspace.session_id == session_id) {
+          const auto stopped = eclipse_workspace_manager->stop(workspace.id, workspace.revision, true);
+          if (stopped.status != eclipse_workspaces::status_t::success) {
+            send_eclipse_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Workspace resources could not be stopped");
+            return;
+          }
+          if (eclipse_peripheral_manager) {
+            eclipse_peripheral_manager->target_ended("workspace", workspace.id, true);
+          }
+          break;
+        }
+      }
+    }
+#endif
     {
       std::lock_guard lock {logical_session_mutex};
       if (logical_session && logical_session->id == session_id && (owner.empty() || logical_session->client_uuid == owner)) {
@@ -2186,9 +6836,52 @@ namespace nvhttp {
         logical_session.reset();
       }
     }
+    {
+      const auto binding = eclipse_session_tracking_for(session_id);
+      if (binding && binding->binding.workspace_id.empty()) {
+        eclipse_destroy_session_sandbox(binding->binding);
+      }
+    }
     display_device::revert_configuration();
     BOOST_LOG(info) << "Audit: client ["sv << client->uuid << "] stopped session ["sv << session_id << ']';
     send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {{"stopped", true}, {"sessionId", session_id}});
+  }
+
+  /**
+   * @brief Return host telemetry and telemetry for visible sessions.
+   */
+  void eclipse_telemetry(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "telemetry.read");
+    if (!client) {
+      return;
+    }
+    const bool administer = scope_allowed(*client, "host.control");
+    send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, eclipse_telemetry_document(administer ? std::string {} : client->uuid));
+  }
+
+  /**
+   * @brief Return telemetry for one visible session.
+   */
+  void eclipse_session_telemetry(resp_https_t response, req_https_t request) {
+    const auto client = authorize_eclipse_request(response, request, "telemetry.read");
+    if (!client) {
+      return;
+    }
+    const auto session_id = request->path_match[1].str();
+    const bool administer = scope_allowed(*client, "host.control");
+    for (const auto &session : eclipse_session_snapshots()) {
+      if (session.id != session_id || (!administer && session.client_uuid != client->uuid)) {
+        continue;
+      }
+      const auto tracking = eclipse_session_tracking_for(session.id);
+      const auto document = eclipse_telemetry_document(std::string {});
+      send_eclipse_response(response, SimpleWeb::StatusCode::success_ok, {
+                                                                           {"timestamp", document.at("timestamp")},
+                                                                           {"session", eclipse_telemetry_session_json(session, tracking ? &*tracking : nullptr)},
+                                                                         });
+      return;
+    }
+    send_eclipse_error(response, SimpleWeb::StatusCode::client_error_not_found, "session_not_found", "Session does not exist or is not visible to this client");
   }
 
   void setup(const std::string &pkey, const std::string &cert) {
@@ -2205,12 +6898,24 @@ namespace nvhttp {
    */
   std::pair<bool, std::string> get_client_status(const std::string_view cert_pem);
 
-  void start() {
+  /**
+   * @brief Run the production paired HTTPS and discovery HTTP servers until shutdown.
+   *
+   * Creates every Eclipse manager, registers all routes, serves clients, runs the
+   * periodic change monitor, and tears everything down before returning.
+   *
+   * @param port_http_override Discovery HTTP port, or no value for the configured port.
+   * @param port_https_override Paired HTTPS port, or no value for the configured port.
+   * @param https_ready Receives the bound HTTPS port after listening starts.
+   * @param external_stop When set, requests shutdown in addition to the global shutdown event.
+   */
+  void run_nvhttp_servers(const std::optional<unsigned short> &port_http_override, const std::optional<unsigned short> &port_https_override, const std::function<void(unsigned short)> &https_ready, const std::atomic_bool &external_stop) {
     platf::set_thread_name("nvhttp");
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
+    eclipse_operation_pool.start(1);
 
-    auto port_http = net::map_port(PORT_HTTP);
-    auto port_https = net::map_port(PORT_HTTPS);
+    auto port_http = port_http_override.value_or(net::map_port(PORT_HTTP));
+    auto port_https = port_https_override.value_or(net::map_port(PORT_HTTPS));
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
 
     bool clean_slate = config::sunshine.flags[config::flag::FRESH_STATE];
@@ -2218,6 +6923,295 @@ namespace nvhttp {
     if (!clean_slate) {
       load_state();
     }
+
+    eclipse_event_hub = std::make_unique<eclipse_events::hub_t>(2048, []() {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    });
+    const auto operation_path = platf::appdata() / "eclipse_operations.json";
+    eclipse_operation_store = std::make_unique<eclipse_operations::store_t>(eclipse_operations::callbacks_t {
+      [operation_path, clean_slate]() -> std::optional<std::string> {
+        if (clean_slate || !fs::exists(operation_path)) {
+          return std::nullopt;
+        }
+        return file_handler::read_file(operation_path.string().c_str());
+      },
+      [operation_path](const std::string &document) {
+        return file_handler::write_file_atomic(operation_path.string().c_str(), document) == 0;
+      },
+      {},
+      {},
+      [](const eclipse_operations::operation_t &operation) {
+        if (!eclipse_operation_pool.running()) {
+          return;
+        }
+        eclipse_operation_pool.push([operation]() {
+          const auto scope = eclipse_operation_scope(operation.action);
+          if (!scope.empty()) {
+            publish_eclipse_event({"operation.updated", operation.id, operation.revision, eclipse_operations::to_json(operation)}, scope, operation.client_uuid);
+          }
+        });
+      },
+    });
+#ifdef _WIN32
+    const auto sandbox_path = platf::appdata() / "eclipse_sandboxes.json";
+    if (clean_slate) {
+      std::error_code error;
+      fs::remove(sandbox_path, error);
+    }
+    auto sandbox_callbacks = eclipse::windows::sandbox::make_callbacks({sandbox_path, eclipse_resolve_sandbox_application, {}});
+    const auto profile_path = platf::appdata() / "eclipse_profiles.json";
+    if (clean_slate) {
+      std::error_code error;
+      fs::remove(profile_path, error);
+    }
+    eclipse_profile_manager = std::make_unique<eclipse::profiles::manager_t>(eclipse::profiles::callbacks_t {
+      [profile_path]() -> std::optional<std::string> {
+        if (!fs::exists(profile_path)) {
+          return std::nullopt;
+        }
+        return file_handler::read_file(profile_path.string().c_str());
+      },
+      [profile_path](const std::string &document) {
+        return file_handler::write_file_atomic(profile_path.string().c_str(), document) == 0;
+      },
+      {},
+      []() {
+        return uuid_util::uuid_t::generate().string();
+      },
+      [](const std::string &kind, const std::string &id) {
+        if (kind != "application") {
+          return eclipse::profiles::status_t::invalid;
+        }
+        const auto &apps = proc::proc.get_apps();
+        return std::ranges::find(apps, id, &proc::ctx_t::uuid) == apps.end() ? eclipse::profiles::status_t::not_found : eclipse::profiles::status_t::success;
+      },
+      [sandbox_capable = sandbox_callbacks.provider_capable](const std::string &type, const nlohmann::json &configuration) {
+        if (type == "display") {
+          return false;
+        }
+        if (type == "sandbox") {
+          std::string reason;
+          return sandbox_capable && sandbox_capable({"", {}, configuration, std::nullopt, false}, reason);
+        }
+        if (type == "launch") {
+          return configuration.at("workingDirectory").is_null() && configuration.at("preLaunchPolicy").empty() && configuration.at("postExitPolicy").empty();
+        }
+        return type == "stream";
+      },
+      [](const eclipse::profiles::profile_t &profile) {
+        return eclipse_profile_referenced(profile.id);
+      },
+    });
+    sandbox_callbacks.on_change = [](const std::optional<eclipse_sandboxes::resource_t> &previous, const std::optional<eclipse_sandboxes::resource_t> &current) {
+      const auto &sandbox = current ? *current : *previous;
+      const auto owner = current && current->owner_client_uuid ? *current->owner_client_uuid : previous && previous->owner_client_uuid ? *previous->owner_client_uuid :
+                                                                                                                                         std::string {};
+      if (current) {
+        publish_eclipse_sandbox_event(previous ? "sandbox.updated" : "sandbox.created", sandbox, eclipse_sandboxes::to_json(sandbox), owner);
+      } else {
+        publish_eclipse_sandbox_event("sandbox.removed", sandbox, {{"id", sandbox.id}, {"revision", sandbox.revision + 1}}, owner);
+      }
+    };
+    eclipse_sandbox_manager = std::make_unique<eclipse_sandboxes::manager_t>(std::move(sandbox_callbacks));
+    const auto workspace_path = platf::appdata() / "eclipse_workspaces.json";
+    if (clean_slate) {
+      std::error_code error;
+      fs::remove(workspace_path, error);
+    }
+    eclipse_peripheral_manager = std::make_unique<eclipse_peripherals::manager_t>(
+      []() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+      },
+      []() {
+        return uuid_util::uuid_t::generate().string();
+      },
+      []() {
+        return uuid_util::uuid_t::generate().string() + uuid_util::uuid_t::generate().string();
+      }
+    );
+    eclipse_workspace_manager = std::make_unique<eclipse_workspaces::manager_t>(eclipse_workspaces::callbacks_t {
+      [workspace_path]() -> std::optional<std::string> {
+        if (!fs::exists(workspace_path)) {
+          return std::nullopt;
+        }
+        return file_handler::read_file(workspace_path.string().c_str());
+      },
+      [workspace_path](const std::string &document) {
+        return file_handler::write_file_atomic(workspace_path.string().c_str(), document) == 0;
+      },
+      []() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+      },
+      []() {
+        return uuid_util::uuid_t::generate().string();
+      },
+      [](const std::string &id) {
+        const auto &apps = proc::proc.get_apps();
+        return std::ranges::find(apps, id, &proc::ctx_t::uuid) != apps.end();
+      },
+      [](const std::string &type, const std::string &id) {
+        const auto profile = eclipse_profile_manager ? eclipse_profile_manager->inspect(id) : std::nullopt;
+        return profile && profile->type == type && eclipse_profile_manager->validate_configuration(type, profile->configuration) == eclipse::profiles::status_t::success;
+      },
+      [](const std::string &type, const nlohmann::json &configuration) {
+        return eclipse_profile_manager && eclipse_profile_manager->validate_configuration(type, configuration) == eclipse::profiles::status_t::success;
+      },
+      [](const nlohmann::json &) {
+        return false;
+      },
+      [](const eclipse_workspaces::peripheral_policy_t &policy) {
+        return policy.required_device_ids.empty() && policy.required_classes.empty();
+      },
+      [](const eclipse_workspaces::preparation_t &request) -> std::optional<eclipse_workspaces::prepared_t> {
+        if (!request.definition.sandbox_profile_id || (request.profile_overrides.sandbox && request.profile_overrides.sandbox->is_null())) {
+          return eclipse_workspaces::prepared_t {true};
+        }
+        const auto profile = eclipse_profile_manager ? eclipse_profile_manager->inspect(*request.definition.sandbox_profile_id) : std::nullopt;
+        if (!profile || profile->type != "sandbox" || !eclipse_sandbox_manager) {
+          return std::nullopt;
+        }
+        const auto &sandbox_configuration = request.profile_overrides.sandbox ? *request.profile_overrides.sandbox : profile->configuration;
+        eclipse_sandboxes::start_t start {.app_uuid = request.app_uuid, .launch_profile_id = request.definition.launch_profile_id};
+        if (request.profile_overrides.launch) {
+          if (request.profile_overrides.launch->is_null()) {
+            start.launch_profile_id.reset();
+          } else {
+            if (!request.definition.launch_profile_id || !eclipse_sandbox_launch_configuration_supported(*request.profile_overrides.launch, request.app_uuid, *request.definition.sandbox_profile_id)) {
+              return std::nullopt;
+            }
+            const auto application = eclipse_resolve_sandbox_application(request.app_uuid, std::nullopt);
+            if (!application) {
+              return std::nullopt;
+            }
+            auto launch_data = application->launch_data;
+            for (const auto &argument : request.profile_overrides.launch->at("arguments")) {
+              launch_data["arguments"].push_back(argument);
+            }
+            launch_data["environment"] = request.profile_overrides.launch->at("environment");
+            if (!request.profile_overrides.launch->at("workingDirectory").is_null()) {
+              launch_data["workingDirectory"] = request.profile_overrides.launch->at("workingDirectory");
+            }
+            start.launch_data = std::move(launch_data);
+          }
+        } else if (request.definition.launch_profile_id) {
+          const auto launch_profile = eclipse_profile_manager->inspect(*request.definition.launch_profile_id);
+          if (!launch_profile || !eclipse_sandbox_launch_profile_supported(*launch_profile, request.app_uuid, *request.definition.sandbox_profile_id)) {
+            return std::nullopt;
+          }
+        }
+        const auto created = eclipse_sandbox_manager->create(request.owner_client_uuid, {
+                                                                                          *request.definition.sandbox_profile_id,
+                                                                                          request.workspace_id,
+                                                                                          request.app_uuid,
+                                                                                          request.definition.persistent,
+                                                                                          request.definition.name,
+                                                                                          sandbox_configuration,
+                                                                                        });
+        if (created.status != eclipse_sandboxes::status_t::success || !created.resource) {
+          return std::nullopt;
+        }
+        const auto started = eclipse_sandbox_manager->start(created.resource->id, created.resource->revision, start);
+        if (started.status != eclipse_sandboxes::status_t::success || !started.resource) {
+          const auto cleaned = eclipse_destroy_workspace_sandbox(created.resource->id);
+          return eclipse_workspaces::prepared_t {false, std::nullopt, cleaned ? std::nullopt : std::optional {created.resource->id}};
+        }
+        return eclipse_workspaces::prepared_t {true, std::nullopt, started.resource->id, started.resource->display_ids, started.resource->peripheral_claim_ids};
+      },
+      [](const eclipse_workspaces::prepared_t &runtime) {
+        if (runtime.sandbox_id && !eclipse_destroy_workspace_sandbox(*runtime.sandbox_id)) {
+          BOOST_LOG(error) << "Failed to clean workspace sandbox [" << *runtime.sandbox_id << ']';
+        }
+      },
+      [](const eclipse_workspaces::resource_t &workspace, const bool terminate_application) {
+        if (!workspace.display_ids.empty() || !workspace.peripheral_claim_ids.empty()) {
+          return false;
+        }
+        bool stopped = true;
+        if (workspace.session_id) {
+          const auto owner = workspace.owner_client_uuid ? std::string_view {*workspace.owner_client_uuid} : std::string_view {};
+          stopped = rtsp_stream::terminate_session(*workspace.session_id, owner);
+          if (terminate_application) {
+            std::lock_guard lock {logical_session_mutex};
+            if (logical_session && logical_session->id == *workspace.session_id) {
+              if (proc::proc.running() > 0) {
+                proc::proc.terminate();
+              }
+              logical_session.reset();
+              stopped = true;
+            }
+            display_device::revert_configuration();
+          } else {
+            std::lock_guard lock {logical_session_mutex};
+            stopped = stopped || (logical_session && logical_session->id == *workspace.session_id);
+          }
+        }
+        stopped = (!terminate_application || !workspace.sandbox_id || eclipse_stop_workspace_sandbox(*workspace.sandbox_id, true)) && stopped;
+        return stopped;
+      },
+      [](const eclipse_workspaces::resource_t &workspace) {
+        if (workspace.session_id || !workspace.display_ids.empty() || !workspace.peripheral_claim_ids.empty()) {
+          return false;
+        }
+        if (!workspace.sandbox_id) {
+          return true;
+        }
+        const auto sandbox = eclipse_sandbox_manager ? eclipse_sandbox_manager->get(*workspace.sandbox_id) : std::nullopt;
+        if (!sandbox || !sandbox->app_uuid || sandbox->workspace_id != workspace.id) {
+          return false;
+        }
+        if (sandbox->state == eclipse_sandboxes::state_t::running) {
+          return true;
+        }
+        if (sandbox->state != eclipse_sandboxes::state_t::stopped && sandbox->state != eclipse_sandboxes::state_t::created) {
+          return false;
+        }
+        if (workspace.definition.launch_profile_id) {
+          const auto profile = eclipse_profile_manager ? eclipse_profile_manager->inspect(*workspace.definition.launch_profile_id) : std::nullopt;
+          if (!profile || !eclipse_sandbox_launch_profile_supported(*profile, *sandbox->app_uuid, sandbox->profile_id)) {
+            return false;
+          }
+        }
+        const auto restarted = eclipse_sandbox_manager->start(sandbox->id, sandbox->revision, {*sandbox->app_uuid, workspace.definition.launch_profile_id});
+        return restarted.status == eclipse_sandboxes::status_t::success;
+      },
+      [](const eclipse_workspaces::resource_t &workspace) {
+        if (!workspace.display_ids.empty() || !workspace.peripheral_claim_ids.empty()) {
+          return false;
+        }
+        if (workspace.sandbox_id) {
+          const auto sandbox = eclipse_sandbox_manager ? eclipse_sandbox_manager->get(*workspace.sandbox_id) : std::nullopt;
+          if (!sandbox || sandbox->workspace_id != workspace.id || sandbox->state != eclipse_sandboxes::state_t::running) {
+            return false;
+          }
+        }
+        if (workspace.state != eclipse_workspaces::state_t::active) {
+          return true;
+        }
+        return workspace.session_id && std::ranges::any_of(eclipse_session_snapshots(), [&](const auto &session) {
+                 return session.id == *workspace.session_id;
+               });
+      },
+      [](const std::optional<eclipse_workspaces::resource_t> &previous, const std::optional<eclipse_workspaces::resource_t> &current) {
+        if (previous && previous->sandbox_id && (!current || current->sandbox_id != previous->sandbox_id) && !eclipse_destroy_workspace_sandbox(*previous->sandbox_id)) {
+          BOOST_LOG(error) << "Failed to remove committed workspace sandbox [" << *previous->sandbox_id << ']';
+        }
+        if (current) {
+          if (!current->owner_client_uuid) {
+            return;
+          }
+          publish_eclipse_workspace_event(previous ? "workspace.updated" : "workspace.created", *current, eclipse_workspaces::to_json(*current));
+        } else if (previous) {
+          publish_eclipse_workspace_event("workspace.removed", *previous, {{"id", previous->id}, {"revision", previous->revision + 1}});
+        }
+      },
+    });
+    const auto virtual_display_path = platf::appdata() / "eclipse_virtual_displays.json";
+    if (clean_slate) {
+      std::error_code error;
+      fs::remove(virtual_display_path, error);
+    }
+    eclipse_virtual_display_manager = std::make_unique<eclipse_virtual_display::manager_t>(eclipse::windows::virtual_display::make_callbacks(virtual_display_path));
+#endif
 
     auto pkey = file_handler::read_file(config::nvhttp.pkey.c_str());
     auto cert = file_handler::read_file(config::nvhttp.cert.c_str());
@@ -2301,6 +7295,7 @@ namespace nvhttp {
 
     https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
     https_server.resource["^/serverinfo$"]["GET"] = serverinfo<SunshineHTTPS>;
+    https_server.on_upgrade = eclipse_peripheral_channel_upgrade;
     https_server.resource["^/pair$"]["GET"] = [](auto resp, auto req) {
       pair<SunshineHTTPS>(resp, req);
     };
@@ -2314,8 +7309,58 @@ namespace nvhttp {
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
     https_server.resource["^/eclipse/v1/capabilities$"]["GET"] = eclipse_capabilities;
+    https_server.resource["^/eclipse/v1/events$"]["GET"] = eclipse_events_stream;
     https_server.resource["^/eclipse/v1/apps$"]["GET"] = eclipse_apps;
+    https_server.resource["^/eclipse/v1/apps/([0-9a-fA-F-]+)/assets/([A-Za-z0-9._-]+)$"]["GET"] = eclipse_app_asset;
+#ifdef _WIN32
+    https_server.resource["^/eclipse/v1/profiles$"]["GET"] = eclipse_profiles;
+    https_server.resource["^/eclipse/v1/profiles$"]["POST"] = eclipse_create_profile;
+    https_server.resource["^/eclipse/v1/profiles/([0-9a-fA-F-]+)$"]["GET"] = eclipse_profile;
+    https_server.resource["^/eclipse/v1/profiles/([0-9a-fA-F-]+)$"]["PATCH"] = eclipse_patch_profile;
+    https_server.resource["^/eclipse/v1/profiles/([0-9a-fA-F-]+)$"]["DELETE"] = eclipse_delete_profile;
+    https_server.resource["^/eclipse/v1/profiles/([0-9a-fA-F-]+)/adopt$"]["POST"] = eclipse_adopt_profile;
+    https_server.resource["^/eclipse/v1/workspaces$"]["GET"] = eclipse_workspaces;
+    https_server.resource["^/eclipse/v1/workspaces$"]["POST"] = eclipse_create_workspace;
+    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)$"]["GET"] = eclipse_workspace;
+    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)$"]["PATCH"] = eclipse_patch_workspace;
+    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)$"]["DELETE"] = eclipse_delete_workspace;
+    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)/start$"]["POST"] = eclipse_start_workspace;
+    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)/stop$"]["POST"] = eclipse_stop_workspace;
+    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)/adopt$"]["POST"] = eclipse_adopt_workspace;
+    https_server.resource["^/eclipse/v1/sandboxes$"]["GET"] = eclipse_sandboxes_route;
+    https_server.resource["^/eclipse/v1/sandboxes$"]["POST"] = eclipse_create_sandbox;
+    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)$"]["GET"] = eclipse_sandbox_route;
+    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)$"]["DELETE"] = eclipse_delete_sandbox;
+    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)/start$"]["POST"] = eclipse_start_sandbox;
+    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)/stop$"]["POST"] = eclipse_stop_sandbox;
+    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)/restart$"]["POST"] = eclipse_restart_sandbox;
+    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)/adopt$"]["POST"] = eclipse_adopt_sandbox;
+    https_server.resource["^/eclipse/v1/displays$"]["GET"] = eclipse_displays;
+    https_server.resource["^/eclipse/v1/displays/([0-9a-fA-F-]+)$"]["GET"] = eclipse_display;
+    https_server.resource["^/eclipse/v1/displays/([0-9a-fA-F-]+)$"]["PATCH"] = eclipse_patch_display;
+    https_server.resource["^/eclipse/v1/display-topology$"]["GET"] = eclipse_display_topology_get;
+    https_server.resource["^/eclipse/v1/display-topology$"]["PUT"] = eclipse_display_topology_put;
+    https_server.resource["^/eclipse/v1/virtual-displays$"]["GET"] = eclipse_virtual_displays;
+    https_server.resource["^/eclipse/v1/virtual-displays$"]["POST"] = eclipse_create_virtual_display;
+    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)$"]["GET"] = eclipse_virtual_display;
+    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)$"]["PATCH"] = eclipse_patch_virtual_display;
+    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)$"]["DELETE"] = eclipse_delete_virtual_display;
+    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)/attach$"]["POST"] = eclipse_attach_virtual_display;
+    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)/detach$"]["POST"] = eclipse_detach_virtual_display;
+    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)/adopt$"]["POST"] = eclipse_adopt_virtual_display;
+#endif
+    https_server.resource["^/eclipse/v1/operations/([0-9a-fA-F-]+)$"]["GET"] = eclipse_operation;
+    https_server.resource["^/eclipse/v1/peripherals$"]["GET"] = eclipse_peripherals_list;
+    https_server.resource["^/eclipse/v1/peripherals$"]["POST"] = eclipse_peripherals_create;
+    https_server.resource["^/eclipse/v1/peripherals/claims$"]["GET"] = eclipse_peripheral_claims_list;
+    https_server.resource["^/eclipse/v1/peripherals/claims$"]["POST"] = eclipse_peripheral_claims_create;
+    https_server.resource["^/eclipse/v1/peripherals/claims/([0-9a-fA-F-]+)$"]["GET"] = eclipse_peripheral_claim_get;
+    https_server.resource["^/eclipse/v1/peripherals/claims/([0-9a-fA-F-]+)$"]["DELETE"] = eclipse_peripheral_claim_delete;
+    https_server.resource["^/eclipse/v1/peripherals/([0-9a-fA-F-]+)$"]["GET"] = eclipse_peripheral_get;
+    https_server.resource["^/eclipse/v1/peripherals/([0-9a-fA-F-]+)$"]["DELETE"] = eclipse_peripheral_delete;
     https_server.resource["^/eclipse/v1/sessions$"]["GET"] = eclipse_sessions;
+    https_server.resource["^/eclipse/v1/telemetry$"]["GET"] = eclipse_telemetry;
+    https_server.resource["^/eclipse/v1/sessions/([0-9a-fA-F-]+)/telemetry$"]["GET"] = eclipse_session_telemetry;
     https_server.resource["^/eclipse/v1/sessions/([0-9a-fA-F-]+)$"]["GET"] = eclipse_session;
     https_server.resource["^/eclipse/v1/sessions/([0-9a-fA-F-]+)/disconnect$"]["POST"] = eclipse_disconnect_session;
     https_server.resource["^/eclipse/v1/sessions/([0-9a-fA-F-]+)/stop$"]["POST"] = eclipse_stop_session;
@@ -2334,11 +7379,11 @@ namespace nvhttp {
     http_server.config.address = net::get_bind_address(address_family);
     http_server.config.port = port_http;
 
-    auto accept_and_run = [&](auto *http_server) {
+    auto accept_and_run = [&](auto *server, const std::function<void()> &start_server) {
       try {
-        std::string name = "nvhttp::" + std::to_string(http_server->config.port);
+        std::string name = "nvhttp::" + std::to_string(server->config.port);
         platf::set_thread_name(name);
-        http_server->start();
+        start_server();
       } catch (boost::system::system_error &err) {
         // It's possible the exception gets thrown after calling http_server->stop() from a different thread
         if (shutdown_event->peek()) {
@@ -2350,36 +7395,295 @@ namespace nvhttp {
         return;
       }
     };
-    std::jthread ssl {accept_and_run, &https_server};
-    std::jthread tcp {accept_and_run, &http_server};
+    std::jthread ssl {accept_and_run, &https_server, std::function<void()> {[&] {
+                        https_server.start([&](const unsigned short port) {
+                          if (https_ready) {
+                            https_ready(port);
+                          }
+                        });
+                      }}};
+    std::jthread tcp {accept_and_run, &http_server, std::function<void()> {[&] {
+                        http_server.start();
+                      }}};
+
+    std::jthread change_monitor([](const std::stop_token stop) {
+      auto catalog_revision = proc::catalog_revision();
+      std::set<std::string> expired_clients;
+      std::uint64_t monitor_tick = 0;
+      std::string host_name_state = config::nvhttp.sunshine_name;
+      std::string capabilities_state;
+#ifdef _WIN32
+      std::uint64_t display_revision = 0;
+      if (const auto snapshot = eclipse_display_snapshot()) {
+        display_revision = snapshot->first;
+      }
+#endif
+      while (!stop.stop_requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds {250});
+        ++monitor_tick;
+        std::vector<std::pair<std::string, std::string>> newly_expired;
+        {
+          std::lock_guard lock {client_auth_mutex};
+          for (const auto &client : client_root.named_devices) {
+            if (permissions_expired(client.permissions)) {
+              if (expired_clients.emplace(client.uuid).second) {
+                newly_expired.emplace_back(client.uuid, client.cert);
+              }
+            } else {
+              expired_clients.erase(client.uuid);
+            }
+          }
+          if (!newly_expired.empty()) {
+            std::erase_if(verified_clients, [&](const auto &entry) {
+              return expired_clients.contains(entry.second.uuid);
+            });
+            rebuild_client_cert_chain();
+          }
+        }
+        for (const auto &[client_uuid, certificate] : newly_expired) {
+          if (eclipse_event_hub) {
+            eclipse_event_hub->disconnect_client(client_uuid);
+          }
+          rtsp_stream::terminate_sessions_by_cert(certificate);
+          if (eclipse_peripheral_manager) {
+            eclipse_peripheral_manager->revoke_owner(client_uuid);
+          }
+#ifdef _WIN32
+          if (eclipse_virtual_display_manager) {
+            static_cast<void>(eclipse_virtual_display_manager->revoke_owner(client_uuid));
+          }
+          revoke_eclipse_sandboxes(client_uuid);
+          revoke_eclipse_profiles(client_uuid);
+          revoke_eclipse_workspaces(client_uuid);
+#endif
+        }
+        const auto current_catalog_revision = proc::catalog_revision();
+        if (current_catalog_revision != catalog_revision) {
+          catalog_revision = current_catalog_revision;
+          publish_eclipse_event({"catalog.changed", std::nullopt, catalog_revision, {{"revision", catalog_revision}}}, "catalog.read");
+        }
+#ifdef _WIN32
+        if (eclipse_sandbox_manager) {
+          const auto status = eclipse_sandbox_manager->reconcile();
+          if (status != eclipse_sandboxes::status_t::success && status != eclipse_sandboxes::status_t::unavailable) {
+            BOOST_LOG(error) << "Sandbox runtime reconciliation failed";
+          }
+        }
+        if (const auto snapshot = eclipse_display_snapshot(); snapshot && snapshot->first != display_revision) {
+          display_revision = snapshot->first;
+          publish_eclipse_event({"displays.changed", std::nullopt, display_revision, {{"revision", display_revision}}}, "display.read");
+        }
+#endif
+        if (config::nvhttp.sunshine_name != host_name_state) {
+          host_name_state = config::nvhttp.sunshine_name;
+          publish_eclipse_event({"host.changed", std::nullopt, std::nullopt, {{"name", host_name_state}}});
+        }
+        if (monitor_tick % 8 == 0) {
+          bool sandbox_ok = true;
+#ifdef _WIN32
+          sandbox_ok = eclipse::windows::sandbox::health().available;
+#endif
+          nlohmann::json capabilities = nlohmann::json::array();
+          for (const auto capability : eclipse_api::CAPABILITIES) {
+            capabilities.push_back(capability);
+          }
+          if (sandbox_ok) {
+            capabilities.push_back("sandboxes-v1");
+          }
+          if (eclipse_peripheral_manager) {
+            capabilities.push_back("peripherals-v1");
+          }
+#ifdef _WIN32
+          capabilities.push_back("displays-v1");
+#endif
+          std::string signature = capabilities.dump();
+          if (capabilities_state.empty()) {
+            capabilities_state = signature;
+          } else if (signature != capabilities_state) {
+            capabilities_state = signature;
+            publish_eclipse_event({"capabilities.changed", std::nullopt, std::nullopt, {{"capabilities", std::move(capabilities)}}});
+          }
+        }
+        {
+          const auto snapshots = eclipse_session_snapshots();
+          const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+          std::vector<std::pair<eclipse_events::event_t, std::pair<std::string, std::vector<std::string>>>> pending_events;
+          std::vector<eclipse_session_binding_t> doomed_bindings;
+          {
+            std::lock_guard lock {eclipse_session_tracking_mutex};
+            std::set<std::string> seen;
+            for (const auto &session : snapshots) {
+              seen.insert(session.id);
+              auto entry = eclipse_session_tracking.find(session.id);
+              if (entry == eclipse_session_tracking.end()) {
+                entry = eclipse_session_tracking.emplace(session.id, eclipse_session_tracking_t {}).first;
+                entry->second.owner_client_uuid = session.client_uuid;
+                entry->second.app_uuid = session.app_uuid;
+                entry->second.state = session.state;
+                entry->second.updated_at = now_ms;
+                entry->second.announced = true;
+                ++eclipse_session_collection_revision;
+              }
+              entry->second.terminal_since.reset();
+              if (entry->second.state != session.state) {
+                entry->second.state = session.state;
+                ++entry->second.revision;
+                entry->second.updated_at = now_ms;
+                ++eclipse_session_collection_revision;
+                pending_events.emplace_back(
+                  eclipse_events::event_t {"session.updated", session.id, entry->second.revision, eclipse_session_json(session, &entry->second)},
+                  std::pair {session.client_uuid, std::vector<std::string> {session.app_uuid}}
+                );
+              }
+            }
+            for (auto entry = eclipse_session_tracking.begin(); entry != eclipse_session_tracking.end();) {
+              if (seen.contains(entry->first)) {
+                ++entry;
+                continue;
+              }
+              const bool terminal = entry->second.state == "stopped" || entry->second.state == "failed";
+              const auto event_apps = entry->second.app_uuid.empty() ? std::vector<std::string> {} : std::vector<std::string> {entry->second.app_uuid};
+              const auto &event_owner = entry->second.owner_client_uuid;
+              if (!terminal) {
+                entry->second.state = "stopped";
+                ++entry->second.revision;
+                entry->second.updated_at = now_ms;
+                entry->second.terminal_since = now_ms;
+                ++eclipse_session_collection_revision;
+                pending_events.emplace_back(
+                  eclipse_events::event_t {"session.updated", entry->first, entry->second.revision, {{"id", entry->first}, {"state", "stopped"}, {"stateReason", "terminated"}, {"revision", entry->second.revision}}},
+                  std::pair {event_owner, event_apps}
+                );
+                ++entry;
+                continue;
+              }
+              if (!entry->second.terminal_since) {
+                entry->second.terminal_since = now_ms;
+                ++entry;
+                continue;
+              }
+              if (now_ms - *entry->second.terminal_since < 60'000) {
+                ++entry;
+                continue;
+              }
+              if (entry->second.binding.workspace_id.empty()) {
+                doomed_bindings.push_back(entry->second.binding);
+              }
+              pending_events.emplace_back(
+                eclipse_events::event_t {"session.removed", entry->first, entry->second.revision + 1, {{"id", entry->first}, {"revision", entry->second.revision + 1}}},
+                std::pair {event_owner, event_apps}
+              );
+              entry = eclipse_session_tracking.erase(entry);
+              ++eclipse_session_collection_revision;
+            }
+          }
+          for (const auto &[event, visibility] : pending_events) {
+            const auto &[owner, apps] = visibility;
+            publish_eclipse_event(event, "session.control", owner, apps);
+          }
+          for (const auto &binding : doomed_bindings) {
+            eclipse_destroy_session_sandbox(binding);
+          }
+        }
+        if (monitor_tick % 4 == 0) {
+          for (const auto &recipient : eclipse_event_recipients("telemetry.read")) {
+            if (!eclipse_event_hub) {
+              continue;
+            }
+            std::string owner_filter;
+            {
+              std::lock_guard lock {client_auth_mutex};
+              const auto found = std::find_if(client_root.named_devices.begin(), client_root.named_devices.end(), [&](const auto &entry) {
+                return entry.uuid == recipient;
+              });
+              if (found != client_root.named_devices.end() && found->permissions.scopes.contains("host.control")) {
+                owner_filter.clear();
+              } else {
+                owner_filter = recipient;
+              }
+            }
+            try {
+              eclipse_event_hub->publish({"telemetry.sample", std::nullopt, std::nullopt, eclipse_telemetry_document(owner_filter)}, {recipient});
+            } catch (const std::exception &exception) {
+              BOOST_LOG(error) << "Eclipse telemetry event publication failed: " << exception.what();
+            }
+          }
+        }
+      }
+    });
 
     // Wait for any event
-    shutdown_event->view();
+    while (!external_stop && !shutdown_event->peek()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds {50});
+    }
+
+    change_monitor.request_stop();
+    change_monitor.join();
+    publish_eclipse_event({"host.stopping", std::nullopt, std::nullopt, nlohmann::json::object()});
+    std::this_thread::sleep_for(std::chrono::milliseconds {50});
+    eclipse_event_hub->disconnect_all();
 
     https_server.stop();
     http_server.stop();
 
     ssl.join();
     tcp.join();
+    eclipse_operation_pool.stop();
+    eclipse_operation_pool.join();
+    {
+      std::lock_guard stream_lock {eclipse_event_stream_mutex};
+      eclipse_event_streams.clear();
+    }
+  }
+
+  void start() {
+    run_nvhttp_servers(std::nullopt, std::nullopt, {}, {});
   }
 
   void erase_all_clients() {
     bool erased = false;
+    std::vector<std::string> removed_owners;
     {
       std::lock_guard lock {client_auth_mutex};
       auto previous_clients = client_root;
+      for (const auto &client : client_root.named_devices) {
+        removed_owners.push_back(client.uuid);
+      }
       client_root = {};
       cert_chain.clear();
       verified_clients.clear();
       if (!save_state()) {
         client_root = std::move(previous_clients);
         rebuild_client_cert_chain();
+        removed_owners.clear();
       } else {
         erased = true;
       }
     }
     if (erased) {
+      if (eclipse_event_hub) {
+        for (const auto &owner : removed_owners) {
+          eclipse_event_hub->disconnect_client(owner);
+        }
+      }
       rtsp_stream::terminate_sessions();
+      if (eclipse_peripheral_manager) {
+        for (const auto &owner : removed_owners) {
+          eclipse_peripheral_manager->revoke_owner(owner);
+        }
+      }
+#ifdef _WIN32
+      if (eclipse_virtual_display_manager) {
+        for (const auto &owner : removed_owners) {
+          static_cast<void>(eclipse_virtual_display_manager->revoke_owner(owner));
+        }
+      }
+      for (const auto &owner : removed_owners) {
+        revoke_eclipse_sandboxes(owner);
+        revoke_eclipse_profiles(owner);
+        revoke_eclipse_workspaces(owner);
+      }
+#endif
     }
   }
 
@@ -2410,7 +7714,18 @@ namespace nvhttp {
       }
     }
     if (removed) {
+      if (eclipse_event_hub) {
+        eclipse_event_hub->disconnect_client(std::string {uuid});
+      }
       rtsp_stream::terminate_sessions_by_cert(certificate);
+#ifdef _WIN32
+      if (eclipse_virtual_display_manager) {
+        static_cast<void>(eclipse_virtual_display_manager->revoke_owner(std::string {uuid}));
+      }
+      revoke_eclipse_sandboxes(std::string {uuid});
+      revoke_eclipse_profiles(std::string {uuid});
+      revoke_eclipse_workspaces(std::string {uuid});
+#endif
     }
     return removed;
   }
@@ -2440,6 +7755,11 @@ namespace nvhttp {
 
     std::string previous_certificate;
     bool terminate_sessions = false;
+    bool revoke_resources = false;
+    bool revoke_profile_owner = false;
+    bool revoke_sandbox_owner = false;
+    bool revoke_workspace_owner = false;
+    std::optional<eclipse_api::client_permissions_t> current_profile_permissions;
     {
       std::lock_guard lock {client_auth_mutex};
       const auto client = std::ranges::find(client_root.named_devices, uuid, &named_cert_t::uuid);
@@ -2457,10 +7777,18 @@ namespace nvhttp {
       if (update.enabled) {
         client->enabled = *update.enabled;
         terminate_sessions = !*update.enabled;
+        revoke_resources = !*update.enabled;
+        revoke_profile_owner = !*update.enabled;
+        revoke_sandbox_owner = !*update.enabled;
+        revoke_workspace_owner = !*update.enabled;
       }
       if (update.permissions) {
         client->permissions = std::move(*update.permissions);
         terminate_sessions = true;
+        revoke_resources = !client->permissions.scopes.contains("virtual-display.manage") || permissions_expired(client->permissions);
+        current_profile_permissions = client->permissions;
+        revoke_sandbox_owner = true;
+        revoke_workspace_owner = true;
         BOOST_LOG(info) << "Audit: changed permissions for client ["sv << uuid << ']';
       }
       if (update.certificate && client->cert != *update.certificate) {
@@ -2480,8 +7808,27 @@ namespace nvhttp {
       }
     }
     if (terminate_sessions) {
+      if (eclipse_event_hub) {
+        eclipse_event_hub->disconnect_client(std::string {uuid});
+      }
       rtsp_stream::terminate_sessions_by_cert(previous_certificate);
     }
+#ifdef _WIN32
+    if (revoke_resources && eclipse_virtual_display_manager) {
+      static_cast<void>(eclipse_virtual_display_manager->revoke_owner(std::string {uuid}));
+    }
+    if (revoke_sandbox_owner) {
+      revoke_eclipse_sandboxes(std::string {uuid});
+    }
+    if (revoke_profile_owner) {
+      revoke_eclipse_profiles(std::string {uuid});
+    } else if (current_profile_permissions) {
+      revoke_eclipse_profiles(std::string {uuid}, current_profile_permissions);
+    }
+    if (revoke_workspace_owner) {
+      revoke_eclipse_workspaces(std::string {uuid});
+    }
+#endif
     return true;
   }
 
@@ -2534,6 +7881,27 @@ namespace nvhttp {
 
 #ifdef SUNSHINE_TESTS
   namespace test_support {
+    nlohmann::json capabilities_document(
+      const std::string_view client_uuid,
+      const std::string_view client_name,
+      const eclipse_api::client_permissions_t &permissions,
+      const std::string_view host_uuid,
+      const std::string_view host_name,
+      const std::string_view host_platform,
+      const std::string_view host_version,
+      const bool wake_available
+    ) {
+      return eclipse_capabilities_document(client_uuid, client_name, permissions, host_uuid, host_name, host_platform, host_version, wake_available);
+    }
+
+    nlohmann::json catalog_app_document(const proc::ctx_t &app) {
+      return eclipse_app_json(app);
+    }
+
+    std::vector<std::string> event_collections(const eclipse_api::client_permissions_t &permissions) {
+      return eclipse_event_collections(permissions);
+    }
+
     void reset_client_state() {
       std::lock_guard lock {client_auth_mutex};
       client_root = {};
@@ -2565,6 +7933,10 @@ namespace nvhttp {
 
     void reload_client_state() {
       load_state();
+    }
+
+    void run_servers(const unsigned short port_http, const unsigned short port_https, const std::function<void(unsigned short)> &https_ready, const std::atomic_bool &external_stop) {
+      run_nvhttp_servers(port_http, port_https, https_ready, external_stop);
     }
   }  // namespace test_support
 #endif

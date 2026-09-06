@@ -76,7 +76,13 @@ if(WIN32)
     endif()
 
     set(NPM_COMMAND cmd /C)
-    set(NPM_PATH "PATH=${NPM_DIRECTORY};$ENV{PATH}")
+    if(DEFINED ENV{MSYSTEM})
+        # MSYS2 shells export a POSIX-style PATH that Windows cmd cannot parse.
+        # Build a minimal native PATH from the npm directory and system roots.
+        set(NPM_PATH "PATH=${NPM_DIRECTORY};$ENV{SystemRoot}/System32;$ENV{SystemRoot}/System32/Wbem;$ENV{SystemRoot}")
+    else()
+        set(NPM_PATH "PATH=${NPM_DIRECTORY};$ENV{PATH}")
+    endif()
 else()
     set(NPM_COMMAND)
     set(NPM_PATH "PATH=$ENV{PATH}")

@@ -6,8 +6,10 @@
 #pragma once
 
 // standard includes
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -21,6 +23,10 @@
 // local includes
 #include "crypto.h"
 #include "eclipse_api.h"
+
+namespace proc {
+  struct ctx_t;
+}
 
 /**
  * @brief Contains all the functions and variables related to the nvhttp (GameStream) server.
@@ -99,9 +105,11 @@ namespace nvhttp {
         SimpleWeb::HTTPS(io_context, ctx) {
     }
 
-    virtual ~SunshineHTTPS() {
-      // Gracefully shutdown the TLS connection
+    virtual ~SunshineHTTPS() noexcept {
+      // Gracefully shutdown the TLS connection, but never block the destructor on
+      // a peer that has already stopped responding with TLS close_notify.
       SimpleWeb::error_code ec;
+      lowest_layer().non_blocking(true, ec);
       shutdown(ec);
     }
   };
@@ -398,11 +406,76 @@ namespace nvhttp {
    */
   void erase_all_clients();
 
+  /**
+   * @brief Compute the RFC 6455 handshake accept key for a client key.
+   *
+   * @param key Raw `Sec-WebSocket-Key` header value.
+   * @return Base64 accept key.
+   */
+  std::string websocket_accept_key(std::string_view key);
+
+  /**
+   * @brief Encode one unmasked server WebSocket frame.
+   *
+   * @param opcode Frame opcode, for example 0x1 for text or 0x8 for close.
+   * @param payload Frame payload bytes.
+   * @return Complete encoded frame.
+   */
+  std::vector<std::uint8_t> websocket_frame(int opcode, std::string_view payload);
+
+  /**
+   * @brief Decode one complete masked client WebSocket frame.
+   *
+   * @param frame Complete frame bytes including header, mask, and payload.
+   * @return Opcode and unmasked payload, or no value for malformed input.
+   */
+  std::optional<std::pair<int, std::string>> websocket_decode_frame(const std::vector<std::uint8_t> &frame);
+
 #ifdef SUNSHINE_TESTS
   /**
    * @brief Test-only accessors for paired-client authorization state.
    */
   namespace test_support {
+    /**
+     * @brief Build a capability document through production serialization logic.
+     *
+     * @param client_uuid Stable paired-client UUID.
+     * @param client_name Paired-client friendly name.
+     * @param permissions Certificate-bound client policy.
+     * @param host_uuid Stable Sunshine host UUID.
+     * @param host_name Sunshine host name.
+     * @param host_platform Sunshine platform identifier.
+     * @param host_version Sunshine build version.
+     * @param wake_available Whether usable Wake-on-LAN information exists.
+     * @return Complete capability document without response `schemaVersion`.
+     */
+    nlohmann::json capabilities_document(
+      std::string_view client_uuid,
+      std::string_view client_name,
+      const eclipse_api::client_permissions_t &permissions,
+      std::string_view host_uuid,
+      std::string_view host_name,
+      std::string_view host_platform,
+      std::string_view host_version,
+      bool wake_available
+    );
+
+    /**
+     * @brief Build one Catalog V2 application through production serialization logic.
+     *
+     * @param app Runtime application context.
+     * @return Catalog V2 application resource.
+     */
+    nlohmann::json catalog_app_document(const proc::ctx_t &app);
+
+    /**
+     * @brief Project event resynchronization collections through client scopes.
+     *
+     * @param permissions Certificate-bound client policy.
+     * @return Collection names visible to event stream.
+     */
+    std::vector<std::string> event_collections(const eclipse_api::client_permissions_t &permissions);
+
     /**
      * @brief Clear in-memory paired-client records without changing persisted state.
      */
@@ -437,6 +510,26 @@ namespace nvhttp {
      * @brief Reload paired-client authorization state from the configured state file.
      */
     void reload_client_state();
+
+    /**
+     * @brief Run the production nvhttp servers with explicit ports until stopped.
+     *
+     * Behaves exactly like `nvhttp::start()`, including Eclipse manager creation,
+     * route registration, and the periodic change monitor, but uses caller-supplied
+     * ports and a cooperative stop flag instead of the global shutdown event.
+     * Blocks the calling thread until `external_stop` is set or shutdown is signaled.
+     *
+     * @param port_http Discovery HTTP port, zero selects an ephemeral port.
+     * @param port_https Paired HTTPS port, zero selects an ephemeral port.
+     * @param https_ready Receives the bound HTTPS port after listening starts.
+     * @param external_stop Set to `true` to request server shutdown.
+     */
+    void run_servers(
+      unsigned short port_http,
+      unsigned short port_https,
+      const std::function<void(unsigned short)> &https_ready,
+      const std::atomic_bool &external_stop
+    );
   }  // namespace test_support
 #endif
 }  // namespace nvhttp

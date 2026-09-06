@@ -12,12 +12,19 @@ Read our contribution guide in our organization level
 
 ### Web UI
 * The Web UI uses [Vite](https://vitejs.dev) as its build system.
-* The HTML pages used by the Web UI are found in `./src_assets/common/assets/web`.
-* [EJS](https://www.npmjs.com/package/vite-plugin-ejs) is used as a templating system for the pages
-  (check `template_header.html` and `template_header_main.html`).
-* The Style System is provided by [Bootstrap](https://getbootstrap.com).
-* Icons are provided by [Lucide](https://lucide.dev) and [Simple Icons](https://simpleicons.org).
-* The JS framework used by the more interactive pages is [Vue.js](https://vuejs.org).
+* The HTML shells served by the backend are found in `./src_assets/common/assets/web`;
+  they all load the same single-page application in `./src_assets/common/assets/web/src`.
+* Routing is handled by [TanStack Router](https://tanstack.com/router) using the request path
+  (e.g. `/apps` maps to `apps.html`).
+* Server state is managed with [TanStack Query](https://tanstack.com/query); UI state uses
+  [Zustand](https://zustand.docs.pmnd.rs).
+* Forms are validated with [Zod](https://zod.dev).
+* Styling uses CSS Modules with design tokens defined in
+  `./src_assets/common/assets/web/src/theme` (no CSS framework).
+* Icons are provided by [Lucide](https://lucide.dev).
+* The UI framework is [React](https://react.dev) 19 with the React Compiler enabled.
+* Linting and formatting use [Biome](https://biomejs.dev); unit tests use
+  [Vitest](https://vitest.dev) with [Testing Library](https://testing-library.com).
 
 #### Building
 
@@ -27,9 +34,31 @@ Read our contribution guide in our organization level
     ninja -C build web-ui
     ```}
   @tab{Manual | ```bash
-    npm run dev
+    npm ci
+    npm run build
     ```}
 }
+
+#### Development
+
+A Vite dev server with hot module replacement and a proxy to the local Sunshine
+backend is available. Start Sunshine, then run:
+
+```bash
+npm ci
+npm run dev
+```
+
+The dev server listens on `https://localhost:5173` and proxies `/api` requests to
+`https://localhost:47990`.
+
+#### Quality Checks
+
+```bash
+npm run check
+```
+
+This runs Biome (`lint`), TypeScript (`typecheck`), and Vitest (`test`).
 
 ### Localization
 Sunshine and related LizardByte projects are being localized into various languages.
@@ -62,8 +91,8 @@ next release.
 #### Extraction
 
 ##### Web UI
-Sunshine uses [Vue I18n](https://vue-i18n.intlify.dev) for localizing the UI.
-The following is a simple example of how to use it.
+Sunshine uses [i18next](https://www.i18next.com) with [react-i18next](https://react.i18next.com)
+for localizing the UI. The following is a simple example of how to use it.
 
 * Add the string to the `./src_assets/common/assets/web/public/assets/locale/en.json` file, in English.
   ```json
@@ -84,18 +113,19 @@ The following is a simple example of how to use it.
   > on [CrowdIn][crowdin-url]. Once the translations are complete, a PR will be made
   > to merge the translations into Sunshine.
 
-* Use the string in the Vue component.
-  ```html
-  <template>
-    <div>
-      <p>{{ $t('index.welcome') }}</p>
-    </div>
-  </template>
+* Use the string in a React component.
+  ```tsx
+  import { useTranslation } from 'react-i18next'
+
+  export function Greeting() {
+    const { t } = useTranslation()
+    return <p>{t('index.welcome')}</p>
+  }
   ```
 
   > [!TIP]
-  > More formatting examples can be found in the
-  > [Vue I18n guide](https://kazupon.github.io/vue-i18n/guide/formatting.html).
+  > Interpolation uses single braces to stay compatible with the existing
+  > translation files, e.g. `t('index.virtualhid_outdated_desc', { version: '1.0' })`.
 
 ##### C++
 
@@ -152,6 +182,14 @@ Additionally, [xgettext](https://www.gnu.org/software/gettext) must be installed
 > Pull Requests. The files are automatically generated and updated by the workflow. Once the PR is merged, the
 > translations can take place on [CrowdIn][crowdin-url]. Once the translations are
 > complete, a PR will be made to merge the translations into Sunshine.
+
+#### Web UI Unit Testing
+The Web UI uses [Vitest](https://vitest.dev) with [Testing Library](https://testing-library.com).
+Test files live next to the sources with a `.test.ts` / `.test.tsx` suffix.
+
+```bash
+npm run test
+```
 
 ### Testing
 
