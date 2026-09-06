@@ -1,0 +1,14 @@
+.portBlock {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-md);
+}
+
+.noteRow {
+  display: flex;
+  gap: var(--spacing-xs);
+  align-items: center;
+  color: var(--color-primary);
+  font-size: 0.85rem;
+}

@@ -1,0 +1,141 @@
+.layout {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: var(--spacing-lg);
+  align-items: start;
+}
+
+.sidebar {
+  position: sticky;
+  top: calc(var(--navbar-height) + var(--spacing-md));
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  padding: var(--spacing-md);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+
+.navGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.navHeading {
+  margin-top: var(--spacing-md);
+  padding: 0 var(--spacing-sm);
+  color: var(--color-text-subtle);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.tabButton {
+  display: flex;
+  gap: 0.55rem;
+  align-items: center;
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-base);
+  font-size: 0.88rem;
+  text-align: left;
+}
+
+.tabButton:hover {
+  background: var(--color-bg-subtle);
+}
+
+.tabActive {
+  background: var(--color-primary-light);
+  font-weight: 600;
+}
+
+.actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-md);
+}
+
+.actions button {
+  width: 100%;
+}
+
+.content {
+  min-width: 0;
+}
+
+.searchRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-md);
+  align-items: center;
+  margin-bottom: var(--spacing-lg);
+}
+
+.searchBox {
+  display: flex;
+  flex: 1;
+  gap: var(--spacing-sm);
+  align-items: center;
+  max-width: 420px;
+  padding: 0 0.7rem;
+  color: var(--color-text-muted);
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+}
+
+.searchBox input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.45rem 0;
+  background: transparent;
+  border: none;
+  color: var(--color-text-base);
+}
+
+.searchBox input:focus {
+  outline: none;
+}
+
+.searchStatus {
+  color: var(--color-text-muted);
+  font-size: 0.85rem;
+}
+
+.fieldWrap {
+  transition: background-color var(--transition-base);
+}
+
+@media (max-width: 860px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .navGroup {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .actions {
+    flex-direction: row;
+    margin-top: 0;
+  }
+
+  .actions button {
+    width: auto;
+  }
+}

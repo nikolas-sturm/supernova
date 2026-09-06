@@ -1,0 +1,223 @@
+.cardHeadRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-sm);
+  align-items: center;
+  justify-content: space-between;
+}
+
+.clientList {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.clientRow {
+  display: flex;
+  gap: var(--spacing-sm);
+  align-items: center;
+  padding: var(--spacing-sm) 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.clientRow:last-child {
+  border-bottom: none;
+}
+
+.clientName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.switchLabel input[type="checkbox"] {
+  width: 2.2rem;
+  height: 1.2rem;
+  appearance: none;
+  position: relative;
+  background: var(--color-bg-muted);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.switchLabel input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: calc(1.2rem - 4px);
+  height: calc(1.2rem - 4px);
+  border-radius: 50%;
+  background: var(--color-text-base);
+  transition: transform var(--transition-fast);
+}
+
+.switchLabel input[type="checkbox"]:checked {
+  background: var(--color-success);
+}
+
+.switchLabel input[type="checkbox"]:checked::after {
+  transform: translateX(1rem);
+}
+
+.section {
+  margin-bottom: var(--spacing-lg);
+}
+
+.sectionHead {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-sm);
+  align-items: baseline;
+  margin-bottom: var(--spacing-md);
+}
+
+.sectionHead p {
+  flex: 1 1 100%;
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.88rem;
+}
+
+.tableWrap {
+  overflow-x: auto;
+}
+
+.spinning {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.licenseStats {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--spacing-xs) var(--spacing-md);
+  margin: 0 0 var(--spacing-md);
+}
+
+.licenseStats dt {
+  color: var(--color-text-muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.licenseStats dd {
+  margin: 0;
+}
+
+.licenseInput {
+  display: flex;
+  flex: 1;
+  gap: var(--spacing-sm);
+  align-items: flex-end;
+  margin-top: var(--spacing-md);
+}
+
+.licenseInput > div {
+  flex: 1;
+}
+
+.logFilter {
+  display: flex;
+  gap: var(--spacing-sm);
+  align-items: center;
+  max-width: 320px;
+  margin-bottom: var(--spacing-md);
+  padding: 0 0.7rem;
+  color: var(--color-text-muted);
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+}
+
+.logFilter input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.45rem 0;
+  background: transparent;
+  border: none;
+  color: var(--color-text-base);
+}
+
+.logFilter input:focus {
+  outline: none;
+}
+
+.logContainer {
+  position: relative;
+  max-height: 480px;
+  overflow: auto;
+  background: var(--color-bg-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.logNav {
+  position: sticky;
+  top: var(--spacing-sm);
+  z-index: 10;
+  display: flex;
+  gap: var(--spacing-xs);
+  float: right;
+  margin: var(--spacing-sm);
+  padding: 3px;
+  background: var(--color-surface-raised);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+
+.logNav button {
+  display: inline-flex;
+  padding: 0.3rem;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-base);
+}
+
+.logNav button:hover:not(:disabled) {
+  background: var(--color-bg-muted);
+}
+
+.logPre {
+  margin: 0;
+  padding: var(--spacing-md);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log_info {
+  color: var(--color-text-muted);
+}
+
+.log_debug {
+  color: var(--color-text-subtle);
+}
+
+.log_warning {
+  color: var(--color-warning);
+}
+
+.log_error {
+  color: var(--color-danger);
+}
+
+.log_fatal {
+  color: var(--color-on-primary);
+  background: var(--color-danger);
+}
+
+.logSelected {
+  outline: 2px solid var(--color-primary);
+}

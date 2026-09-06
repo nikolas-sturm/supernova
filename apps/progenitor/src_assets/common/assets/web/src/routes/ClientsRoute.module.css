@@ -1,0 +1,38 @@
+.toolbar {
+  display: flex;
+  gap: var(--spacing-md);
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--spacing-md);
+}
+
+.switchLabel input[type="checkbox"] {
+  width: 2.2rem;
+  height: 1.2rem;
+  appearance: none;
+  position: relative;
+  background: var(--color-bg-muted);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.switchLabel input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: calc(1.2rem - 4px);
+  height: calc(1.2rem - 4px);
+  border-radius: 50%;
+  background: var(--color-text-base);
+  transition: transform var(--transition-fast);
+}
+
+.switchLabel input[type="checkbox"]:checked {
+  background: var(--color-success);
+}
+
+.switchLabel input[type="checkbox"]:checked::after {
+  transform: translateX(1rem);
+}
