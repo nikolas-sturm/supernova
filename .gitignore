@@ -1,0 +1,10 @@
+node_modules/
+.nx/
+**/cmake-build-*/
+**/build/
+**/build-release/
+**/dist/
+**/coverage/
+**/.venv/
+**/*.tsbuildinfo
+**/extensions/eclipse-core/bin/
