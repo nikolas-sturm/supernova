@@ -1,5 +1,9 @@
-import { app, events, extensions, init, window as neutralinoWindow } from '@neutralinojs/lib'
+import { app, events, extensions, window as neutralinoWindow } from '@neutralinojs/lib'
 import { z } from 'zod'
+import {
+  streamOverlayRequestSchema,
+  streamStatisticsUpdateSchema,
+} from '../overlay/overlayProtocol'
 import { type StreamSettings, settingsSchema } from '../settings'
 import type {
   AppLibrary,
@@ -8,6 +12,14 @@ import type {
   PairingUpdate,
   SessionUpdate,
 } from '../store/clientStore'
+import {
+  dismissStreamOverlay,
+  openStreamOverlay,
+  prewarmStreamOverlay,
+  stopStreamOverlayPrewarm,
+  updateStreamOverlayStatistics,
+} from './overlayWindow'
+import { hasNeutralinoRuntime, initializeNeutralinoRuntime } from './runtime'
 
 const extensionId = 'dev.eclipse.core'
 const statusEvent = 'eclipse.core.status'
@@ -17,6 +29,8 @@ const pairingEvent = 'eclipse.pairing.changed'
 const appsEvent = 'eclipse.apps.changed'
 const artworkEvent = 'eclipse.app.art.changed'
 const sessionEvent = 'eclipse.session.changed'
+const streamOverlayEvent = 'eclipse.stream.overlay.requested'
+const streamStatisticsEvent = 'eclipse.stream.statistics'
 
 const statusSchema = z.object({
   schemaVersion: z.literal(1),
@@ -39,8 +53,21 @@ const hostSchema = z.object({
   error: z.string(),
   httpsPort: z.number().int().min(0).max(65535),
   currentGameId: z.number().int().nonnegative(),
+  serverCodecModeSupport: z.number().int().nonnegative().optional().default(1),
+  maxLumaPixelsHevc: z.number().int().nonnegative().optional().default(0),
+  displayModes: z
+    .array(
+      z.object({
+        width: z.number().int().positive(),
+        height: z.number().int().positive(),
+        refreshRate: z.number().int().positive(),
+      }),
+    )
+    .optional()
+    .default([]),
   lastSeenAt: z.number().int().nonnegative(),
   paired: z.boolean(),
+  wakeable: z.boolean().optional().default(false),
 })
 
 const hostsSchema = z.object({
@@ -134,10 +161,6 @@ async function dispatchConnected(event: string, data?: unknown) {
 
 let initialized = false
 
-function hasNeutralinoRuntime() {
-  return typeof window !== 'undefined' && 'NL_OS' in window
-}
-
 export function startCoreBridge({
   onStatus,
   onHosts,
@@ -157,8 +180,12 @@ export function startCoreBridge({
   }
 
   if (!initialized) {
-    init()
-    void events.on('windowClose', () => app.exit())
+    initializeNeutralinoRuntime()
+    void events.on('windowClose', () => {
+      void dismissStreamOverlay().finally(() =>
+        stopStreamOverlayPrewarm().finally(() => app.exit()),
+      )
+    })
     initialized = true
   }
 
@@ -236,9 +263,43 @@ export function startCoreBridge({
     const result = sessionSchema.safeParse(event.detail)
     if (result.success) {
       onSession(result.data)
+      if (['stopped', 'terminated', 'error'].includes(result.data.state)) {
+        void dismissStreamOverlay()
+        void stopStreamOverlayPrewarm()
+      } else if (window.NL_OS === 'Linux') {
+        void prewarmStreamOverlay()
+      }
     } else {
       onHostError('Native core returned an invalid session update.')
     }
+  }
+
+  const handleStreamOverlay = (event: CustomEvent<unknown>) => {
+    const result = streamOverlayRequestSchema.safeParse(event.detail)
+    if (!result.success) {
+      onHostError('Native core returned invalid stream overlay bounds.')
+      return
+    }
+    void openStreamOverlay(result.data, (action) =>
+      action === 'resume'
+        ? dispatchConnected('stream.overlay.closed', {
+            hostId: result.data.hostId,
+            generation: result.data.generation,
+          })
+        : dispatchConnected('session.cancel', {
+            hostId: result.data.hostId,
+            quitHost: action === 'quit',
+          }),
+    ).catch((error: unknown) => {
+      onHostError(
+        error instanceof Error ? error.message : 'Eclipse could not open the stream overlay.',
+      )
+    })
+  }
+
+  const handleStreamStatistics = (event: CustomEvent<unknown>) => {
+    const result = streamStatisticsUpdateSchema.safeParse(event.detail)
+    if (result.success) void updateStreamOverlayStatistics(result.data)
   }
 
   void events.on(statusEvent, handleStatus)
@@ -248,6 +309,8 @@ export function startCoreBridge({
   void events.on(appsEvent, handleApps)
   void events.on(artworkEvent, handleArtwork)
   void events.on(sessionEvent, handleSession)
+  void events.on(streamOverlayEvent, handleStreamOverlay)
+  void events.on(streamStatisticsEvent, handleStreamStatistics)
   void events.on('extClientDisconnect', handleExtensionDisconnect)
   void extensions.dispatch(extensionId, 'core.status').catch(() => {
     onStatus({
@@ -266,6 +329,8 @@ export function startCoreBridge({
     void events.off(appsEvent, handleApps)
     void events.off(artworkEvent, handleArtwork)
     void events.off(sessionEvent, handleSession)
+    void events.off(streamOverlayEvent, handleStreamOverlay)
+    void events.off(streamStatisticsEvent, handleStreamStatistics)
     void events.off('extClientDisconnect', handleExtensionDisconnect)
   }
 }
@@ -276,9 +341,19 @@ export async function saveCoreHost(name: string, address: string) {
   return true
 }
 
+export async function configureCoreDiscovery(enabled: boolean) {
+  if (!hasNeutralinoRuntime()) return
+  await dispatchConnected('discovery.configure', { enabled })
+}
+
 export async function refreshCoreHost(id: string) {
   if (!hasNeutralinoRuntime()) return
   await dispatchConnected('host.refresh', { id })
+}
+
+export async function wakeCoreHost(id: string) {
+  if (!hasNeutralinoRuntime()) return
+  await dispatchConnected('host.wake', { id })
 }
 
 export async function pairCoreHost(id: string, pin: string) {
@@ -310,9 +385,9 @@ export async function applyUiDisplayMode(mode: StreamSettings['uiDisplayMode']) 
   }
 }
 
-export async function cancelCoreSession(hostId: string) {
+export async function cancelCoreSession(hostId: string, quitHost: boolean) {
   if (!hasNeutralinoRuntime()) return
-  await dispatchConnected('session.cancel', { hostId })
+  await dispatchConnected('session.cancel', { hostId, quitHost })
 }
 
 export async function removeCoreHost(id: string) {

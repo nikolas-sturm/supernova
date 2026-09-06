@@ -3,20 +3,27 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 
 #include <ixwebsocket/IXUuid.h>
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 
 #include "gamestream_client.h"
+#include "input_forwarder.h"
 #include "stream_session.h"
+#include "audio_renderer.h"
+#include "video_renderer.h"
+#include "wake_on_lan.h"
 
 namespace eclipse {
 namespace {
@@ -45,6 +52,12 @@ std::string randomHex(std::size_t byteCount) {
 }
 
 Json hostJson(const HostRecord& host) {
+    Json displayModes = Json::array();
+    for (const auto& mode : host.displayModes) {
+        displayModes.push_back({{"width", mode.width},
+                                {"height", mode.height},
+                                {"refreshRate", mode.refreshRate}});
+    }
     return {
         {"id", host.id},
         {"name", host.name},
@@ -60,6 +73,9 @@ Json hostJson(const HostRecord& host) {
         {"httpsPort", host.httpsPort},
         {"currentGameId", host.currentGameId},
         {"serverCodecModeSupport", host.serverCodecModeSupport},
+        {"maxLumaPixelsHevc", host.maxLumaPixelsHevc},
+        {"displayModes", std::move(displayModes)},
+        {"wakeMacAddress", host.wakeMacAddress},
         {"lastSeenAt", host.lastSeenAt},
         {"paired", host.paired},
     };
@@ -83,7 +99,28 @@ HostRecord parseHost(const Json& value) {
     }
     host.lastSeenAt = value.value("lastSeenAt", 0);
     host.currentGameId = value.value("currentGameId", 0);
-    host.serverCodecModeSupport = value.value("serverCodecModeSupport", 0);
+    host.serverCodecModeSupport =
+        value.value("serverCodecModeSupport", kBaselineCodecModeSupport);
+    host.maxLumaPixelsHevc = value.value("maxLumaPixelsHevc", std::uint64_t{0});
+    if (const auto modes = value.find("displayModes"); modes != value.end() && modes->is_array()) {
+        for (const auto& mode : *modes) {
+            if (!mode.is_object()) continue;
+            HostDisplayMode parsed{
+                .width = mode.value("width", 0),
+                .height = mode.value("height", 0),
+                .refreshRate = mode.value("refreshRate", 0),
+            };
+            if (parsed.width > 0 && parsed.height > 0 && parsed.refreshRate > 0) {
+                host.displayModes.push_back(parsed);
+            }
+        }
+        std::ranges::sort(host.displayModes);
+        host.displayModes.erase(std::unique(host.displayModes.begin(), host.displayModes.end()),
+                                host.displayModes.end());
+    }
+    if (const auto wakeAddress = parseMacAddress(value.value("wakeMacAddress", ""))) {
+        host.wakeMacAddress = formatMacAddress(*wakeAddress);
+    }
     host.paired = value.value("paired", false);
     return host;
 }
@@ -131,16 +168,27 @@ ControlPlane::ControlPlane(std::filesystem::path dataPath)
       statePath_(dataPath_ / "client-state.json"),
       gameStream_(std::make_unique<GameStreamClient>(ensureDataPath(dataPath_))) {
     load();
+    disconnectThread_ = std::thread([this] { cleanupSessions(); });
 }
 
 ControlPlane::~ControlPlane() {
-    std::unique_ptr<StreamSession> transport;
+    {
+        std::scoped_lock lock{disconnectMutex_};
+        shuttingDown_ = true;
+    }
+    disconnectCondition_.notify_one();
+    if (disconnectThread_.joinable()) disconnectThread_.join();
+
+    std::shared_ptr<StreamSession> transport;
     {
         std::scoped_lock lock{mutex_};
         sessionListener_ = {};
-        transport = std::move(transport_);
+        streamOverlayListener_ = {};
+        streamStatisticsListener_ = {};
+        transport = std::exchange(transport_, {});
+        session_.reset();
     }
-    transport.reset();
+    if (transport) transport->stop();
 }
 
 std::vector<HostRecord> ControlPlane::hosts() const {
@@ -187,6 +235,59 @@ HostRecord ControlPlane::addHost(std::string name, std::string address) {
     return host;
 }
 
+HostRecord ControlPlane::discoverHost(std::string name, std::string address) {
+    name = trim(std::move(name));
+    if (name.empty()) throw std::invalid_argument("Discovered host name is empty.");
+    const auto normalizedAddress = GameStreamClient::normalizeAddress(std::move(address));
+
+    std::string existingId;
+    std::string clientId;
+    {
+        std::scoped_lock lock{mutex_};
+        const auto existing = std::find_if(hosts_.begin(), hosts_.end(), [&](const auto& host) {
+            return host.address == normalizedAddress;
+        });
+        if (existing != hosts_.end()) existingId = existing->id;
+        clientId = clientId_;
+    }
+    if (!existingId.empty()) return probeHost(existingId);
+
+    const auto info = gameStream_->probe(normalizedAddress, 0, clientId);
+    HostRecord discovered{
+        .id = ix::uuid4(),
+        .name = std::move(name),
+        .address = normalizedAddress,
+        .serverName = info.serverName,
+        .serverUniqueId = info.serverUniqueId,
+        .appVersion = info.appVersion,
+        .gfeVersion = info.gfeVersion,
+        .serverState = info.serverState,
+        .status = "online",
+        .error = {},
+        .serverCertificate = {},
+        .httpsPort = info.httpsPort,
+        .currentGameId = info.currentGameId,
+        .serverCodecModeSupport = info.serverCodecModeSupport,
+        .maxLumaPixelsHevc = info.maxLumaPixelsHevc,
+        .displayModes = info.displayModes,
+        .wakeMacAddress = {},
+        .lastSeenAt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count(),
+        .paired = info.paired,
+    };
+
+    std::scoped_lock lock{mutex_};
+    const auto duplicate = std::find_if(hosts_.begin(), hosts_.end(), [&](const auto& host) {
+        return host.address == normalizedAddress ||
+               (!host.serverUniqueId.empty() && host.serverUniqueId == info.serverUniqueId);
+    });
+    if (duplicate != hosts_.end()) return *duplicate;
+    hosts_.push_back(discovered);
+    saveLocked();
+    return discovered;
+}
+
 HostRecord ControlPlane::probeHost(const std::string& id) {
     HostRecord current;
     std::string clientId;
@@ -215,6 +316,11 @@ HostRecord ControlPlane::probeHost(const std::string& id) {
         current.httpsPort = info.httpsPort;
         current.currentGameId = info.currentGameId;
         current.serverCodecModeSupport = info.serverCodecModeSupport;
+        current.maxLumaPixelsHevc = info.maxLumaPixelsHevc;
+        current.displayModes = info.displayModes;
+        if (!current.serverCertificate.empty() && !info.macAddress.empty()) {
+            current.wakeMacAddress = info.macAddress;
+        }
         current.paired = info.paired;
         current.status = "online";
         current.error.clear();
@@ -321,12 +427,14 @@ std::string ControlPlane::boxArtDataUrl(const std::string& hostId, int appId) {
 }
 
 SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
-                                       const StreamSettings& settings) {
+                                        const StreamSettings& settings) {
     std::scoped_lock sessionLock{sessionMutex_};
     HostRecord current;
     GameStreamApp selected;
     std::string clientId;
     bool resume = false;
+    std::uint64_t generation = 0;
+    std::function<void(const SessionUpdate&)> listener;
     {
         std::scoped_lock lock{mutex_};
         if (transport_ || session_) {
@@ -357,10 +465,101 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
         selected = *app;
         clientId = clientId_;
         resume = host->currentGameId == appId;
+        generation = ++sessionGeneration_;
+        sessionStopRequested_ = false;
+        launchCancellationRequested_.store(false);
+        session_ = SessionRecord{
+            .hostId = hostId,
+            .appId = appId,
+            .appName = selected.name,
+            .sessionUrl = {},
+            .resumed = resume,
+            .remoteInputKey = {},
+            .remoteInputIv = {},
+        };
+        listener = sessionListener_;
     }
-
-    const auto launched = gameStream_->launch(current.address, current.httpsPort, clientId,
-                                                current.serverCertificate, appId, resume, settings);
+    if (listener) {
+        try {
+            listener({
+                .hostId = hostId,
+                .appId = appId,
+                .appName = selected.name,
+                .state = "launching",
+                .message = "Requesting native host session.",
+                .resumed = resume,
+            });
+        } catch (...) {
+        }
+    }
+    int videoFormat = VIDEO_FORMAT_H264;
+    LaunchResult launched;
+    auto effectiveSettings = settings;
+    try {
+        if (effectiveSettings.audioConfig != AudioConfig::stereo &&
+            !AudioRenderer::supportsOutputChannels(
+                audioChannelCount(effectiveSettings.audioConfig))) {
+            effectiveSettings.audioConfig = AudioConfig::stereo;
+            if (listener) {
+                try {
+                    listener({
+                        .hostId = hostId,
+                        .appId = appId,
+                        .appName = selected.name,
+                        .state = "launching",
+                        .message = "Selected surround layout is unavailable; using stereo audio.",
+                        .resumed = resume,
+                    });
+                } catch (...) {
+                }
+            }
+        }
+        auto codecModeSupport = current.serverCodecModeSupport;
+        if (current.maxLumaPixelsHevc == 0) {
+            codecModeSupport &=
+                ~(SCM_HEVC | SCM_HEVC_MAIN10 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444);
+        }
+        videoFormat =
+            selectVideoFormat(effectiveSettings.videoCodec, codecModeSupport,
+                              effectiveSettings.enableHdr, effectiveSettings.enableYuv444);
+        const auto requestedPixels = static_cast<std::uint64_t>(effectiveSettings.width) *
+                                     static_cast<std::uint64_t>(effectiveSettings.height);
+        if ((videoFormat & VIDEO_FORMAT_MASK_H265) != 0 &&
+            requestedPixels > current.maxLumaPixelsHevc) {
+            throw std::runtime_error(
+                "Requested resolution exceeds this host's reported HEVC encoder limit.");
+        }
+        launched = gameStream_->launch(current.address, current.httpsPort, clientId,
+                                       current.serverCertificate, appId, resume, effectiveSettings,
+                                       &launchCancellationRequested_);
+    } catch (...) {
+        const auto failure = std::current_exception();
+        const bool cancelled = launchCancellationRequested_.load();
+        {
+            std::scoped_lock lock{mutex_};
+            if (sessionGeneration_ == generation) {
+                session_.reset();
+                sessionStopRequested_ = false;
+                ++sessionGeneration_;
+            }
+        }
+        if (cancelled) {
+            try {
+                static_cast<void>(probeHost(hostId));
+            } catch (...) {
+            }
+            return SessionRecord{
+                .hostId = hostId,
+                .appId = appId,
+                .appName = selected.name,
+                .sessionUrl = {},
+                .resumed = resume,
+                .remoteInputKey = {},
+                .remoteInputIv = {},
+            };
+        }
+        std::rethrow_exception(failure);
+    }
     SessionRecord session{
         .hostId = hostId,
         .appId = appId,
@@ -383,7 +582,7 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
         session_ = session;
     }
 
-    auto transport = std::make_unique<StreamSession>(
+    auto transport = std::make_shared<StreamSession>(
         StreamSessionConfig{
             .hostId = hostId,
             .appId = appId,
@@ -392,14 +591,16 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
             .appVersion = current.appVersion,
             .gfeVersion = current.gfeVersion,
             .serverCodecModeSupport = current.serverCodecModeSupport,
-            .settings = settings,
+            .videoFormat = videoFormat,
+            .settings = effectiveSettings,
             .launch = launched,
         },
-        [this, hostId, appId, appName = selected.name, resumed = launched.resumed](
+        [this, hostId, appId, appName = selected.name, resumed = launched.resumed, generation](
             const StreamSessionEvent& event) {
             std::function<void(const SessionUpdate&)> listener;
             {
                 std::scoped_lock lock{mutex_};
+                if (sessionGeneration_ != generation || !session_) return;
                 listener = sessionListener_;
             }
             if (listener) {
@@ -412,15 +613,160 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                     .resumed = resumed,
                 });
             }
+        },
+        [this, generation, hostId, appId, appName = selected.name,
+         resumed = launched.resumed,
+         quitAppAfter = settings.quitAppAfter](StreamSessionEvent event, bool hostEnded,
+                                                  bool userEnded) {
+            requestSessionDisconnect(generation, hostId, appId, appName, resumed,
+                                     std::move(event), hostEnded,
+                                     userEnded && quitAppAfter);
+        },
+        [this, generation, hostId, appId, appName = selected.name, effectiveSettings,
+         videoFormat](
+            const StreamWindowBounds& bounds) {
+            std::function<void(const StreamOverlayRequest&)> listener;
+            {
+                std::scoped_lock lock{mutex_};
+                if (sessionGeneration_ != generation || !session_) return;
+                listener = streamOverlayListener_;
+            }
+            if (listener) {
+                listener({
+                    .hostId = hostId,
+                    .appId = appId,
+                    .appName = appName,
+                    .generation = generation,
+                    .x = bounds.x,
+                    .y = bounds.y,
+                    .width = bounds.width,
+                    .height = bounds.height,
+                    .scaleFactor = bounds.scaleFactor,
+                    .wayland = bounds.wayland,
+                    .fullscreen = bounds.fullscreen,
+                    .settings = effectiveSettings,
+                    .videoFormat = videoFormat,
+                    .controllerMask = connectedGamepadMask(),
+                });
+            }
+        },
+        [this, generation, hostId](const StreamStatisticsSample& sample) {
+            std::function<void(const StreamStatisticsUpdate&)> listener;
+            {
+                std::scoped_lock lock{mutex_};
+                if (sessionGeneration_ != generation || !session_) return;
+                listener = streamStatisticsListener_;
+            }
+            if (listener) {
+                listener({
+                    .hostId = hostId,
+                    .generation = generation,
+                    .sample = sample,
+                });
+            }
         });
+    {
+        std::scoped_lock lock{mutex_};
+        if (sessionGeneration_ != generation || !session_) {
+            transport->requestStop();
+        } else {
+            transport_ = transport;
+            if (sessionStopRequested_) transport->requestStop();
+        }
+    }
     try {
         transport->start();
     } catch (...) {
-        try {
-            gameStream_->cancel(current.address, current.httpsPort, clientId,
-                                current.serverCertificate);
-        } catch (...) {
+        const bool cancelled = transport->stopRequested();
+        bool explicitStop = false;
+        {
+            std::scoped_lock lock{mutex_};
+            explicitStop = sessionGeneration_ == generation && sessionStopRequested_;
         }
+        if (!cancelled && !launched.resumed) {
+            try {
+                gameStream_->cancel(current.address, current.httpsPort, clientId,
+                                    current.serverCertificate);
+            } catch (...) {
+            }
+        }
+        {
+            std::scoped_lock lock{mutex_};
+            if (sessionGeneration_ == generation) {
+                if (transport_ == transport) transport_.reset();
+                session_.reset();
+                sessionStopRequested_ = false;
+                if (!cancelled && !launched.resumed) {
+                    const auto host = std::find_if(
+                        hosts_.begin(), hosts_.end(),
+                        [&](const HostRecord& value) { return value.id == hostId; });
+                    if (host != hosts_.end()) {
+                        host->currentGameId = 0;
+                        host->serverState = "SUNSHINE_SERVER_IDLE";
+                        saveLocked();
+                    }
+                }
+                if (!cancelled || explicitStop) ++sessionGeneration_;
+            }
+        }
+        if (cancelled) return session;
+        throw;
+    }
+    return session;
+}
+
+void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
+    HostRecord current;
+    std::string clientId;
+    std::shared_ptr<StreamSession> transport;
+    std::uint64_t generation = 0;
+    bool ownsSession = false;
+    {
+        std::scoped_lock lock{mutex_};
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
+            return value.id == hostId;
+        });
+        if (host == hosts_.end()) {
+            throw std::invalid_argument("Host no longer exists.");
+        }
+        ownsSession = session_ && session_->hostId == hostId;
+        if (!ownsSession && (!quitHost || host->currentGameId == 0)) {
+            return;
+        }
+        current = *host;
+        clientId = clientId_;
+        if (ownsSession) {
+            generation = sessionGeneration_;
+            sessionStopRequested_ = true;
+            launchCancellationRequested_.store(true);
+            transport = transport_;
+        }
+    }
+
+    if (transport) {
+        transport->requestStop();
+    } else if (ownsSession) {
+        LiInterruptConnection();
+    }
+
+    std::scoped_lock sessionLock{sessionMutex_};
+    if (ownsSession && !transport) {
+        std::scoped_lock lock{mutex_};
+        if (sessionGeneration_ == generation) transport = transport_;
+    }
+    if (transport) transport->stop();
+    {
+        std::scoped_lock lock{mutex_};
+        if (ownsSession && sessionGeneration_ == generation) {
+            if (!transport || transport_ == transport) transport_.reset();
+            session_.reset();
+            sessionStopRequested_ = false;
+            ++sessionGeneration_;
+        }
+    }
+
+    if (quitHost) {
+        gameStream_->cancel(current.address, current.httpsPort, clientId, current.serverCertificate);
         std::scoped_lock lock{mutex_};
         const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
             return value.id == hostId;
@@ -430,56 +776,163 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
             host->serverState = "SUNSHINE_SERVER_IDLE";
             saveLocked();
         }
-        session_.reset();
-        throw;
     }
-    {
-        std::scoped_lock lock{mutex_};
-        transport_ = std::move(transport);
-    }
-    return session;
 }
 
-void ControlPlane::cancelSession(const std::string& hostId) {
-    std::scoped_lock sessionLock{sessionMutex_};
-    HostRecord current;
-    std::string clientId;
-    std::unique_ptr<StreamSession> transport;
+void ControlPlane::resumeStreamOverlay(const std::string& hostId, std::uint64_t generation) {
+    std::shared_ptr<StreamSession> transport;
     {
         std::scoped_lock lock{mutex_};
-        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-            return value.id == hostId;
+        if (!session_ || session_->hostId != hostId || sessionGeneration_ != generation) return;
+        transport = transport_;
+    }
+    if (transport) transport->resumeOverlay();
+}
+
+void ControlPlane::requestSessionDisconnect(std::uint64_t generation,
+                                            std::string hostId, int appId,
+                                            std::string appName, bool resumed,
+                                            StreamSessionEvent event, bool hostEnded,
+                                            bool quitHost) {
+    {
+        std::scoped_lock lock{mutex_};
+        if (sessionGeneration_ != generation) return;
+    }
+    LiInterruptConnection();
+    {
+        std::scoped_lock lock{disconnectMutex_};
+        if (shuttingDown_) return;
+        disconnectRequest_ = DisconnectRequest{
+            .generation = generation,
+            .hostEnded = hostEnded,
+            .quitHost = quitHost,
+            .hostId = std::move(hostId),
+            .appId = appId,
+            .appName = std::move(appName),
+            .resumed = resumed,
+            .state = std::move(event.state),
+            .message = std::move(event.message),
+        };
+    }
+    disconnectCondition_.notify_one();
+}
+
+void ControlPlane::cleanupSessions() {
+    while (true) {
+        DisconnectRequest request;
+        {
+            std::unique_lock lock{disconnectMutex_};
+            disconnectCondition_.wait(lock, [this] {
+                return shuttingDown_ || disconnectRequest_.has_value();
+            });
+            if (shuttingDown_) return;
+            request = *std::exchange(disconnectRequest_, std::nullopt);
+        }
+        try {
+            finishSessionDisconnect(request);
+        } catch (const std::exception& exception) {
+            std::fprintf(stderr, "[eclipse-core] session cleanup failed: %s\n", exception.what());
+        } catch (...) {
+            std::fputs("[eclipse-core] session cleanup failed with an unknown error.\n", stderr);
+        }
+    }
+}
+
+void ControlPlane::finishSessionDisconnect(const DisconnectRequest& request) {
+    std::scoped_lock sessionLock{sessionMutex_};
+    std::shared_ptr<StreamSession> transport;
+    SessionRecord endingSession;
+    HostRecord current;
+    std::string clientId;
+    bool hasHost = false;
+    {
+        std::scoped_lock lock{mutex_};
+        if (sessionGeneration_ != request.generation) return;
+        transport = transport_;
+        endingSession = session_.value_or(SessionRecord{
+            .hostId = request.hostId,
+            .appId = request.appId,
+            .appName = request.appName,
+            .sessionUrl = {},
+            .resumed = request.resumed,
+            .remoteInputKey = {},
+            .remoteInputIv = {},
         });
-        if (host == hosts_.end()) {
-            throw std::invalid_argument("Host no longer exists.");
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
+            return value.id == endingSession.hostId;
+        });
+        if (host != hosts_.end()) {
+            current = *host;
+            hasHost = true;
         }
-        const bool ownsSession = session_ && session_->hostId == hostId;
-        const bool ownsStaleTransport = !session_ && static_cast<bool>(transport_);
-        if (!ownsSession && !ownsStaleTransport && host->currentGameId == 0) {
-            return;
-        }
-        current = *host;
         clientId = clientId_;
-        if (ownsSession || ownsStaleTransport) transport = std::move(transport_);
+    }
+    if (transport) transport->stop();
+
+    bool hostEnded = request.hostEnded;
+    std::string state = request.state;
+    std::string message = request.message;
+    if (request.quitHost && hasHost) {
+        try {
+            gameStream_->cancel(current.address, current.httpsPort, clientId,
+                                current.serverCertificate);
+            hostEnded = true;
+            message = "Render window closed; host application stopped.";
+        } catch (const std::exception& exception) {
+            state = "error";
+            message = std::string{"Stream disconnected, but the host application could not be stopped: "} +
+                      exception.what();
+        }
     }
 
-    if (transport) transport->stop();
-    gameStream_->cancel(current.address, current.httpsPort, clientId, current.serverCertificate);
-    std::scoped_lock lock{mutex_};
-    const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-        return value.id == hostId;
-    });
-    if (host != hosts_.end()) {
-        host->currentGameId = 0;
-        host->serverState = "SUNSHINE_SERVER_IDLE";
-        saveLocked();
+    std::function<void(const SessionUpdate&)> listener;
+    {
+        std::scoped_lock lock{mutex_};
+        if (sessionGeneration_ != request.generation) return;
+        if (!transport || transport_ == transport) transport_.reset();
+        session_.reset();
+        sessionStopRequested_ = false;
+        ++sessionGeneration_;
+        if (hostEnded) {
+            const auto host =
+                std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
+                    return value.id == endingSession.hostId;
+                });
+            if (host != hosts_.end()) {
+                host->currentGameId = 0;
+                host->serverState = "SUNSHINE_SERVER_IDLE";
+                saveLocked();
+            }
+        }
+        listener = sessionListener_;
     }
-    if (session_ && session_->hostId == hostId) session_.reset();
+    if (listener) {
+        listener({
+            .hostId = endingSession.hostId,
+            .appId = endingSession.appId,
+            .appName = endingSession.appName,
+            .state = state,
+            .message = message,
+            .resumed = endingSession.resumed,
+        });
+    }
 }
 
 void ControlPlane::setSessionListener(std::function<void(const SessionUpdate&)> listener) {
     std::scoped_lock lock{mutex_};
     sessionListener_ = std::move(listener);
+}
+
+void ControlPlane::setStreamOverlayListener(
+    std::function<void(const StreamOverlayRequest&)> listener) {
+    std::scoped_lock lock{mutex_};
+    streamOverlayListener_ = std::move(listener);
+}
+
+void ControlPlane::setStreamStatisticsListener(
+    std::function<void(const StreamStatisticsUpdate&)> listener) {
+    std::scoped_lock lock{mutex_};
+    streamStatisticsListener_ = std::move(listener);
 }
 
 HostRecord ControlPlane::pairHost(const std::string& id, const std::string& pin) {
@@ -505,10 +958,21 @@ HostRecord ControlPlane::pairHost(const std::string& id, const std::string& pin)
 
     try {
         current.serverCertificate = gameStream_->pair(current.address, current.httpsPort,
-                                                      current.appVersion, clientId, pin);
+                                                       current.appVersion, clientId, pin);
         current.paired = true;
         current.status = "online";
         current.error.clear();
+        try {
+            const auto info = gameStream_->probe(current.address, current.httpsPort, clientId,
+                                                 current.serverCertificate);
+            if (!info.macAddress.empty()) current.wakeMacAddress = info.macAddress;
+            current.serverState = info.serverState;
+            current.currentGameId = info.currentGameId;
+            current.serverCodecModeSupport = info.serverCodecModeSupport;
+            current.maxLumaPixelsHevc = info.maxLumaPixelsHevc;
+            current.displayModes = info.displayModes;
+        } catch (...) {
+        }
     } catch (const std::exception& exception) {
         current.status = current.serverName.empty() ? "offline" : "online";
         current.error = exception.what();
@@ -534,6 +998,34 @@ HostRecord ControlPlane::pairHost(const std::string& id, const std::string& pin)
     return current;
 }
 
+void ControlPlane::wakeHost(const std::string& id) {
+    MacAddress address{};
+    {
+        std::scoped_lock lock{mutex_};
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
+            return value.id == id;
+        });
+        if (host == hosts_.end()) throw std::invalid_argument("Host no longer exists.");
+        if (host->status != "offline") {
+            throw std::runtime_error("Wake-on-LAN is available only while host is offline.");
+        }
+        const auto parsed = parseMacAddress(host->wakeMacAddress);
+        if (!parsed) {
+            throw std::runtime_error(
+                "Wake-on-LAN is unavailable until this paired host reports a valid MAC address.");
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto previous = lastWakeRequests_.find(id);
+        if (previous != lastWakeRequests_.end() &&
+            now - previous->second < std::chrono::seconds{5}) {
+            throw std::runtime_error("Wait five seconds before sending another wake request.");
+        }
+        lastWakeRequests_[id] = now;
+        address = *parsed;
+    }
+    sendWakeOnLan(address);
+}
+
 void ControlPlane::removeHost(const std::string& id) {
     {
         std::scoped_lock lock{mutex_};
@@ -542,6 +1034,7 @@ void ControlPlane::removeHost(const std::string& id) {
         }
         std::erase_if(hosts_, [&](const HostRecord& host) { return host.id == id; });
         apps_.erase(id);
+        lastWakeRequests_.erase(id);
         saveLocked();
     }
     std::error_code ignored;

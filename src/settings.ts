@@ -1,5 +1,9 @@
 import { z } from 'zod'
 
+export const appModeSchema = z.enum(['gaming', 'workstation'])
+
+export type AppMode = z.infer<typeof appModeSchema>
+
 export const resolutionOptions = [
   { label: '720p', width: 1280, height: 720 },
   { label: '1080p', width: 1920, height: 1080 },
@@ -15,6 +19,7 @@ export const settingsSchema = z.object({
   fps: z.number().int().min(1).max(240),
   bitrateKbps: z.number().int().min(500).max(500_000),
   displayMode: z.enum(['fullscreen', 'borderless', 'windowed']),
+  displayIndex: z.number().int().min(0).max(15),
   enableVsync: z.boolean(),
   framePacing: z.boolean(),
   audioConfig: z.enum(['stereo', '5.1', '7.1']),
@@ -55,6 +60,7 @@ export const defaultSettings: StreamSettings = {
   fps: 60,
   bitrateKbps: 10_000,
   displayMode: 'windowed',
+  displayIndex: 0,
   enableVsync: true,
   framePacing: false,
   audioConfig: 'stereo',
@@ -85,6 +91,15 @@ export const defaultSettings: StreamSettings = {
   autoDiscoverHosts: false,
   detectBlockedConnections: false,
   showPerformanceStats: false,
+}
+
+export const defaultSettingsByMode: Record<AppMode, StreamSettings> = {
+  gaming: { ...defaultSettings },
+  workstation: {
+    ...defaultSettings,
+    gameOptimizations: false,
+    absoluteMouseMode: true,
+  },
 }
 
 export function recommendedBitrate(width: number, height: number, fps: number) {

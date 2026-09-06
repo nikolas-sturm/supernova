@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <compare>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -11,6 +13,16 @@
 
 namespace eclipse {
 
+inline constexpr int kBaselineCodecModeSupport = 0x00000001;
+
+struct HostDisplayMode {
+    int width = 0;
+    int height = 0;
+    int refreshRate = 0;
+
+    auto operator<=>(const HostDisplayMode&) const = default;
+};
+
 struct ServerInfo {
     std::string serverName;
     std::string serverUniqueId;
@@ -19,7 +31,10 @@ struct ServerInfo {
     std::string serverState;
     std::uint16_t httpsPort = 0;
     int currentGameId = 0;
-    int serverCodecModeSupport = 0;
+    int serverCodecModeSupport = kBaselineCodecModeSupport;
+    std::uint64_t maxLumaPixelsHevc = 0;
+    std::vector<HostDisplayMode> displayModes;
+    std::string macAddress;
     bool paired = false;
 };
 
@@ -58,9 +73,10 @@ public:
                                      const std::string& clientId,
                                      const std::string& serverCertificate, int appId) const;
     [[nodiscard]] LaunchResult launch(const std::string& address, std::uint16_t httpsPort,
-                                       const std::string& clientId,
-                                       const std::string& serverCertificate, int appId,
-                                       bool resume, const StreamSettings& settings) const;
+                                        const std::string& clientId,
+                                        const std::string& serverCertificate, int appId,
+                                        bool resume, const StreamSettings& settings,
+                                        const std::atomic_bool* cancellation = nullptr) const;
     void cancel(const std::string& address, std::uint16_t httpsPort,
                 const std::string& clientId, const std::string& serverCertificate) const;
 

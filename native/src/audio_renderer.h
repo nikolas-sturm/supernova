@@ -22,6 +22,8 @@ public:
 
     void initialize(const OPUS_MULTISTREAM_CONFIGURATION& config);
     void submit(const char* data, int length);
+    [[nodiscard]] bool recoveryRequired() const noexcept;
+    [[nodiscard]] static bool supportsOutputChannels(int channels) noexcept;
 
 private:
     struct Impl;

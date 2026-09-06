@@ -30,6 +30,13 @@ body {
   margin: 0;
 }
 
+html.stream-overlay-window,
+html.stream-overlay-window body,
+html.stream-overlay-window #root {
+  min-width: 0;
+  background: transparent;
+}
+
 button,
 input,
 select {

@@ -1,16 +1,20 @@
 #include "gamestream_client.h"
 
 #include "input_forwarder.h"
+#include "wake_on_lan.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cctype>
 #include <cstring>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <ixwebsocket/IXHttpClient.h>
@@ -71,6 +75,24 @@ std::string trim(std::string value) {
     value.erase(value.begin(), std::find_if(value.begin(), value.end(), notSpace));
     value.erase(std::find_if(value.rbegin(), value.rend(), notSpace).base(), value.end());
     return value;
+}
+
+void collectDisplayModes(const pugi::xml_node& node, std::vector<HostDisplayMode>& result) {
+    for (const auto child : node.children()) {
+        if (std::string_view{child.name()} == "DisplayMode") {
+            HostDisplayMode mode{
+                .width = child.child("Width").text().as_int(0),
+                .height = child.child("Height").text().as_int(0),
+                .refreshRate = child.child("RefreshRate").text().as_int(0),
+            };
+            if (mode.width > 0 && mode.width <= 16384 && mode.height > 0 &&
+                mode.height <= 16384 && mode.refreshRate > 0 && mode.refreshRate <= 1000) {
+                result.push_back(mode);
+            }
+        } else {
+            collectDisplayModes(child, result);
+        }
+    }
 }
 
 std::uint16_t parsePort(const std::string& value) {
@@ -142,14 +164,20 @@ std::string compactUuid() {
 }
 
 std::string urlHost(const Endpoint& endpoint) {
-    return endpoint.host.find(':') == std::string::npos ? endpoint.host
-                                                        : "[" + endpoint.host + "]";
+    if (endpoint.host.find(':') == std::string::npos) return endpoint.host;
+    auto host = endpoint.host;
+    for (std::size_t offset = 0; (offset = host.find('%', offset)) != std::string::npos;
+         offset += 3) {
+        host.replace(offset, 1, "%25");
+    }
+    return "[" + host + "]";
 }
 
 std::string request(const Endpoint& endpoint, std::uint16_t port, bool https,
-                    const std::string& command, const std::string& arguments,
-                    const std::string& clientId, const Identity& identity,
-                    const std::string& serverCertificate, int timeoutSeconds) {
+                     const std::string& command, const std::string& arguments,
+                     const std::string& clientId, const Identity& identity,
+                     const std::string& serverCertificate, int timeoutSeconds,
+                     const std::atomic_bool* cancellation = nullptr) {
     const auto url = std::string{https ? "https://" : "http://"} + urlHost(endpoint) + ":" +
                      std::to_string(port) + "/" + command + "?uniqueid=" + clientId +
                      "&uuid=" + compactUuid() + (arguments.empty() ? "" : "&" + arguments);
@@ -174,7 +202,19 @@ std::string request(const Endpoint& endpoint, std::uint16_t port, bool https,
     requestArguments->followRedirects = false;
     requestArguments->compress = false;
     requestArguments->extraHeaders["Connection"] = "close";
+    std::jthread cancellationMonitor;
+    if (cancellation) {
+        requestArguments->cancel.store(cancellation->load());
+        cancellationMonitor = std::jthread(
+            [requestArguments, cancellation](const std::stop_token stopToken) {
+                while (!stopToken.stop_requested() && !cancellation->load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+                }
+                if (cancellation->load()) requestArguments->cancel.store(true);
+            });
+    }
     const auto response = client.get(url, requestArguments);
+    if (cancellationMonitor.joinable()) cancellationMonitor.request_stop();
     if (!response || response->errorCode != ix::HttpErrorCode::Ok) {
         throw std::runtime_error(response ? response->errorMsg : "No HTTP response.");
     }
@@ -397,6 +437,13 @@ ServerInfo GameStreamClient::probe(const std::string& address, std::uint16_t htt
                                   5);
     pugi::xml_document document;
     const auto root = parseRoot(document, response);
+    const auto codecModeNode = root.child("ServerCodecModeSupport");
+    const auto codecModeText = codecModeNode.text().as_string();
+    const auto macAddress = parseMacAddress(childText(root, "mac"));
+    std::vector<HostDisplayMode> displayModes;
+    collectDisplayModes(root, displayModes);
+    std::ranges::sort(displayModes);
+    displayModes.erase(std::unique(displayModes.begin(), displayModes.end()), displayModes.end());
     ServerInfo info{
         .serverName = childText(root, "hostname"),
         .serverUniqueId = childText(root, "uniqueid"),
@@ -406,7 +453,12 @@ ServerInfo GameStreamClient::probe(const std::string& address, std::uint16_t htt
         .httpsPort = static_cast<std::uint16_t>(
             root.child("HttpsPort").text().as_uint(kDefaultHttpsPort)),
         .currentGameId = root.child("currentgame").text().as_int(0),
-        .serverCodecModeSupport = root.child("ServerCodecModeSupport").text().as_int(0),
+        .serverCodecModeSupport = !codecModeNode || codecModeText[0] == '\0'
+                                      ? kBaselineCodecModeSupport
+                                      : codecModeNode.text().as_int(0),
+        .maxLumaPixelsHevc = root.child("MaxLumaPixelsHEVC").text().as_ullong(0),
+        .displayModes = std::move(displayModes),
+        .macAddress = macAddress ? formatMacAddress(*macAddress) : std::string{},
         .paired = childText(root, "PairStatus") == "1",
     };
     if (info.serverName.empty() || info.serverUniqueId.empty()) {
@@ -456,9 +508,10 @@ std::string GameStreamClient::boxArt(const std::string& address, std::uint16_t h
 }
 
 LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t httpsPort,
-                                       const std::string& clientId,
-                                       const std::string& serverCertificate, int appId,
-                                       bool resume, const StreamSettings& settings) const {
+                                        const std::string& clientId,
+                                        const std::string& serverCertificate, int appId,
+                                        bool resume, const StreamSettings& settings,
+                                        const std::atomic_bool* cancellation) const {
     requireSecureRequest(serverCertificate, appId);
     if (appId == 0) {
         throw std::invalid_argument("Application ID is invalid.");
@@ -477,22 +530,30 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
                            static_cast<std::uint32_t>(iv[3]);
     const auto keyId = std::bit_cast<std::int32_t>(keyIdBits);
 
-    const auto gamepadMask =
-        settings.input.forceGamepad ? std::uint16_t{1} : connectedGamepadMask();
+    auto gamepadMask = connectedGamepadMask();
+    if (settings.input.forceGamepad && gamepadTransportAvailable()) gamepadMask |= 1;
+    const std::string hdrArguments = settings.enableHdr
+                                         ? "&hdrMode=1&clientHdrCapVersion=0"
+                                           "&clientHdrCapSupportedFlagsInUint32=0"
+                                           "&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1"
+                                           "&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0"
+                                         : "";
     const auto arguments =
         "appid=" + std::to_string(appId) +
         "&mode=" + std::to_string(settings.width) + "x" + std::to_string(settings.height) +
         "x" + std::to_string(settings.fps) + "&additionalStates=1&sops=" +
         std::to_string(settings.gameOptimizations ? 1 : 0) + "&rikey=" + toHex(key) +
-        "&rikeyid=" + std::to_string(keyId) +
+        "&rikeyid=" + std::to_string(keyId) + hdrArguments +
         "&localAudioPlayMode=" + std::to_string(settings.muteHostAudio ? 0 : 1) +
-        "&surroundAudioInfo=196610&remoteControllersBitmap=" +
+        "&surroundAudioInfo=" + std::to_string(surroundAudioInfo(settings.audioConfig)) +
+        "&remoteControllersBitmap=" +
         std::to_string(gamepadMask) + "&gcmap=" + std::to_string(gamepadMask) +
         "&gcpersist=" + std::to_string(settings.input.forceGamepad ? 1 : 0) + "&corever=1";
     const auto endpoint = parseEndpoint(address);
     const auto response = request(endpoint, httpsPort == 0 ? kDefaultHttpsPort : httpsPort, true,
-                                  resume ? "resume" : "launch", arguments, clientId, identity_,
-                                  serverCertificate, resume ? 30 : kLaunchTimeoutSeconds);
+                                   resume ? "resume" : "launch", arguments, clientId, identity_,
+                                   serverCertificate, resume ? 30 : kLaunchTimeoutSeconds,
+                                   cancellation);
     pugi::xml_document document;
     const auto root = parseRoot(document, response);
     result.sessionUrl = childText(root, "sessionUrl0");
@@ -503,14 +564,18 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
 }
 
 void GameStreamClient::cancel(const std::string& address, std::uint16_t httpsPort,
-                              const std::string& clientId,
-                              const std::string& serverCertificate) const {
+                               const std::string& clientId,
+                               const std::string& serverCertificate) const {
     requireSecureRequest(serverCertificate);
     const auto endpoint = parseEndpoint(address);
     const auto response = request(endpoint, httpsPort == 0 ? kDefaultHttpsPort : httpsPort, true,
                                   "cancel", {}, clientId, identity_, serverCertificate, 30);
     pugi::xml_document document;
     static_cast<void>(parseRoot(document, response));
+    if (probe(address, httpsPort, clientId, serverCertificate).currentGameId != 0) {
+        throw std::runtime_error(
+            "The running application was not started by this client and could not be stopped.");
+    }
 }
 
 std::string GameStreamClient::pair(const std::string& address, std::uint16_t httpsPort,

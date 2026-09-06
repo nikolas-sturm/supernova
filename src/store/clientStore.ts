@@ -1,6 +1,14 @@
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
-import { defaultSettings, type StreamSettings, settingsSchema } from '../settings'
+import { createJSONStorage, persist } from 'zustand/middleware'
+import {
+  type AppMode,
+  appModeSchema,
+  defaultSettings,
+  defaultSettingsByMode,
+  type StreamSettings,
+  settingsSchema,
+} from '../settings'
+import { settingsStorage } from './settingsStorage'
 
 export type BridgeState = 'connecting' | 'ready' | 'preview' | 'error'
 
@@ -25,8 +33,12 @@ export interface Host {
   error: string
   httpsPort: number
   currentGameId: number
+  serverCodecModeSupport: number
+  maxLumaPixelsHevc: number
+  displayModes: Array<{ width: number; height: number; refreshRate: number }>
   lastSeenAt: number
   paired: boolean
+  wakeable?: boolean
 }
 
 export interface PairingUpdate {
@@ -80,7 +92,8 @@ interface ClientState {
   pairing: PairingState | undefined
   library: AppLibrary
   session: SessionUpdate | undefined
-  settings: StreamSettings
+  appMode: AppMode
+  settingsByMode: Record<AppMode, StreamSettings>
   setBridge: (bridge: BridgeStatus) => void
   setHosts: (hosts: Host[]) => void
   setHostError: (hostError?: string) => void
@@ -90,6 +103,7 @@ interface ClientState {
   setLibrary: (library: AppLibrary) => void
   setArtwork: (hostId: string, appId: number, dataUrl: string, error: string) => void
   setSession: (session: SessionUpdate) => void
+  setAppMode: (appMode: AppMode) => void
   updateSettings: (settings: Partial<StreamSettings>) => void
   resetSettings: () => void
   addPreviewHost: (host: Pick<Host, 'name' | 'address'>) => void
@@ -108,7 +122,11 @@ export const useClientStore = create<ClientState>()(
       pairing: undefined,
       library: { hostId: '', state: 'idle', apps: [], message: '' },
       session: undefined,
-      settings: defaultSettings,
+      appMode: 'gaming',
+      settingsByMode: {
+        gaming: { ...defaultSettingsByMode.gaming },
+        workstation: { ...defaultSettingsByMode.workstation },
+      },
       setBridge: (bridge) => set({ bridge }),
       setHosts: (hosts) => set({ hosts, hostError: undefined }),
       setHostError: (hostError) => set({ hostError }),
@@ -153,9 +171,21 @@ export const useClientStore = create<ClientState>()(
               ? { ...session, appId: state.session.appId, appName: state.session.appName }
               : session,
         })),
+      setAppMode: (appMode) => set({ appMode }),
       updateSettings: (settings) =>
-        set((state) => ({ settings: { ...state.settings, ...settings } })),
-      resetSettings: () => set({ settings: defaultSettings }),
+        set((state) => ({
+          settingsByMode: {
+            ...state.settingsByMode,
+            [state.appMode]: { ...state.settingsByMode[state.appMode], ...settings },
+          },
+        })),
+      resetSettings: () =>
+        set((state) => ({
+          settingsByMode: {
+            ...state.settingsByMode,
+            [state.appMode]: { ...defaultSettingsByMode[state.appMode] },
+          },
+        })),
       addPreviewHost: (host) =>
         set((state) => ({
           hosts: [
@@ -171,6 +201,9 @@ export const useClientStore = create<ClientState>()(
               error: 'Native probing requires Neutralino.',
               httpsPort: 0,
               currentGameId: 0,
+              serverCodecModeSupport: 1,
+              maxLumaPixelsHevc: 0,
+              displayModes: [],
               lastSeenAt: 0,
               paired: false,
             },
@@ -179,15 +212,47 @@ export const useClientStore = create<ClientState>()(
     }),
     {
       name: 'eclipse-client-settings',
-      partialize: (state) => ({ settings: state.settings }),
-      merge: (persisted, current) => {
-        const stored = persisted as Partial<ClientState>
-        const settings = settingsSchema.safeParse({ ...defaultSettings, ...stored.settings })
+      storage: createJSONStorage(() => settingsStorage),
+      version: 1,
+      partialize: (state) => ({
+        appMode: state.appMode,
+        settingsByMode: state.settingsByMode,
+      }),
+      migrate: (persisted, version) => {
+        if (version !== 0 || !persisted || typeof persisted !== 'object') return persisted
+        const legacy = persisted as { settings?: Partial<StreamSettings> }
+        const gaming = settingsSchema.safeParse({ ...defaultSettings, ...legacy.settings })
         return {
-          ...current,
-          settings: settings.success ? settings.data : defaultSettings,
+          appMode: 'gaming',
+          settingsByMode: {
+            gaming: gaming.success ? gaming.data : { ...defaultSettingsByMode.gaming },
+            workstation: { ...defaultSettingsByMode.workstation },
+          },
         }
       },
+      merge: (persisted, current) => {
+        const stored = persisted as Partial<ClientState>
+        const appMode = appModeSchema.safeParse(stored.appMode)
+        const gaming = settingsSchema.safeParse({
+          ...defaultSettingsByMode.gaming,
+          ...stored.settingsByMode?.gaming,
+        })
+        const workstation = settingsSchema.safeParse({
+          ...defaultSettingsByMode.workstation,
+          ...stored.settingsByMode?.workstation,
+        })
+        return {
+          ...current,
+          appMode: appMode.success ? appMode.data : 'gaming',
+          settingsByMode: {
+            gaming: gaming.success ? gaming.data : { ...defaultSettingsByMode.gaming },
+            workstation: workstation.success
+              ? workstation.data
+              : { ...defaultSettingsByMode.workstation },
+          },
+        }
+      },
+      skipHydration: true,
     },
   ),
 )
