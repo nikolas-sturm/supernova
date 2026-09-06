@@ -1,0 +1,86 @@
+{
+  "$schema": "https://raw.githubusercontent.com/neutralinojs/neutralinojs/main/schemas/neutralino.config.schema.json",
+  "applicationId": "dev.eclipse.client",
+  "applicationName": "Eclipse",
+  "version": "0.1.0",
+  "description": "Open game streaming client",
+  "defaultMode": "window",
+  "port": 0,
+  "documentRoot": "/build/web/",
+  "url": "/",
+  "enableServer": true,
+  "enableNativeAPI": true,
+  "enableExtensions": true,
+  "tokenSecurity": "one-time",
+  "singlePageServe": true,
+  "dataLocation": "system",
+  "storageLocation": "system",
+  "logging": {
+    "enabled": true,
+    "writeToLogFile": true
+  },
+  "nativeAllowList": [
+    "app.broadcast",
+    "app.exit",
+    "extensions.dispatch",
+    "extensions.getStats",
+    "os.execCommand",
+    "os.spawnProcess",
+    "os.updateSpawnedProcess",
+    "storage.getData",
+    "storage.removeData",
+    "storage.setData",
+    "window.exitFullScreen",
+    "window.isFullScreen",
+    "window.isMaximized",
+    "window.maximize",
+    "window.create",
+    "window.setFullScreen",
+    "window.unmaximize"
+  ],
+  "extensions": [
+    {
+      "id": "dev.eclipse.core",
+      "commandLinux": "\"${NL_PATH}/extensions/eclipse-core/bin/eclipse-core\" --data-path \"${NL_OSDATAPATH}/Eclipse\"",
+      "commandDarwin": "\"${NL_PATH}/extensions/eclipse-core/bin/eclipse-core\" --data-path \"${NL_OSDATAPATH}/Eclipse\"",
+      "commandWindows": "\"${NL_PATH}\\extensions\\eclipse-core\\bin\\eclipse-core.exe\" --data-path \"${NL_OSDATAPATH}\\Eclipse\""
+    }
+  ],
+  "modes": {
+    "window": {
+      "title": "Eclipse",
+      "width": 1280,
+      "height": 800,
+      "minWidth": 760,
+      "minHeight": 560,
+      "center": true,
+      "fullScreen": false,
+      "alwaysOnTop": false,
+      "enableInspector": false,
+      "borderless": false,
+      "maximize": false,
+      "hidden": false,
+      "resizable": true,
+      "exitProcessOnClose": false,
+      "useSavedState": true,
+      "useLogicalPixels": true,
+      "injectGlobals": true,
+      "newWindowPolicy": "browser"
+    }
+  },
+  "cli": {
+    "binaryName": "eclipse",
+    "resourcesPath": "/build/web/",
+    "extensionsPath": "/extensions/",
+    "binaryVersion": "6.9.0",
+    "clientVersion": "6.9.0",
+    "frontendLibrary": {
+      "patchFile": "/index.html",
+      "devUrl": "http://localhost:5173",
+      "projectPath": "/",
+      "initCommand": "npm install",
+      "devCommand": "npm run dev:web",
+      "buildCommand": "npm run build:web"
+    }
+  }
+}

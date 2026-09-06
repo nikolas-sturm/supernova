@@ -1,0 +1,3 @@
+[submodule "refs/moonlight-qt"]
+	path = refs/moonlight-qt
+	url = https://github.com/moonlight-stream/moonlight-qt.git

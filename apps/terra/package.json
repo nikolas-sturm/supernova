@@ -1,0 +1,58 @@
+{
+  "name": "eclipse-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "npm run core:build && neu run -- --window-enable-inspector=true",
+    "dev:web": "vite --clearScreen false",
+    "build:web": "tsc -b && vite build",
+    "core:configure": "cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Debug",
+    "core:build": "npm run core:configure && cmake --build native/build --config Debug",
+    "core:build:release": "cmake -S native -B native/build-release -DCMAKE_BUILD_TYPE=Release && cmake --build native/build-release --config Release",
+    "build": "npm run core:build:release && npm run check && neu build",
+    "bundle": "npm run core:build:release && npm run check && neu build --release",
+    "check": "npm run lint && npm run typecheck && npm run test",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "neutralino:update": "neu update --latest"
+  },
+  "dependencies": {
+    "@neutralinojs/lib": "6.9.0",
+    "@tanstack/charts": "^0.16.0",
+    "lucide-react": "1.35.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "zod": "4.4.3",
+    "zustand": "5.0.15"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.11",
+    "@neutralinojs/neu": "11.7.2",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@types/node": "24.3.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "@vitejs/plugin-react": "6.1.1",
+    "jsdom": "30.0.1",
+    "oxc-transform-react": "0.145.0",
+    "typescript": "7.0.2",
+    "vite": "8.2.2",
+    "vitest": "4.1.11"
+  },
+  "packageManager": "npm@12.0.2+sha512.b885e890b9418fa1693544d05f53e64f9a73ec194837d4258b15fecdd692347b1dd2a517b1b0cbaf9d31cd8e92c3b70956bd2ecc72833a57b4b3098f5bfa7943",
+  "devEngines": {
+    "packageManager": {
+      "name": "npm",
+      "version": "^12.0.2",
+      "onFail": "warn"
+    }
+  }
+}

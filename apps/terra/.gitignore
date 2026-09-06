@@ -1,0 +1,9 @@
+node_modules/
+build/
+dist/
+bin/
+.tmp/
+.storage/
+*.log
+native/build*/
+extensions/eclipse-core/bin/
