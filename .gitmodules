@@ -1,0 +1,51 @@
+[submodule "progenitor/flatpak-builder-tools"]
+	path = apps/progenitor/packaging/linux/flatpak/deps/flatpak-builder-tools
+	url = https://github.com/flatpak/flatpak-builder-tools.git
+[submodule "progenitor/build-deps"]
+	path = apps/progenitor/third-party/build-deps
+	url = https://github.com/LizardByte/build-deps.git
+[submodule "progenitor/doxyconfig"]
+	path = apps/progenitor/third-party/doxyconfig
+	url = https://github.com/LizardByte/doxyconfig.git
+[submodule "progenitor/glad"]
+	path = apps/progenitor/third-party/glad
+	url = https://github.com/Dav1dde/glad.git
+[submodule "progenitor/libdisplaydevice"]
+	path = apps/progenitor/third-party/libdisplaydevice
+	url = https://github.com/LizardByte/libdisplaydevice.git
+[submodule "progenitor/libvirtualhid"]
+	path = apps/progenitor/third-party/libvirtualhid
+	url = https://github.com/LizardByte/libvirtualhid.git
+[submodule "progenitor/lizardbyte-common"]
+	path = apps/progenitor/third-party/lizardbyte-common
+	url = https://github.com/LizardByte/lizardbyte-common.git
+[submodule "progenitor/moonlight-common-c"]
+	path = apps/progenitor/third-party/moonlight-common-c
+	url = https://github.com/moonlight-stream/moonlight-common-c.git
+[submodule "progenitor/nvapi"]
+	path = apps/progenitor/third-party/nvapi
+	url = https://github.com/NVIDIA/nvapi.git
+[submodule "progenitor/plasma-wayland-protocols"]
+	path = apps/progenitor/third-party/plasma-wayland-protocols
+	url = https://github.com/KDE/plasma-wayland-protocols.git
+[submodule "progenitor/Simple-Web-Server"]
+	path = apps/progenitor/third-party/Simple-Web-Server
+	url = https://github.com/LizardByte-infrastructure/Simple-Web-Server.git
+[submodule "progenitor/TPCircularBuffer"]
+	path = apps/progenitor/third-party/TPCircularBuffer
+	url = https://github.com/michaeltyson/TPCircularBuffer.git
+[submodule "progenitor/tray"]
+	path = apps/progenitor/third-party/tray
+	url = https://github.com/LizardByte/tray.git
+[submodule "progenitor/ViGEmClient"]
+	path = apps/progenitor/third-party/ViGEmClient
+	url = https://github.com/LizardByte/Virtual-Gamepad-Emulation-Client.git
+[submodule "progenitor/wayland-protocols"]
+	path = apps/progenitor/third-party/wayland-protocols
+	url = https://github.com/LizardByte-infrastructure/wayland-protocols.git
+[submodule "progenitor/wlr-protocols"]
+	path = apps/progenitor/third-party/wlr-protocols
+	url = https://github.com/LizardByte-infrastructure/wlr-protocols.git
+[submodule "terra/moonlight-qt"]
+	path = apps/terra/refs/moonlight-qt
+	url = https://github.com/moonlight-stream/moonlight-qt.git

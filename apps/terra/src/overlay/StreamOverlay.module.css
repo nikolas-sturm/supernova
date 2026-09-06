@@ -1,4 +1,11 @@
 .overlay {
+  /* Capture surfaces stay dark for legibility over arbitrary streamed content. */
+  --ink: #f3f4ef;
+  --muted: #93959f;
+  --muted-bright: #aeb0b8;
+  --line: #292a32;
+  --acid: #d7ff4f;
+  --violet: #9d7bff;
   position: fixed;
   inset: 0;
   min-width: 320px;

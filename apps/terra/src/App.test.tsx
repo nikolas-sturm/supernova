@@ -1,3 +1,4 @@
+import { useThemeStore } from '@supernova/design-system/theme'
 import { fireEvent, render, screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { App } from './App'
@@ -7,6 +8,7 @@ import { useClientStore } from './store/clientStore'
 describe('App', () => {
   beforeEach(() => {
     localStorage.clear()
+    useThemeStore.getState().setTheme('dark')
     useClientStore.setState({
       bridge: {
         state: 'connecting',
@@ -31,6 +33,21 @@ describe('App', () => {
 
     expect((await screen.findAllByText('Web preview')).length).toBeGreaterThan(0)
     expect(screen.getByText('Connect your first gaming rig')).toBeInTheDocument()
+  })
+
+  it('switches shared themes without resetting client modes or stream settings', () => {
+    render(<App />)
+    const theme = screen.getByRole('combobox', { name: 'Theme' })
+    expect(theme).toHaveValue('dark')
+    fireEvent.change(theme, { target: { value: 'latte' } })
+    expect(document.documentElement.dataset.theme).toBe('latte')
+    expect(localStorage.getItem('theme')).toBe('latte')
+    fireEvent.click(screen.getByRole('button', { name: 'Workstation' }))
+    expect(theme).toHaveValue('latte')
+    expect(useClientStore.getState().settingsByMode.gaming).toEqual(defaultSettings)
+    fireEvent.change(theme, { target: { value: 'dracula' } })
+    expect(document.documentElement.dataset.theme).toBe('dracula')
+    expect(useClientStore.getState().appMode).toBe('workstation')
   })
 
   it('edits and persists the native stream profile', async () => {

@@ -7,11 +7,11 @@
  * to stay compatible with the existing vue-i18n message syntax.
  */
 
-import i18next from 'i18next'
+import i18next, { type i18n as I18n } from 'i18next'
 import { initReactI18next } from 'react-i18next'
 import en from '../../public/assets/locale/en.json'
 
-export const i18n = i18next.createInstance()
+export const i18n: I18n = i18next.createInstance()
 
 i18n.use(initReactI18next).init({
   lng: 'en',

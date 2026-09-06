@@ -7,15 +7,28 @@
  * concrete theme, so only concrete themes are defined here.
  */
 
-/* Dark Theme - Simple clean dark design */
+/* Each concrete palette starts with the original foreground defaults, not the
+   previous selection's foreground. Specific palettes override these below. */
+:root,
+[data-theme] {
+  --color-on-primary: #fff;
+  --color-on-success: #fff;
+  --color-on-danger: #fff;
+  --color-on-info: #1a1a1a;
+  --color-on-warning: #1a1a1a;
+}
+
+/* Eclipse is the default dark palette; the persisted "dark" selector is retained. */
+:root:not([data-theme]),
 [data-theme="dark"] {
   color-scheme: dark;
-  --color-primary: #0d6efd;
-  --color-primary-hover: #3d8bfd;
-  --color-primary-light: #031633;
-  --color-accent: #fd7e14;
-  --color-accent-hover: #fd9843;
-  --color-accent-light: #331e08;
+  --color-primary: #d7ff4f;
+  --color-primary-hover: #e4ff89;
+  --color-primary-light: #202815;
+  --color-accent: #9d7bff;
+  --color-accent-hover: #b69cff;
+  --color-accent-light: #231d35;
+  --color-on-primary: #090a0c;
   --color-success: #198754;
   --color-success-hover: #20c997;
   --color-success-light: #051b11;
@@ -29,19 +42,16 @@
   --color-info-hover: #3dd5f3;
   --color-info-light: #032830;
   --color-on-info: #1a1a1a;
-  --color-bg-base: #212529;
-  --color-bg-subtle: #2c3034;
-  --color-bg-muted: #383d41;
-  --color-surface: #2c3034;
-  --color-surface-raised: #383d41;
-  --color-border: #495057;
-  --color-border-strong: #6c757d;
-  --color-text-base: #f8f9fa;
-  --color-text-muted: #adb5bd;
-  --color-text-subtle: #6c757d;
-  --navbar-bg: linear-gradient(135deg, #ffc400 0%, #ff9d00 100%);
-  --navbar-text: #594400;
-  --navbar-text-muted: #7f6100;
+  --color-bg-base: #08090b;
+  --color-bg-subtle: #101116;
+  --color-bg-muted: #202127;
+  --color-surface: #0e0f13;
+  --color-surface-raised: #17181e;
+  --color-border: #292a32;
+  --color-border-strong: #484a56;
+  --color-text-base: #f3f4ef;
+  --color-text-muted: #aeb0b8;
+  --color-text-subtle: #93959f;
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -1px rgba(0, 0, 0, 0.3);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.4), 0 4px 6px -2px rgba(0, 0, 0, 0.3);
@@ -83,9 +93,6 @@
   --color-text-base: #d8d0c0;
   --color-text-muted: #b0a48d;
   --color-text-subtle: #93866c;
-  --navbar-bg: linear-gradient(135deg, #d06a4c 0%, #c87d52 50%, #c09058 100%);
-  --navbar-text: #282418;
-  --navbar-text-muted: rgba(40, 36, 24, 0.72);
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.5);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.6), 0 2px 4px -1px rgba(0, 0, 0, 0.5);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.6), 0 4px 6px -2px rgba(0, 0, 0, 0.5);
@@ -127,9 +134,6 @@
   --color-text-base: #e6e8ff;
   --color-text-muted: #c3c7f0;
   --color-text-subtle: #9498d0;
-  --navbar-bg: linear-gradient(135deg, #0a0a24 0%, #16165a 50%, #191970 100%);
-  --navbar-text: #e6e8ff;
-  --navbar-text-muted: rgba(230, 232, 255, 0.8);
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.5);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.6), 0 2px 4px -1px rgba(0, 0, 0, 0.5);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.6), 0 4px 6px -2px rgba(0, 0, 0, 0.5);
@@ -171,9 +175,6 @@
   --color-text-base: #e6e8f4;
   --color-text-muted: #c0c6dd;
   --color-text-subtle: #b0bcdf;
-  --navbar-bg: linear-gradient(135deg, #1b1726 0%, #2e2547 50%, #443266 100%);
-  --navbar-text: #e6e8f4;
-  --navbar-text-muted: rgba(230, 232, 244, 0.8);
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.5);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.6), 0 2px 4px -1px rgba(0, 0, 0, 0.5);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.6), 0 4px 6px -2px rgba(0, 0, 0, 0.5);
@@ -211,9 +212,6 @@
   --color-text-base: #eceff4;
   --color-text-muted: #d8dee9;
   --color-text-subtle: #e5e9f0;
-  --navbar-bg: linear-gradient(135deg, #2e3440 0%, #3b4252 100%);
-  --navbar-text: #eceff4;
-  --navbar-text-muted: rgba(236, 239, 244, 0.8);
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.4);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.5), 0 2px 4px -1px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -2px rgba(0, 0, 0, 0.4);
@@ -251,9 +249,6 @@
   --color-text-base: #f1f5f9;
   --color-text-muted: #cbd5e1;
   --color-text-subtle: #94a3b8;
-  --navbar-bg: linear-gradient(135deg, #1e293b 0%, #334155 100%);
-  --navbar-text: #f1f5f9;
-  --navbar-text-muted: rgba(241, 245, 249, 0.8);
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -1px rgba(0, 0, 0, 0.3);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.4), 0 4px 6px -2px rgba(0, 0, 0, 0.3);
@@ -292,11 +287,8 @@
   --color-border: #44475a;
   --color-border-strong: #6272a4;
   --color-text-base: #f8f8f2;
-  --color-text-muted: #6272a4;
-  --color-text-subtle: #6272a4;
-  --navbar-bg: linear-gradient(135deg, #a98fd8 0%, #c792bb 100%);
-  --navbar-text: #282a36;
-  --navbar-text-muted: rgba(40, 42, 54, 0.7);
+  --color-text-muted: #a2acd0;
+  --color-text-subtle: #a2acd0;
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.5);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.6), 0 2px 4px -1px rgba(0, 0, 0, 0.5);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.6), 0 4px 6px -2px rgba(0, 0, 0, 0.5);
@@ -338,9 +330,6 @@
   --color-text-base: #cdd6f4;
   --color-text-muted: #a6adc8;
   --color-text-subtle: #7f849c;
-  --navbar-bg: linear-gradient(135deg, #c9aae8 0%, #e3bdd8 100%);
-  --navbar-text: #1e1e2e;
-  --navbar-text-muted: rgba(30, 30, 46, 0.75);
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.5);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.6), 0 2px 4px -1px rgba(0, 0, 0, 0.5);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.6), 0 4px 6px -2px rgba(0, 0, 0, 0.5);
@@ -380,10 +369,7 @@
   --color-border-strong: #524f67;
   --color-text-base: #e0def4;
   --color-text-muted: #908caa;
-  --color-text-subtle: #6e6a86;
-  --navbar-bg: linear-gradient(135deg, #c4a7e7 0%, #ebbcba 100%);
-  --navbar-text: #191724;
-  --navbar-text-muted: rgba(25, 23, 36, 0.75);
+  --color-text-subtle: #a09bb8;
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.5);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.6), 0 2px 4px -1px rgba(0, 0, 0, 0.5);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.6), 0 4px 6px -2px rgba(0, 0, 0, 0.5);
@@ -421,10 +407,7 @@
   --color-border-strong: #adb5bd;
   --color-text-base: #212529;
   --color-text-muted: #6c757d;
-  --color-text-subtle: #adb5bd;
-  --navbar-bg: linear-gradient(135deg, #ffc400 0%, #ff9d00 100%);
-  --navbar-text: #594400;
-  --navbar-text-muted: #7f6100;
+  --color-text-subtle: #6c757d;
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
@@ -434,8 +417,8 @@
 /* Forest Theme - Green nature tones */
 [data-theme="forest"] {
   color-scheme: light;
-  --color-primary: #10b981;
-  --color-primary-hover: #059669;
+  --color-primary: #087b54;
+  --color-primary-hover: #066442;
   --color-primary-light: #d1fae5;
   --color-accent: #14b8a6;
   --color-accent-hover: #0d9488;
@@ -462,9 +445,6 @@
   --color-text-base: #14532d;
   --color-text-muted: #166534;
   --color-text-subtle: #15803d;
-  --navbar-bg: linear-gradient(135deg, #10b981 0%, #14b8a6 100%);
-  --navbar-text: #ffffff;
-  --navbar-text-muted: rgba(255, 255, 255, 0.9);
 }
 
 /* Indigo Theme - Modern indigo/purple design */
@@ -497,17 +477,14 @@
   --color-border-strong: #d1d5db;
   --color-text-base: #111827;
   --color-text-muted: #6b7280;
-  --color-text-subtle: #9ca3af;
-  --navbar-bg: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%);
-  --navbar-text: #ffffff;
-  --navbar-text-muted: rgba(255, 255, 255, 0.8);
+  --color-text-subtle: #6b7280;
 }
 
 /* Lavender Theme - Soft purple tones */
 [data-theme="lavender"] {
   color-scheme: light;
-  --color-primary: #a78bfa;
-  --color-primary-hover: #8b5cf6;
+  --color-primary: #7953c2;
+  --color-primary-hover: #6541a8;
   --color-primary-light: #ede9fe;
   --color-accent: #c4b5fd;
   --color-accent-hover: #a78bfa;
@@ -534,9 +511,6 @@
   --color-text-base: #4c1d95;
   --color-text-muted: #5b21b6;
   --color-text-subtle: #6d28d9;
-  --navbar-bg: linear-gradient(135deg, #8b5cf6 0%, #a78bfa 100%);
-  --navbar-text: #ffffff;
-  --navbar-text-muted: rgba(255, 255, 255, 0.9);
 }
 
 /* Monochrome Theme - Pure black and white */
@@ -570,16 +544,13 @@
   --color-text-base: #18181b;
   --color-text-muted: #52525b;
   --color-text-subtle: #71717a;
-  --navbar-bg: linear-gradient(135deg, #18181b 0%, #27272a 100%);
-  --navbar-text: #ffffff;
-  --navbar-text-muted: rgba(255, 255, 255, 0.9);
 }
 
 /* Ocean Theme - Cool blue tones */
 [data-theme="ocean"] {
   color-scheme: light;
-  --color-primary: #0ea5e9;
-  --color-primary-hover: #0284c7;
+  --color-primary: #0072a5;
+  --color-primary-hover: #005e89;
   --color-primary-light: #e0f2fe;
   --color-accent: #06b6d4;
   --color-accent-hover: #0891b2;
@@ -606,16 +577,13 @@
   --color-text-base: #0c4a6e;
   --color-text-muted: #075985;
   --color-text-subtle: #0369a1;
-  --navbar-bg: linear-gradient(135deg, #0ea5e9 0%, #06b6d4 100%);
-  --navbar-text: #ffffff;
-  --navbar-text-muted: rgba(255, 255, 255, 0.9);
 }
 
 /* Rose Theme - Elegant pink tones */
 [data-theme="rose"] {
   color-scheme: light;
-  --color-primary: #ec4899;
-  --color-primary-hover: #db2777;
+  --color-primary: #ba236c;
+  --color-primary-hover: #9d1b59;
   --color-primary-light: #fce7f3;
   --color-accent: #f472b6;
   --color-accent-hover: #ec4899;
@@ -642,9 +610,6 @@
   --color-text-base: #881337;
   --color-text-muted: #9f1239;
   --color-text-subtle: #be123c;
-  --navbar-bg: linear-gradient(135deg, #ec4899 0%, #f472b6 100%);
-  --navbar-text: #ffffff;
-  --navbar-text-muted: rgba(255, 255, 255, 0.9);
 }
 
 /* Sunshine Theme - Warm and bright inspired by sunlight */
@@ -679,9 +644,6 @@
   --color-text-base: #78350f;
   --color-text-muted: #92400e;
   --color-text-subtle: #b45309;
-  --navbar-bg: linear-gradient(135deg, #f59e0b 0%, #fb923c 50%, #fbbf24 100%);
-  --navbar-text: #ffffff;
-  --navbar-text-muted: rgba(255, 255, 255, 0.9);
 }
 
 /* Alucard Theme - https://draculatheme.com */
@@ -716,9 +678,6 @@
   --color-text-base: #1f1f1f;
   --color-text-muted: #6c664b;
   --color-text-subtle: #6c664b;
-  --navbar-bg: linear-gradient(135deg, #6a5aa8 0%, #8a4f77 100%);
-  --navbar-text: #ffffff;
-  --navbar-text-muted: rgba(255, 255, 255, 0.85);
 }
 
 /* Catppuccin Latte - https://github.com/catppuccin/catppuccin */
@@ -752,10 +711,7 @@
   --color-border-strong: #acb0be;
   --color-text-base: #4c4f69;
   --color-text-muted: #6c6f85;
-  --color-text-subtle: #8c8fa1;
-  --navbar-bg: linear-gradient(135deg, #7b47d0 0%, #4257c2 100%);
-  --navbar-text: #ffffff;
-  --navbar-text-muted: rgba(255, 255, 255, 0.85);
+  --color-text-subtle: #6c6f85;
 }
 
 /* Ember Light Theme */
@@ -789,10 +745,7 @@
   --color-border-strong: #a89c7a;
   --color-text-base: #282418;
   --color-text-muted: #6c664b;
-  --color-text-subtle: #8a8264;
-  --navbar-bg: linear-gradient(135deg, #b84c30 0%, #a5562c 50%, #946030 100%);
-  --navbar-text: #ffffff;
-  --navbar-text-muted: rgba(255, 255, 255, 0.85);
+  --color-text-subtle: #6c664b;
 }
 
 /* Rosé Pine Dawn Theme - https://rosepinetheme.com */
@@ -827,8 +780,5 @@
   --color-border-strong: #cecacd;
   --color-text-base: #575279;
   --color-text-muted: #797593;
-  --color-text-subtle: #9893a5;
-  --navbar-bg: linear-gradient(135deg, #907aa9 0%, #d7827e 100%);
-  --navbar-text: #ffffff;
-  --navbar-text-muted: rgba(255, 255, 255, 0.85);
+  --color-text-subtle: #797593;
 }

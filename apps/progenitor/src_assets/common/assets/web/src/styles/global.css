@@ -2,29 +2,12 @@
  * @file Global styles: reset, base typography, and shared utility classes.
  *
  * Components use CSS Modules; only element-level defaults live here.
- * Theme tokens (`../theme/tokens.css`) and palettes (`../theme/themes.css`)
- * are imported by the application bootstrap before this stylesheet.
+ * Shared document defaults and palettes come from @supernova/design-system.
  */
 
-* {
-  box-sizing: border-box;
-}
-
-html {
-  min-width: 320px;
-  background: var(--color-bg-base);
-}
-
 body {
-  min-width: 320px;
-  min-height: 100vh;
-  margin: 0;
-  background: var(--color-bg-base);
-  color: var(--color-text-base);
-  font-family: var(--font-body);
-  font-size: 0.95rem;
+  font-size: 0.875rem;
   line-height: 1.5;
-  -webkit-font-smoothing: antialiased;
 }
 
 h1,
@@ -36,11 +19,13 @@ h6 {
   margin: 0 0 var(--spacing-sm);
   color: var(--color-text-base);
   font-weight: 650;
+  font-family: var(--font-display);
   line-height: 1.25;
 }
 
 h1 {
-  font-size: 1.6rem;
+  font-size: clamp(30px, 4vw, 47px);
+  letter-spacing: -0.035em;
 }
 
 h2 {
@@ -82,44 +67,28 @@ pre {
   word-break: break-word;
 }
 
-button,
-input,
-select,
-textarea {
-  font: inherit;
-  color: inherit;
-}
-
-button {
-  cursor: pointer;
-  transition:
-    background-color var(--transition-fast),
-    border-color var(--transition-fast),
-    color var(--transition-fast),
-    box-shadow var(--transition-fast),
-    transform var(--transition-fast);
-}
-
-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.6;
-}
-
-:focus-visible {
-  outline: 2px solid var(--color-primary);
-  outline-offset: 2px;
-}
-
-::selection {
-  color: var(--color-on-primary);
-  background: var(--color-primary);
-}
-
 /* Shared page container */
 .page {
   max-width: var(--content-max-width);
-  margin: 0 auto;
-  padding: var(--spacing-lg);
+  margin: 0 0 0 var(--sidebar-width);
+  padding: 36px clamp(24px, 4vw, 64px) 64px;
+  min-width: 0;
+}
+
+.page::before {
+  content: "ECLIPSE / HOST ADMINISTRATION";
+  display: block;
+  margin-bottom: 18px;
+  color: var(--color-accent);
+  font: 650 10px / 1.4 var(--font-mono);
+  letter-spacing: 0.14em;
+}
+.page > h1 + p {
+  margin-bottom: 32px;
+  color: var(--color-text-muted);
+}
+.simplePage {
+  margin-inline: auto;
 }
 
 /* Row of buttons/links */
@@ -128,15 +97,6 @@ button:disabled {
   flex-wrap: wrap;
   gap: var(--spacing-sm);
   align-items: center;
-}
-
-/* Anchor sharing the .button styling via ui.module.css */
-.buttonLink {
-  text-decoration: none;
-}
-
-.buttonLink:hover {
-  text-decoration: none;
 }
 
 /* Release update banner header */
@@ -168,7 +128,7 @@ button:disabled {
 .twoColumn,
 .welcomeColumns {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
   gap: var(--spacing-lg);
   align-items: start;
 }
@@ -208,9 +168,10 @@ button:disabled {
   margin-bottom: var(--spacing-md);
 }
 
-.inputWithIcon .field,
+.inputWithIcon > div,
 .inputWithIcon input {
   flex: 1;
+  min-width: 0;
   margin-bottom: 0;
 }
 
@@ -273,7 +234,7 @@ button:disabled {
 
 /* Apps page toolbar */
 .appsHeader {
-  margin: var(--spacing-lg) 0 var(--spacing-md);
+  margin: 0 0 var(--spacing-xl);
 }
 
 .appsHeader p {
@@ -330,7 +291,7 @@ button:disabled {
 /* App card grid */
 .appGrid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 200px), 1fr));
   gap: var(--spacing-md);
 }
 
@@ -388,7 +349,8 @@ button:disabled {
   transition: opacity var(--transition-base);
 }
 
-.appCard:hover .appPosterOverlay {
+.appCard:hover .appPosterOverlay,
+.appCard:focus-within .appPosterOverlay {
   opacity: 1;
 }
 
@@ -434,21 +396,7 @@ button:disabled {
   text-align: center;
 }
 
-/* Card-based page sections */
-.card {
-  margin: 0 0 var(--spacing-lg);
-  padding: var(--spacing-lg);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-sm);
-}
-
-.cardTitle {
-  margin-bottom: var(--spacing-md);
-}
-
-.centeredForm .card {
+.centeredForm > div {
   width: min(480px, 100%);
 }
 
@@ -456,6 +404,11 @@ button:disabled {
 .table {
   width: 100%;
   border-collapse: collapse;
+}
+
+.tableScroll {
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 .table th,
@@ -492,6 +445,18 @@ button:disabled {
   clip: rect(0 0 0 0);
   white-space: nowrap;
   border: 0;
+}
+
+@media (max-width: 1000px) {
+  .page {
+    margin-inline: auto;
+  }
+}
+
+@media (hover: none) {
+  .appPosterOverlay {
+    opacity: 1;
+  }
 }
 
 @media (max-width: 720px) {

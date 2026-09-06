@@ -2,8 +2,8 @@ import fs from 'node:fs'
 import { resolve } from 'node:path'
 import process from 'node:process'
 import { codecovVitePlugin } from '@codecov/vite-plugin'
-import react from '@vitejs/plugin-react'
 import { defineConfig, type Plugin } from 'vite'
+import { browserTarget, reactCompiler } from '../../tooling/frontend/config.ts'
 
 /**
  * Source and destination paths for the web UI.
@@ -66,8 +66,9 @@ function sunshineHtmlRewrite(): Plugin {
       server.middlewares.use((req, _res, next) => {
         if (req.url) {
           const match = req.url.match(/^\/([A-Za-z]+)(\?.*)?$/)
-          if (match && pageNames.has(match[1].toLowerCase())) {
-            req.url = `/${match[1].toLowerCase()}.html${match[2] ?? ''}`
+          const page = match?.[1]?.toLowerCase()
+          if (page && pageNames.has(page)) {
+            req.url = `/${page}.html${match?.[2] ?? ''}`
           }
         }
         next()
@@ -85,15 +86,13 @@ export default defineConfig({
   },
   base: './',
   plugins: [
-    react({
-      compiler: { target: '19' },
-    }),
+    reactCompiler(),
     sunshineHtmlRewrite(),
     // The Codecov vite plugin should be after all other plugins
     codecovVitePlugin({
       enableBundleAnalysis: true,
       bundleName: 'sunshine',
-      uploadToken: process.env.CODECOV_TOKEN,
+      ...(process.env.CODECOV_TOKEN ? { uploadToken: process.env.CODECOV_TOKEN } : {}),
       gitService: 'github',
       dryRun: process.env.GITHUB_REPOSITORY !== 'LizardByte/Sunshine',
       telemetry: process.env.GITHUB_REPOSITORY === 'LizardByte/Sunshine',
@@ -101,7 +100,9 @@ export default defineConfig({
   ],
   root: resolve(assetsSrcPath),
   server: {
+    host: '127.0.0.1',
     port: 5173,
+    strictPort: true,
     proxy: {
       '/api': {
         target: 'https://localhost:47990',
@@ -113,7 +114,7 @@ export default defineConfig({
   },
   build: {
     outDir: resolve(assetsDstPath),
-    target: 'es2022',
+    target: browserTarget,
     rollupOptions: {
       input: {
         apps: resolve(assetsSrcPath, 'apps.html'),

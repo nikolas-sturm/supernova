@@ -82,7 +82,7 @@ export function SimplePage({ children }: SimplePageProps) {
   return (
     <>
       <SimpleNavbar />
-      <main className="page">{children}</main>
+      <main className="page simplePage">{children}</main>
     </>
   )
 }

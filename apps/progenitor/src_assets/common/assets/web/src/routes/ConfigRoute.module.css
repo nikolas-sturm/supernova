@@ -1,13 +1,13 @@
 .layout {
   display: grid;
-  grid-template-columns: 240px 1fr;
+  grid-template-columns: 200px minmax(0, 1fr);
   gap: var(--spacing-lg);
   align-items: start;
 }
 
 .sidebar {
   position: sticky;
-  top: calc(var(--navbar-height) + var(--spacing-md));
+  top: var(--spacing-lg);
   display: flex;
   flex-direction: column;
   gap: var(--spacing-xs);
@@ -53,6 +53,8 @@
 
 .tabActive {
   background: var(--color-primary-light);
+  color: var(--color-primary);
+  box-shadow: inset 2px 0 var(--color-primary);
   font-weight: 600;
 }
 
@@ -102,7 +104,7 @@
 }
 
 .searchBox input:focus {
-  outline: none;
+  outline: 2px solid var(--color-accent);
 }
 
 .searchStatus {
@@ -114,7 +116,7 @@
   transition: background-color var(--transition-base);
 }
 
-@media (max-width: 860px) {
+@media (max-width: 1100px) {
   .layout {
     grid-template-columns: 1fr;
   }

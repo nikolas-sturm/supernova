@@ -1,3 +1,4 @@
+import { Button, EclipseBrand, ThemePicker } from '@supernova/design-system'
 import {
   Activity,
   ArrowRight,
@@ -380,13 +381,7 @@ export function App() {
         </div>
 
         <div className={styles.brand}>
-          <span className={styles.brandMark} aria-hidden="true">
-            <span />
-          </span>
-          <div>
-            <strong>ECLIPSE</strong>
-            <small>OPEN STREAM CLIENT</small>
-          </div>
+          <EclipseBrand subtitle="TERRA / OPEN STREAM CLIENT" />
         </div>
 
         <ModeSwitch value={appMode} onChange={setAppMode} label="Application mode" />
@@ -451,19 +446,16 @@ export function App() {
             <h1>{viewTitles[activeView]}</h1>
           </div>
           <div className={styles.headerActions}>
+            <ThemePicker />
             <div className={`${styles.corePill} ${styles[bridge.state]}`}>
               <span />
               {bridge.label}
             </div>
             {(hostsView || activeView === 'workspaces') && (
-              <button
-                className={styles.primaryButton}
-                type="button"
-                onClick={() => setShowAddHost(true)}
-              >
+              <Button type="button" onClick={() => setShowAddHost(true)}>
                 <Plus size={18} />
                 Add computer
-              </button>
+              </Button>
             )}
           </div>
         </header>
@@ -738,10 +730,10 @@ export function App() {
                       {settings.width} × {settings.height}
                     </strong>
                   </span>
-                  <span className={styles.workspaceAppArt}>
+                  <span>
                     FRAME RATE <strong>{settings.fps} FPS</strong>
                   </span>
-                  <span className={styles.workspaceAppCopy}>
+                  <span>
                     BITRATE <strong>{(settings.bitrateKbps / 1000).toFixed(1)} Mbps</strong>
                   </span>
                   <span>
@@ -869,14 +861,14 @@ export function App() {
                               disabled={sessionBusy && activeSession?.appId !== app.id}
                               onClick={() => void handleLaunch(selectedHost.id, app.id)}
                             >
-                              <span>
+                              <span className={styles.workspaceAppArt}>
                                 {app.artDataUrl ? (
                                   <img src={app.artDataUrl} alt="" />
                                 ) : (
                                   <Monitor size={18} />
                                 )}
                               </span>
-                              <span>
+                              <span className={styles.workspaceAppCopy}>
                                 <strong>{app.name}</strong>
                                 <small>{running ? 'READY TO RESUME' : 'OPEN REMOTELY'}</small>
                               </span>
@@ -1015,10 +1007,10 @@ export function App() {
                 Host or IP address
                 <input name="address" placeholder="192.168.1.40" autoComplete="off" required />
               </label>
-              <button className={styles.primaryButton} type="submit">
+              <Button type="submit">
                 Save computer
                 <ArrowRight size={17} />
-              </button>
+              </Button>
             </form>
           </section>
         </div>

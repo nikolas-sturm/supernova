@@ -1,0 +1,7 @@
+{
+  "name": "native-tooling",
+  "projectType": "library",
+  "targets": {
+    "test": { "command": "node --test tooling/native/build.test.mjs", "cache": false }
+  }
+}

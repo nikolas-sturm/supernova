@@ -18,6 +18,7 @@
   max-height: calc(100vh - 4rem);
   background: var(--color-surface);
   border: 1px solid var(--color-border);
+  border-top: 2px solid var(--color-accent);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-xl);
 }
@@ -69,41 +70,9 @@
 
 .footer {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--spacing-sm);
   justify-content: flex-end;
   padding: var(--spacing-md) var(--spacing-lg);
   border-top: 1px solid var(--color-border);
-}
-
-.plainButton {
-  padding: 0.45rem 0.9rem;
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  background: var(--color-bg-muted);
-  color: var(--color-text-base);
-  font-weight: 550;
-}
-
-.plainButton:hover:not(:disabled) {
-  background: var(--color-border);
-}
-
-.primary {
-  background: var(--color-primary);
-  border-color: var(--color-primary);
-  color: var(--color-on-primary);
-}
-
-.primary:hover:not(:disabled) {
-  background: var(--color-primary-hover);
-}
-
-.danger {
-  background: var(--color-danger);
-  border-color: var(--color-danger);
-  color: var(--color-on-danger);
-}
-
-.danger:hover:not(:disabled) {
-  background: var(--color-danger-hover);
 }

@@ -1,0 +1,27 @@
+{
+  "name": "@supernova/design-system",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "nx": {
+    "includedScripts": []
+  },
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "scripts": {
+    "lint": "biome check .",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test tests/contracts.test.mjs"
+  },
+  "exports": {
+    ".": "./src/index.tsx",
+    "./theme": "./src/theme.ts",
+    "./styles.css": "./src/styles.css",
+    "./primitives.module.css": "./src/primitives.module.css"
+  },
+  "peerDependencies": {
+    "react": "^19.2.0",
+    "zustand": "^5.0.0"
+  }
+}

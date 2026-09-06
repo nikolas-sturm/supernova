@@ -44,9 +44,17 @@ if(WIN32)
             COPYONLY)
 endif()
 
-# install built vite assets
-install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assets/web"
-        DESTINATION "${SUNSHINE_ASSETS_DIR}")
+# Packaging must consume a completed web build, not just the tray icons above.
+install(CODE "
+    if(NOT EXISTS \"${SUNSHINE_WEB_ASSETS_DIR}/index.html\")
+        message(FATAL_ERROR \"Web assets missing: ${SUNSHINE_WEB_ASSETS_DIR}/index.html. Build and stage the web UI before packaging.\")
+    endif()
+")
+install(DIRECTORY "${SUNSHINE_WEB_ASSETS_DIR}/"
+        DESTINATION "${SUNSHINE_ASSETS_DIR}/web")
+# Tray icons are native assets and may not be present in an external web stage.
+install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assets/web/images"
+        DESTINATION "${SUNSHINE_ASSETS_DIR}/web")
 
 # platform specific packaging
 if(WIN32)

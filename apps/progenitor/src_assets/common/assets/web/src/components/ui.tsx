@@ -2,45 +2,16 @@
  * @file Core UI primitives: buttons, cards, alerts, badges, spinner.
  */
 
+import { buttonClassName, type Variant } from '@supernova/design-system'
+import styles from '@supernova/design-system/primitives.module.css'
 import { Link } from '@tanstack/react-router'
 import { AlertCircle, AlertTriangle, CheckCircle, Info, type LucideProps } from 'lucide-react'
-import type { ButtonHTMLAttributes, HTMLAttributes, ReactNode } from 'react'
+import type { HTMLAttributes, ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import styles from './ui.module.css'
 
+export type { ButtonProps, Variant } from '@supernova/design-system'
 /** Visual variant shared by buttons and alerts. */
-export type Variant = 'primary' | 'secondary' | 'success' | 'danger' | 'warning' | 'info'
-
-export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
-  /** Visual variant. */
-  variant?: Variant
-  /** Outlined style instead of filled. */
-  outline?: boolean
-  /** Compact size. */
-  small?: boolean
-}
-
-/**
- * @brief Themed action button.
- * @param props Button props plus variant modifiers.
- * @returns The button element.
- */
-export function Button({
-  variant = 'primary',
-  outline = false,
-  small = false,
-  className,
-  ...rest
-}: ButtonProps) {
-  const classes = [
-    styles.button,
-    styles[variant],
-    outline ? styles.outline : '',
-    small ? styles.small : '',
-    className ?? '',
-  ]
-  return <button type="button" {...rest} className={classes.filter(Boolean).join(' ')} />
-}
+export { Button } from '@supernova/design-system'
 
 export interface LinkButtonProps {
   /** External URL; takes precedence over `to`. */
@@ -76,15 +47,7 @@ export function LinkButton({
   className,
   title,
 }: LinkButtonProps) {
-  const classes = [
-    'buttonLink',
-    styles.button,
-    styles[variant],
-    outline ? styles.outline : '',
-    small ? styles.small : '',
-    className ?? '',
-  ]
-  const resolvedClassName = classes.filter(Boolean).join(' ')
+  const resolvedClassName = buttonClassName({ variant, outline, small, className })
   if (href !== undefined) {
     return (
       <a

@@ -1,0 +1,35 @@
+name: Workspace
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm --version
+      - run: npm ci
+      # Direct validation until automation process lifetime with Nx is resolved.
+      # This job does not validate native compilation or hardware streaming.
+      - run: npm run check:workspace
+      - run: npm run build --workspace apps/progenitor
+      - run: npm run build:web --workspace apps/terra

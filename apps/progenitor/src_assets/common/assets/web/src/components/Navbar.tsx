@@ -5,6 +5,7 @@
  * is the minimal bar used by the welcome and logout pages.
  */
 
+import { EclipseBrand } from '@supernova/design-system'
 import { Link, useRouterState } from '@tanstack/react-router'
 import {
   CircleUserRound,
@@ -26,6 +27,7 @@ import { ThemeMenu } from './ThemeMenu'
 const navItems = [
   { to: '/', labelKey: 'navbar.home', icon: Home },
   { to: '/pin', labelKey: 'navbar.pin', icon: Lock },
+  { to: '/clients', labelKey: 'clients.title', icon: CircleUserRound },
   { to: '/apps', labelKey: 'navbar.applications', icon: Layers },
   { to: '/featured', labelKey: 'navbar.featured', icon: Star },
   { to: '/config', labelKey: 'navbar.configuration', icon: Settings },
@@ -87,10 +89,10 @@ export function AppNavbar() {
   }, [pathname])
 
   return (
-    <nav className={styles.navbar}>
+    <nav className={styles.navbar} aria-label="Primary navigation">
       <div className={styles.inner}>
-        <Link to="/" className={styles.brand} title="Sunshine">
-          <img src="./images/logo-sunshine-45.png" height={40} alt="Sunshine" />
+        <Link to="/" className={styles.brand} title="Eclipse / Progenitor host">
+          <EclipseBrand subtitle="PROGENITOR / HOST ADMIN" />
         </Link>
         <button
           type="button"
@@ -108,7 +110,11 @@ export function AppNavbar() {
               const Icon = item.icon
               return (
                 <li key={item.to}>
-                  <Link to={item.to} className={`${styles.link} ${active ? styles.active : ''}`}>
+                  <Link
+                    to={item.to}
+                    aria-current={active ? 'page' : undefined}
+                    className={`${styles.link} ${active ? styles.active : ''}`}
+                  >
                     <Icon size={18} aria-hidden />
                     {t(item.labelKey)}
                   </Link>
@@ -162,10 +168,10 @@ export function AppNavbar() {
  */
 export function SimpleNavbar() {
   return (
-    <nav className={styles.navbar}>
+    <nav className={`${styles.navbar} ${styles.simple}`} aria-label="Primary navigation">
       <div className={styles.inner}>
-        <span className={styles.brand} title="Sunshine">
-          <img src="./images/logo-sunshine-45.png" height={40} alt="Sunshine" />
+        <span className={styles.brand} title="Eclipse / Progenitor host">
+          <EclipseBrand subtitle="PROGENITOR / HOST ADMIN" />
         </span>
         <ThemeMenu />
       </div>

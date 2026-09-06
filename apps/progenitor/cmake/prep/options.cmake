@@ -9,7 +9,9 @@ set(SUNSHINE_PUBLISHER_ISSUE_URL "https://app.lizardbyte.dev/support"
 
 option(BUILD_DOCS "Build documentation" ON)
 option(BUILD_TESTS "Build tests" ON)
-option(NPM_OFFLINE "Use offline npm packages. You must ensure packages are in your npm cache." OFF)
+option(SUNSHINE_BUILD_WEB_UI "Build the web UI with the native build (requires root npm install)" ON)
+set(SUNSHINE_WEB_ASSETS_DIR "${CMAKE_BINARY_DIR}/assets/web"
+        CACHE PATH "Staged web assets consumed by installation and packaging")
 
 option(BUILD_WERROR "Enable -Werror flag." OFF)
 

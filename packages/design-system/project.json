@@ -1,0 +1,16 @@
+{
+  "name": "design-system",
+  "projectType": "library",
+  "targets": {
+    "lint": { "command": "biome check packages/design-system" },
+    "typecheck": { "command": "tsc -p packages/design-system/tsconfig.json" },
+    "test": {
+      "command": "node --test packages/design-system/tests/contracts.test.mjs",
+      "inputs": [
+        "default",
+        "{workspaceRoot}/apps/terra/src/**/*",
+        "{workspaceRoot}/apps/progenitor/src_assets/common/assets/web/src/**/*"
+      ]
+    }
+  }
+}

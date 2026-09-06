@@ -1,15 +1,11 @@
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vitest/config'
+import { browserTests } from '../../tooling/frontend/config.ts'
 
 export default defineConfig({
   plugins: [react()],
   test: {
-    execArgv: ['--no-experimental-webstorage'],
-    environment: 'jsdom',
+    ...browserTests,
     setupFiles: ['./src/test/setup.ts'],
-    css: true,
-    coverage: {
-      reporter: ['text', 'html'],
-    },
   },
 })

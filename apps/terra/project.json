@@ -1,0 +1,58 @@
+{
+  "name": "terra",
+  "projectType": "application",
+  "implicitDependencies": ["design-system", "native-tooling"],
+  "targets": {
+    "lint": { "command": "npm run lint --workspace apps/terra" },
+    "typecheck": { "command": "npm run typecheck --workspace apps/terra" },
+    "test": { "command": "npm run test --workspace apps/terra" },
+    "build:web": {
+      "command": "npm run build:web --workspace apps/terra",
+      "outputs": ["{projectRoot}/build/web"]
+    },
+    "dev:web": {
+      "command": "npm run dev:web --workspace apps/terra",
+      "continuous": true,
+      "cache": false
+    },
+    "dev": { "command": "npm run dev --workspace apps/terra", "continuous": true, "cache": false },
+    "bundle": {
+      "command": "npm run bundle --workspace apps/terra",
+      "cache": false,
+      "parallelism": false
+    },
+    "native:configure": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "debug",
+      "options": { "command": "node tooling/native/build.mjs terra configure debug" },
+      "configurations": {
+        "debug": {},
+        "release": { "command": "node tooling/native/build.mjs terra configure release" }
+      }
+    },
+    "native:build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "parallelism": false,
+      "dependsOn": ["native:configure"],
+      "defaultConfiguration": "debug",
+      "options": { "command": "node tooling/native/build.mjs terra build debug" },
+      "configurations": {
+        "debug": {},
+        "release": { "command": "node tooling/native/build.mjs terra build release" }
+      }
+    },
+    "native:test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["native:build"],
+      "defaultConfiguration": "debug",
+      "options": { "command": "node tooling/native/build.mjs terra test debug" },
+      "configurations": {
+        "debug": {},
+        "release": { "command": "node tooling/native/build.mjs terra test release" }
+      }
+    }
+  }
+}

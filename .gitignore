@@ -8,3 +8,4 @@ node_modules/
 **/.venv/
 **/*.tsbuildinfo
 **/extensions/eclipse-core/bin/
+**/.native-stage.lock

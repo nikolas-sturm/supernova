@@ -1,0 +1,61 @@
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--color-text-base);
+  text-align: left;
+}
+.brand strong,
+.brand small {
+  display: block;
+}
+.brand strong {
+  font: 700 19px / 1 var(--font-display);
+  letter-spacing: 0.16em;
+}
+.brand small {
+  margin-top: 7px;
+  color: var(--color-text-muted);
+  font: 600 9px / 1.3 var(--font-mono);
+  letter-spacing: 0.1em;
+}
+.mark {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--color-primary);
+  mask-image: radial-gradient(circle at 75% 25%, transparent 0 48%, #000 50%);
+}
+.themePicker {
+  display: flex;
+  align-items: end;
+  gap: 6px;
+  min-width: 0;
+}
+.themePicker label {
+  display: grid;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+}
+.themePicker label > span {
+  color: var(--color-text-muted);
+  font: 650 10px / 1.3 var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.themePicker select {
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  padding: 7px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-subtle);
+  color: var(--color-text-base);
+  font-size: 12px;
+}
+.themePicker button {
+  min-height: 40px;
+}

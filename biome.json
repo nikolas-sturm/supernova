@@ -1,0 +1,37 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.11/schema.json",
+  "files": {
+    "includes": [
+      "*.json",
+      "apps/*/*.json",
+      "apps/*/*.ts",
+      "apps/terra/index.html",
+      "apps/terra/src/**",
+      "apps/progenitor/src_assets/common/assets/web/*.html",
+      "apps/progenitor/src_assets/common/assets/web/src/**",
+      "packages/**",
+      "tooling/**",
+      "!!**/node_modules",
+      "!!**/.git",
+      "!!**/.nx",
+      "!!**/third-party",
+      "!!**/refs",
+      "!!**/cmake-build-*",
+      "!!**/build",
+      "!!**/build-release",
+      "!!**/dist",
+      "!!**/coverage",
+      "!!**/public",
+      "!!**/packaging",
+      "!!**/.venv",
+      "!!**/extensions",
+      "!!**/package-lock.json",
+      "!!apps/progenitor/renovate.json"
+    ]
+  },
+  "formatter": { "enabled": true, "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },
+  "linter": { "enabled": true, "rules": { "preset": "recommended" } },
+  "javascript": {
+    "formatter": { "quoteStyle": "single", "semicolons": "asNeeded", "trailingCommas": "all" }
+  }
+}

@@ -76,9 +76,9 @@
     "clientVersion": "6.9.0",
     "frontendLibrary": {
       "patchFile": "/index.html",
-      "devUrl": "http://localhost:5173",
+      "devUrl": "http://localhost:5174",
       "projectPath": "/",
-      "initCommand": "npm install",
+      "initCommand": "npm ci --prefix ../..",
       "devCommand": "npm run dev:web",
       "buildCommand": "npm run build:web"
     }

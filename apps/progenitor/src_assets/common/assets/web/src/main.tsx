@@ -15,8 +15,7 @@ import { initI18n } from './i18n'
 import { queryClient } from './queries'
 import { createAppRouter } from './router'
 import { useThemeStore } from './store/themeStore'
-import './theme/tokens.css'
-import './theme/themes.css'
+import '@supernova/design-system/styles.css'
 import './styles/global.css'
 
 /**

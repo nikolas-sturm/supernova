@@ -2,6 +2,7 @@
  * @file Accessible modal dialog with promise-friendly API.
  */
 
+import { Button } from '@supernova/design-system'
 import { X } from 'lucide-react'
 import { type ReactNode, useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
@@ -129,16 +130,12 @@ export function ConfirmDialog({
       size="md"
       footer={
         <>
-          <button type="button" className={styles.plainButton} onClick={onCancel}>
+          <Button variant="secondary" onClick={onCancel}>
             {t('_common.cancel')}
-          </button>
-          <button
-            type="button"
-            className={`${styles.plainButton} ${styles[confirmVariant]}`}
-            onClick={onConfirm}
-          >
+          </Button>
+          <Button variant={confirmVariant} onClick={onConfirm}>
             {confirmLabel}
-          </button>
+          </Button>
         </>
       }
     >

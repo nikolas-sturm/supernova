@@ -1,20 +1,16 @@
-import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
+import { browserTarget, reactCompiler } from '../../tooling/frontend/config.ts'
 
 export default defineConfig({
-  plugins: [
-    react({
-      compiler: { target: '19' },
-    }),
-  ],
+  plugins: [reactCompiler()],
   build: {
     outDir: 'build/web',
     emptyOutDir: true,
-    target: 'es2022',
+    target: browserTarget,
   },
   server: {
     host: '127.0.0.1',
-    port: 5173,
+    port: 5174,
     strictPort: true,
   },
 })

@@ -21,7 +21,7 @@ option(ECLIPSE_ENABLE_LIBPLACEBO "Enable Vulkan HDR and YUV 4:4:4 presentation o
 set(ECLIPSE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 set(MOONLIGHT_QT_ROOT "${ECLIPSE_ROOT}/refs/moonlight-qt")
 set(MOONLIGHT_COMMON_ROOT "${MOONLIGHT_QT_ROOT}/moonlight-common-c/moonlight-common-c")
-set(ECLIPSE_EXTENSION_OUTPUT "${ECLIPSE_ROOT}/extensions/eclipse-core/bin")
+set(ECLIPSE_EXTENSION_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/extension/$<CONFIG>")
 
 if(NOT EXISTS "${MOONLIGHT_QT_ROOT}/.git")
   message(FATAL_ERROR "Moonlight submodule missing. Run: git submodule update --init --recursive")
@@ -124,6 +124,9 @@ if(ECLIPSE_LINK_MOONLIGHT_COMMON)
 endif()
 
 find_package(OpenSSL REQUIRED)
+
+# Dependencies retain their upstream standards; first-party C++ uses C++23.
+set(CMAKE_CXX_STANDARD 23)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (ECLIPSE_ENABLE_LINUX_VIDEO OR ECLIPSE_ENABLE_LINUX_AUDIO))
   find_package(PkgConfig REQUIRED)
@@ -311,14 +314,18 @@ if(WIN32)
   )
 endif()
 
-foreach(configuration Debug Release RelWithDebInfo MinSizeRel)
-  string(TOUPPER "${configuration}" configuration_upper)
-  set_target_properties(
-    eclipse-core
-    PROPERTIES
-      "RUNTIME_OUTPUT_DIRECTORY_${configuration_upper}" "${ECLIPSE_EXTENSION_OUTPUT}"
-  )
-endforeach()
+# Shared runtime location is populated only by an explicit staging operation.
+add_custom_target(stage-extension
+  COMMAND "${CMAKE_COMMAND}"
+    "-DECLIPSE_STAGE_SOURCE=${ECLIPSE_EXTENSION_OUTPUT}"
+    "-DECLIPSE_STAGE_DESTINATION=${ECLIPSE_ROOT}/extensions/eclipse-core/bin"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StageExtension.cmake"
+  DEPENDS eclipse-core
+  VERBATIM
+)
+if(TARGET eclipse-wayland-overlay)
+  add_dependencies(stage-extension eclipse-wayland-overlay)
+endif()
 
 if(BUILD_TESTING)
   find_package(Threads REQUIRED)
