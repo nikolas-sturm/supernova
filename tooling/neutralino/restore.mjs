@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -28,11 +29,16 @@ export function restore({
       )
     }
   }
-  const cli = path.join(root, 'node_modules/@neutralinojs/neu/bin/neu.js')
-  if (!existsSync(cli))
+  let cli
+  try {
+    // The dependency belongs to Terra; isolated linkers need not hoist it to root.
+    cli = createRequire(path.join(app, 'package.json')).resolve('@neutralinojs/neu/bin/neu.js')
+  } catch (error) {
     throw new Error(
-      'Neutralino CLI missing. Run npm ci at the repository root with development dependencies enabled.',
+      'Neutralino CLI is not resolvable from the Terra workspace. Install workspace development dependencies before restoring the runtime.',
+      { cause: error },
     )
+  }
   console.log(
     `[setup] Restoring Neutralino ${config.cli.binaryVersion} from the pinned project configuration`,
   )

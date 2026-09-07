@@ -9,16 +9,33 @@
       "{workspaceRoot}/biome.json",
       "{workspaceRoot}/tsconfig.base.json",
       "{workspaceRoot}/tooling/frontend/**/*",
-      { "runtime": "node --version" },
-      { "runtime": "node -p \"process.platform + '-' + process.arch\"" }
+      {
+        "runtime": "node --version"
+      },
+      {
+        "runtime": "node -p \"process.platform + '-' + process.arch\""
+      }
     ],
     "default": ["{projectRoot}/**/*", "sharedGlobals"],
     "production": ["default", "!{projectRoot}/**/*.test.*", "!{projectRoot}/**/test/**"]
   },
   "targetDefaults": {
-    "lint": { "cache": true, "inputs": ["default", "^default"] },
-    "typecheck": { "cache": true, "inputs": ["default", "^default"] },
-    "test": { "cache": true, "inputs": ["default", "^default"] },
-    "build:web": { "cache": true, "inputs": ["production", "^production"] }
-  }
+    "lint": {
+      "cache": true,
+      "inputs": ["default", "^default"]
+    },
+    "typecheck": {
+      "cache": true,
+      "inputs": ["default", "^default"]
+    },
+    "test": {
+      "cache": true,
+      "inputs": ["default", "^default"]
+    },
+    "build:web": {
+      "cache": true,
+      "inputs": ["production", "^production"]
+    }
+  },
+  "analytics": false
 }
