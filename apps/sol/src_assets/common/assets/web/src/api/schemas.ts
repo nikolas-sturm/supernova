@@ -16,6 +16,7 @@ export const localeResponseSchema = z.object({
 
 /** Response of `GET /api/config`. */
 export const configSchema = z.looseObject({
+  username: z.string().optional(),
   platform: z.string().catch(''),
   status: z.union([z.string(), z.boolean()]).optional(),
   version: z.string().optional(),

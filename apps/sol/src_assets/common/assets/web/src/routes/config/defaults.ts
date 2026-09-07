@@ -238,6 +238,7 @@ export function populateConfigDraft(
   delete draft.platform
   delete draft.status
   delete draft.version
+  delete draft.username
 
   for (const optionKey of SPECIAL_OPTIONS) {
     const value = draft[optionKey]

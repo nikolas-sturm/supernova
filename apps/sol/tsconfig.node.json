@@ -8,5 +8,5 @@
     "lib": ["ES2023"],
     "types": ["node"]
   },
-  "include": ["vite.config.ts", "vitest.config.ts", "../../tooling/frontend/*.ts"]
+  "include": ["vite.config.ts", "vite.auth.ts", "vitest.config.ts", "../../tooling/frontend/*.ts"]
 }

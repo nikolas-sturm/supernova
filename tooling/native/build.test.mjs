@@ -94,6 +94,71 @@ const cmake =
     : 'cmake'
 const hasCmake = spawnSync(cmake, ['--version']).status === 0
 
+test('WiX installs once, reuses the exact pin, and rejects mismatched or broken tools', {
+  skip: !hasCmake,
+}, () => {
+  const temporary = mkdtempSync(path.join(tmpdir(), 'supernova-wix-'))
+  try {
+    const bootstrap = readFileSync(
+      new URL('../../apps/sol/cmake/packaging/windows_wix.cmake', import.meta.url),
+      'utf8',
+    ).split('# Set WiX-specific variables')[0]
+    const bootstrapPath = path.join(temporary, 'bootstrap.cmake')
+    writeFileSync(bootstrapPath, bootstrap)
+    const script = path.join(temporary, 'fixture.cmake')
+    writeFileSync(
+      script,
+      `
+cmake_minimum_required(VERSION 3.24)
+set(DOTNET_EXECUTABLE "fixture-dotnet")
+set(CMAKE_BINARY_DIR "\${FIXTURE_DIR}")
+function(execute_process)
+  cmake_parse_arguments(R "OUTPUT_STRIP_TRAILING_WHITESPACE" "RESULT_VARIABLE;OUTPUT_VARIABLE;ERROR_VARIABLE;WORKING_DIRECTORY" "COMMAND" \${ARGN})
+  set(result 0)
+  if("\${R_COMMAND}" MATCHES ";tool;install;")
+    file(APPEND "\${FIXTURE_DIR}/installs" "install\\n")
+    file(WRITE "\${FIXTURE_DIR}/.wix/wix.exe" "fixture")
+  elseif("\${R_COMMAND}" MATCHES ";--version$")
+    set(result "\${VERSION_RESULT}")
+    set(\${R_OUTPUT_VARIABLE} "\${FAKE_VERSION}" PARENT_SCOPE)
+  endif()
+  set(\${R_RESULT_VARIABLE} "\${result}" PARENT_SCOPE)
+  set(\${R_ERROR_VARIABLE} "" PARENT_SCOPE)
+endfunction()
+include("${bootstrapPath.replaceAll('\\', '/')}")
+include("${bootstrapPath.replaceAll('\\', '/')}")
+`,
+    )
+    for (const [version, status, success] of [
+      ['4.0.4+a8592982', '0', true],
+      ['5.0.0', '0', false],
+      ['4.0.4', '1', false],
+    ]) {
+      const fixture = path.join(temporary, `${version}-${status}`)
+      mkdirSync(fixture)
+      const result = spawnSync(
+        cmake,
+        [
+          `-DFIXTURE_DIR=${fixture.replaceAll('\\', '/')}`,
+          `-DFAKE_VERSION=${version}`,
+          `-DVERSION_RESULT=${status}`,
+          '-P',
+          script,
+        ],
+        { encoding: 'utf8', timeout: 10000 },
+      )
+      if (success) assert.equal(result.status, 0, result.stderr)
+      else {
+        assert.notEqual(result.status, 0)
+        assert.match(result.stderr, /Expected WiX 4.0.4/)
+      }
+      assert.equal(readFileSync(path.join(fixture, 'installs'), 'utf8').trim(), 'install')
+    }
+  } finally {
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
 test('Terra staging replaces generated runtime files and preserves unrelated files', {
   skip: !hasCmake,
 }, () => {

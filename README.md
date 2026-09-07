@@ -42,16 +42,22 @@ not install them. See [Development](docs/development.md) before native builds.
 ## Commands
 
 Nx is the intended orchestrator, installed in this workspace rather than globally.
-Root npm scripts invoke that local installation:
+Most root npm scripts invoke that local installation. The full development session
+uses a foreground supervisor for ordered native builds and process cleanup:
 
 | Command | Purpose |
 | --- | --- |
+| `npm run dev` | Start Sol at `https://localhost:47990` and Terra desktop; watch frontend changes |
 | `npm run check` | Nx lint, typecheck, and test targets |
 | `npm run build` | Both frontend builds, not native packages |
-| `npm run dev:sol` | Sol web development server |
-| `npm run dev:terra` | Terra browser preview, without the native core |
+| `npm run dev:sol` | Build/start Sol backend and HTTPS web UI on 47990 |
+| `npm run dev:terra` | Build/start Terra native desktop app, including its core |
 | `npm run graph` | Nx project graph |
 | `npm run check:workspace` | Direct checks plus tooling and Nx exit regression tests |
+
+`npm run dev` requires native toolchains and the pinned Neutralino shell to be
+installed first. It fails rather than downloading missing tools or bypassing
+native build errors. See [Full Local Session](docs/development.md#full-local-session).
 
 Nx's optional daemon is disabled in `nx.json`: the automation runner waits on
 surviving detached processes even after the Nx client exits. Graph generation
@@ -60,9 +66,10 @@ and task caching remain available without the daemon. See
 
 Windows extraction failures were traced to directory watchers locking native build
 trees. Shared Vite watcher exclusions now prevent those locks. Before the naming
-migration, Terra's UCRT64 debug build and six native tests passed; the host got past
-dependency extraction but encountered a WiX restore error. Native builds after the
-rename remain unverified. See
+migration, Terra's UCRT64 debug build and six native tests passed. Sol and Terra
+now build and start through `npm run dev`; version-checked WiX reuse fixes the
+repeat-configure failure. Windows live startup, Terra's Core ready UI, and
+desktop-close shutdown have been verified. Full streaming remains unverified. See
 [Migration Verification](docs/migration-status.md). Windows CMake 4.4.2, Ninja,
 and GCC 16.2 are present in UCRT64. Local NixOS WSL lacks Node.js, CMake, Ninja,
 and a compiler; Linux builds are not locally verified.

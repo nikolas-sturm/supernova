@@ -1,4 +1,4 @@
-/** @file Terra shell tests: retain admin destinations and mobile navigation. */
+/** @file Sol shell tests: retain admin destinations and mobile navigation. */
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -16,7 +16,7 @@ vi.mock('@tanstack/react-router', () => ({
 
 afterEach(cleanup)
 
-describe('Terra admin navigation', () => {
+describe('Sol admin navigation', () => {
   it('retains admin destinations and marks the current client-management page', () => {
     render(<AppNavbar />)
     const destinations = screen.getAllByRole('link').map((link) => link.getAttribute('href'))
@@ -35,9 +35,10 @@ describe('Terra admin navigation', () => {
       'aria-current',
       'page',
     )
-    expect(screen.getByText('TERRA')).toBeInTheDocument()
-    expect(screen.getByText('SOL / HOST ADMIN')).toBeInTheDocument()
-    expect(screen.getByTitle('Terra / Sol host')).toHaveAttribute('href', '/')
+    expect(screen.getByText('SOL')).toBeInTheDocument()
+    expect(screen.queryByText('TERRA')).not.toBeInTheDocument()
+    expect(screen.getByText('HOST ADMIN')).toBeInTheDocument()
+    expect(screen.getByTitle('Sol host')).toHaveAttribute('href', '/')
     fireEvent.click(screen.getByRole('button', { name: 'User menu' }))
     expect(screen.getByRole('menuitem', { name: /navbar.password/ })).toHaveAttribute(
       'href',
@@ -58,9 +59,10 @@ describe('Terra admin navigation', () => {
 
   it('keeps unauthenticated chrome free of admin links', () => {
     render(<SimpleNavbar />)
-    expect(screen.getByText('TERRA')).toBeInTheDocument()
-    expect(screen.getByText('SOL / HOST ADMIN')).toBeInTheDocument()
-    expect(screen.getByTitle('Terra / Sol host')).toBeInTheDocument()
+    expect(screen.getByText('SOL')).toBeInTheDocument()
+    expect(screen.queryByText('TERRA')).not.toBeInTheDocument()
+    expect(screen.getByText('HOST ADMIN')).toBeInTheDocument()
+    expect(screen.getByTitle('Sol host')).toBeInTheDocument()
     expect(screen.queryByRole('link')).not.toBeInTheDocument()
     expect(screen.getByRole('combobox')).toBeInTheDocument()
   })

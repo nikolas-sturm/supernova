@@ -2,6 +2,9 @@
   "name": "frontend-tooling",
   "projectType": "library",
   "targets": {
-    "test": { "command": "node --test tooling/frontend/config.test.mjs", "cache": false }
+    "test": {
+      "command": "node --test tooling/frontend/config.test.mjs tooling/frontend/sol-auth.test.mjs tooling/dev.test.mjs",
+      "cache": false
+    }
   }
 }

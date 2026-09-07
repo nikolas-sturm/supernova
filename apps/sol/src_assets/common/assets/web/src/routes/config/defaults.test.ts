@@ -44,7 +44,7 @@ describe('tabsForPlatform', () => {
 describe('populateConfigDraft', () => {
   it('fills missing keys with tab defaults', () => {
     const draft = populateConfigDraft(
-      { platform: 'windows', version: '1.0', sunshine_name: 'PC' },
+      { platform: 'windows', version: '1.0', sunshine_name: 'PC', username: 'account-user' },
       CONFIG_TABS,
     )
     expect(draft.sunshine_name).toBe('PC')
@@ -53,6 +53,7 @@ describe('populateConfigDraft', () => {
     expect(draft.sw_preset).toBe('superfast')
     expect(draft.platform).toBeUndefined()
     expect(draft.version).toBeUndefined()
+    expect(draft.username).toBeUndefined()
   })
 
   it('parses JSON-stringified special options', () => {

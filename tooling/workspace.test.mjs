@@ -45,7 +45,8 @@ test('workspace uses one lockfile and one first-party language toolchain', () =>
   ]) {
     assert.equal(git('check-attr', 'eol', '--', file).trim(), `${file}: eol: lf`)
   }
-  assert.equal(manifest.scripts['dev:sol'], 'nx run sol:dev:web')
+  assert.equal(manifest.scripts['dev:sol'], 'node tooling/dev.mjs sol')
+  assert.equal(manifest.scripts['dev:terra'], 'node tooling/dev.mjs terra')
   assert.deepEqual(
     Object.keys(manifest.scripts)
       .filter((name) => name.startsWith('dev:'))
@@ -101,6 +102,36 @@ test('native targets stay uncached with complete configuration chains', () => {
     }
     assert.deepEqual(targets['native:build'].dependsOn, ['native:configure'])
     assert.deepEqual(targets['native:test'].dependsOn, ['native:build'])
+  }
+})
+
+test('Sol preserves Sunshine port defaults, offsets, and discovery mapping', () => {
+  const upstream = '74273db90c7eb8ce6b6d07d009ffc4066f015611'
+  const original = (file) => git('show', `${upstream}:src/${file}`)
+  const basePattern = /(\d+),\s*\/\/ Base port number/
+  const base = Number(read('apps/sol/src/config.cpp').match(basePattern)?.[1])
+  assert.equal(base, 47989)
+  assert.equal(base, Number(original('config.cpp').match(basePattern)?.[1]))
+  for (const [file, symbol, port] of [
+    ['nvhttp.h', 'PORT_HTTPS', 47984],
+    ['nvhttp.h', 'PORT_HTTP', 47989],
+    ['confighttp.h', 'PORT_HTTPS', 47990],
+    ['rtsp.h', 'RTSP_SETUP_PORT', 48010],
+    ['stream.h', 'VIDEO_STREAM_PORT', 47998],
+    ['stream.h', 'CONTROL_PORT', 47999],
+    ['stream.h', 'AUDIO_STREAM_PORT', 48000],
+  ]) {
+    const pattern = new RegExp(`constexpr auto ${symbol} = (-?\\d+);`)
+    const current = read(`apps/sol/src/${file}`).match(pattern)?.[1]
+    assert.notEqual(current, undefined)
+    assert.equal(current, original(file).match(pattern)?.[1], `${symbol}: upstream offset changed`)
+    assert.equal(base + Number(current), port)
+  }
+  for (const platform of ['windows', 'linux']) {
+    assert.match(
+      read(`apps/sol/src/platform/${platform}/publish.cpp`),
+      /net::map_port\(nvhttp::PORT_HTTP\)/,
+    )
   }
 })
 

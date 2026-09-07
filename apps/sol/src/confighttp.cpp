@@ -1430,7 +1430,7 @@ namespace confighttp {
   }
 
   /**
-   * @brief Get the configuration settings.
+   * @brief Get configuration settings and the authenticated account's display username.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
    *
@@ -1454,6 +1454,8 @@ namespace confighttp {
       output_tree[name] = std::move(value);
     }
 
+    // Account identity is response metadata, not a configurable host name.
+    output_tree["username"] = config::sol.username;
     send_response(response, output_tree);
   }
 

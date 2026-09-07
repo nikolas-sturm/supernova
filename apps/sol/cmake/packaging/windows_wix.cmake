@@ -19,16 +19,30 @@ set(WIX_BUILD_DIRECTORY "${CPACK_PACKAGE_DIRECTORY}/_CPack_Packages/win64/WIX")
 set(WIX_TOOL_PATH "${CMAKE_BINARY_DIR}/.wix")
 file(MAKE_DIRECTORY ${WIX_TOOL_PATH})
 
-# Install WiX locally using dotnet
-execute_process(
-        COMMAND ${DOTNET_EXECUTABLE} tool install --tool-path ${WIX_TOOL_PATH} wix --version ${WIX_VERSION}
-        ERROR_VARIABLE WIX_INSTALL_OUTPUT
-        RESULT_VARIABLE WIX_INSTALL_RESULT
-)
+# Reinstalling an existing dotnet tool can fail during package resolution.
+# Reuse only the pinned executable; never silently accept a different version.
+if(NOT EXISTS "${WIX_TOOL_PATH}/wix.exe")
+    execute_process(
+            COMMAND "${DOTNET_EXECUTABLE}" tool install --tool-path "${WIX_TOOL_PATH}" wix --version "${WIX_VERSION}"
+            OUTPUT_VARIABLE WIX_INSTALL_STDOUT
+            ERROR_VARIABLE WIX_INSTALL_OUTPUT
+            RESULT_VARIABLE WIX_INSTALL_RESULT
+    )
+    if(NOT WIX_INSTALL_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to install WiX ${WIX_VERSION}: ${WIX_INSTALL_STDOUT}\n${WIX_INSTALL_OUTPUT}")
+    endif()
+endif()
 
-if(NOT WIX_INSTALL_RESULT EQUAL 0)
-    message(FATAL_ERROR "Failed to install WiX tools locally.
-     WiX packaging may not work correctly, error: ${WIX_INSTALL_OUTPUT}")
+execute_process(
+        COMMAND "${WIX_TOOL_PATH}/wix.exe" --version
+        OUTPUT_VARIABLE WIX_INSTALLED_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_VARIABLE WIX_VERSION_ERROR
+        RESULT_VARIABLE WIX_VERSION_RESULT
+)
+string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" WIX_INSTALLED_RELEASE "${WIX_INSTALLED_VERSION}")
+if(NOT WIX_VERSION_RESULT EQUAL 0 OR NOT WIX_INSTALLED_RELEASE STREQUAL WIX_VERSION)
+    message(FATAL_ERROR "Expected WiX ${WIX_VERSION} at ${WIX_TOOL_PATH}, got '${WIX_INSTALLED_VERSION}': ${WIX_VERSION_ERROR}")
 endif()
 
 # Install WiX UI Extension

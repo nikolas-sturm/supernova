@@ -14,16 +14,17 @@
   },
   "packageManager": "npm@12.0.2",
   "scripts": {
+    "dev": "node tooling/dev.mjs",
     "check": "nx run-many -t lint,typecheck,test",
     "build": "nx run-many -t build:web",
-    "dev:sol": "nx run sol:dev:web",
-    "dev:terra": "nx run terra:dev:web",
+    "dev:sol": "node tooling/dev.mjs sol",
+    "dev:terra": "node tooling/dev.mjs terra",
     "lint": "nx run-many -t lint",
     "typecheck": "nx run-many -t typecheck",
     "test": "nx run-many -t test",
     "graph": "nx graph",
     "format": "biome check --write .",
-    "test:tooling": "node --test tooling/native/build.test.mjs tooling/workspace.test.mjs tooling/frontend/config.test.mjs",
+    "test:tooling": "node --test tooling/native/build.test.mjs tooling/workspace.test.mjs tooling/frontend/config.test.mjs tooling/frontend/sol-auth.test.mjs tooling/dev.test.mjs",
     "check:workspace": "biome check . && npm run typecheck --workspaces --if-present && npm run test --workspaces --if-present && npm run test:tooling"
   },
   "devDependencies": {

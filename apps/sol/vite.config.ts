@@ -2,8 +2,9 @@ import fs from 'node:fs'
 import { resolve } from 'node:path'
 import process from 'node:process'
 import { codecovVitePlugin } from '@codecov/vite-plugin'
-import { defineConfig, type Plugin } from 'vite'
+import { defineConfig } from 'vite'
 import { browserTarget, nativeWatchIgnored, reactCompiler } from '../../tooling/frontend/config.ts'
+import { solApiProxy, solHtmlRewrite } from './vite.auth.ts'
 
 /**
  * Source and destination paths for the web UI.
@@ -28,49 +29,6 @@ if (process.env.SOL_BUILD_HOMEBREW) {
     const path = resolve(fs.realpathSync(process.env.SOL_ASSETS_DIR), 'assets/web')
     console.log(`Using destdir from Cmake: ${path}`)
     assetsDstPath = path
-  }
-}
-
-/**
- * Page names served by the Sol backend. The backend maps routes like
- * `/apps` to `apps.html`; in the dev server we rewrite such requests so
- * client-side routing works with a plain page reload.
- */
-const pageNames = new Set([
-  'apps',
-  'clients',
-  'config',
-  'featured',
-  'index',
-  'logout',
-  'password',
-  'pin',
-  'troubleshooting',
-  'welcome',
-])
-
-/**
- * Dev-server middleware that rewrites extension-less page requests
- * (`/apps`) to their HTML shells (`/apps.html`) so a reload during
- * development keeps working with TanStack Router's pathname-based routes.
- * @returns The Vite plugin.
- */
-function solHtmlRewrite(): Plugin {
-  return {
-    name: 'sol-html-rewrite',
-    apply: 'serve',
-    configureServer(server) {
-      server.middlewares.use((req, _res, next) => {
-        if (req.url) {
-          const match = req.url.match(/^\/([A-Za-z]+)(\?.*)?$/)
-          const page = match?.[1]?.toLowerCase()
-          if (page && pageNames.has(page)) {
-            req.url = `/${page}.html${match?.[2] ?? ''}`
-          }
-        }
-        next()
-      })
-    },
   }
 }
 
@@ -102,12 +60,7 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
-      '/api': {
-        target: 'https://localhost:47990',
-        changeOrigin: true,
-        secure: false,
-        ws: false,
-      },
+      '/api': solApiProxy(process.env.SUPERNOVA_SOL_ADMIN_PORT || '47990'),
     },
   },
   build: {

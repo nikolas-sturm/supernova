@@ -176,6 +176,7 @@ protected:
     server->config.reuse_address = true;
     server->config.timeout_request = 5;
     server->config.timeout_content = 300;
+    server->resource["^/config-test$"]["GET"] = confighttp::getConfig;
 
     // Add a route to test authentication directly
     server->resource["^/auth-test$"]["GET"] = [](
@@ -531,6 +532,7 @@ INSTANTIATE_TEST_SUITE_P(
   AuthenticatedConfigHttpEndpointTest,
   testing::Values(
     endpoint_request_t {"Page", "GET", "/page-test", ""},
+    endpoint_request_t {"Config", "GET", "/config-test", ""},
     endpoint_request_t {"CsrfToken", "GET", "/csrf-token-test", ""},
     endpoint_request_t {"BrowseDirectory", "GET", "/browse-test", ""},
     endpoint_request_t {"PairingList", "GET", "/pairing-test", ""},
@@ -540,6 +542,23 @@ INSTANTIATE_TEST_SUITE_P(
   ),
   endpoint_request_name
 );
+
+/** @brief Configuration exposes authenticated account identity without credential material. */
+TEST_F(ConfigHttpTest, ConfigReturnsAuthenticatedUsername) {
+  const auto original_file = config::sol.config_file;
+  const auto restore = util::fail_guard([&]() { config::sol.config_file = original_file; });
+  config::sol.config_file = (test_web_dir / "config-response.conf").string();
+  std::ofstream(config::sol.config_file) << "username = not-the-account\nsunshine_name = Host PC\n";
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto response = client->request("GET", "/config-test", "", headers);
+  ASSERT_EQ(response->status_code, "200 OK");
+  const auto body = nlohmann::json::parse(response->content.string());
+  EXPECT_EQ(body["username"], "testuser");
+  EXPECT_EQ(body["sunshine_name"], "Host PC");
+  EXPECT_FALSE(body.contains("password"));
+  EXPECT_FALSE(body.contains("salt"));
+}
 
 TEST_P(CsrfProtectedConfigHttpEndpointTest, RejectsCrossOriginRequestWithoutToken) {
   const auto &request = GetParam();

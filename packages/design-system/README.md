@@ -11,7 +11,7 @@ must include `packages/*`. Existing React 19.2 and Zustand 5 satisfy peer depend
 
 ```tsx
 import '@supernova/design-system/styles.css'
-import { Button, TerraBrand, ThemePicker } from '@supernova/design-system'
+import { AppBrand, Button, ThemePicker } from '@supernova/design-system'
 import { useThemeStore } from '@supernova/design-system/theme'
 
 const dispose = useThemeStore.getState().initialize()
@@ -20,7 +20,7 @@ const dispose = useThemeStore.getState().initialize()
 
 ## Exports
 
-- `.`: `Button`, `buttonClassName`, `ButtonProps`, `Variant`, `TerraBrand`, `ThemePicker`.
+- `.`: `Button`, `buttonClassName`, `ButtonProps`, `Variant`, `AppBrand`, `ThemePicker`.
 - `./theme`: `themeOptions`, `ThemePreference`, `isThemePreference`, `getStoredThemePreference`, `resolveTheme`, `useThemeStore`.
 - `./styles.css`: tokens, palettes, document reset/base, reduced-motion defaults.
 - `./primitives.module.css`: shared button, card, alert, badge, spinner, and heading styles. Admin-specific router and translation adapters remain in Sol.

@@ -5,7 +5,7 @@ product names. The directory, npm package, Nx project, and frontend identity use
 Terra is the official client name, replacing Moonlight/Eclipse product branding.
 Upstream Moonlight dependencies retain their names. Host symbols use `sol`, `Sol`, or `SOL`;
 private client-integration symbols, files, namespaces, and tests use `terra` or
-`Terra`. Shared branding uses `TerraBrand`, renders `TERRA`, and uses
+`Terra`. Shared branding uses `AppBrand` with `product="SOL"`, renders `SOL`, and uses
 `data-terra-button` without old aliases. All 21 themes, the `dark` default, and
 the existing `/eclipse/v1` API route namespace remain unchanged. Windows and Linux are the
 only supported platforms.

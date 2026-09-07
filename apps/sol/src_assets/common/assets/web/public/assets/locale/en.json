@@ -462,7 +462,8 @@
     "virtualhid_not_installed_title": "libvirtualhid Driver Not Installed",
     "virtualhid_outdated_desc": "The installed libvirtualhid driver version (v{version}) is not supported. Supported versions: {supported_versions}.",
     "virtualhid_outdated_title": "libvirtualhid Driver Outdated",
-    "welcome": "Hello, Sol!"
+    "welcome": "Hello, {{username}}!",
+    "welcome_generic": "Hello!"
   },
   "navbar": {
     "applications": "Applications",

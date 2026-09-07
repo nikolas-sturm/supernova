@@ -24,6 +24,70 @@ not the latest upstream revisions. Install npm dependencies once at the root.
 
 ## Frontend And Checks
 
+### Full Local Session
+
+```sh
+npm run dev
+```
+
+Run either application independently with `npm run dev:sol` or `npm run dev:terra`.
+Each command builds and launches that application's native runtime, not a
+browser-only preview. Sol-only startup does not require Neutralino; Terra-only
+startup does not build Sol or reserve any host streaming ports.
+
+This single foreground command configures/builds Sol and Terra serially, stages
+runtime assets, starts Sol with its built-in HTTPS web UI and a frontend build
+watcher, then opens Terra desktop with its built frontend served by Neutralino.
+Sol UI is at `https://localhost:47990`. Neither command starts a Vite HTTP
+server on 5173 or 5174. Sol assets rebuild on edits; refresh the browser to load
+changes. Restart `dev:terra` after Terra frontend or native changes.
+Closing Terra or pressing Ctrl+C stops
+the session's processes. A failed build/service or occupied port aborts startup;
+existing hosts and dev servers are never killed.
+
+Native prerequisites must already be installed, including the Neutralino 6.9.0
+shell under `apps/terra/bin`. The launcher does not install tools, download the
+shell, change dependency pins, or bypass native build failures. WiX 4.0.4 is
+installed once per build tree and its exact version is checked on later runs. Close
+other Terra instances before running it: the core build shares the staging path.
+Run this long-lived command in your own terminal, not an automation runner.
+
+Sol uses `apps/sol/cmake-build-<platform>-dev-debug`, with generated runtime assets
+and a separate development configuration/paired-client identity there. It does
+not import your installed host's configuration. Terra retains its existing app
+settings and pairing storage. Pair Terra with this development host separately.
+Development Sol uses the standard HTTP port `47989` and admin HTTPS port `47990`.
+Stop any installed Sol/Sunshine host before starting it; the launcher refuses
+occupied ports rather than silently moving the service or killing another host.
+Add `http://127.0.0.1:47989` in Terra to test this local host.
+At `https://localhost:47990`, Sol handles first-run setup, Basic authentication,
+CSRF checks, pages, and API requests on the same native origin.
+Credentials for an installed Sunshine host do not automatically apply here.
+
+Sol retains Sunshine's default port mapping (base port 47989):
+
+| Protocol | Port | Purpose |
+| --- | --- | --- |
+| TCP | 47984 | Client HTTPS/pairing |
+| TCP | 47989 | Client HTTP/server discovery information |
+| TCP | 47990 | Admin HTTPS web UI and API |
+| TCP | 48010 | RTSP session setup |
+| UDP | 47998 | Video |
+| UDP | 47999 | Control |
+| UDP | 48000 | Audio |
+
+The launcher checks both TCP and UDP host ports for conflicts. Discovery keeps
+the upstream `_nvstream._tcp` advertisement and mapped HTTP port; shared mDNS
+uses its normal infrastructure, not a replacement application port.
+
+Browser-only previews remain explicitly available through `npx nx run sol:dev:web`
+and `npx nx run terra:dev:web`; these are not the normal app launch commands. After
+native edits, stop and rerun `npm run dev`; native processes do not hot-reload.
+
+The development-only native wrapper suffix `--dev` is accepted for Sol debug
+configure/build/test operations. It selects the isolated tree and points compiled
+asset lookup at that tree, without changing release packaging paths.
+
 The expected orchestration interface is the root npm scripts backed by local Nx:
 
 ```sh
@@ -34,8 +98,8 @@ npm run dev:terra
 npm run graph
 ```
 
-`check` includes tests. Root `build` runs `build:web` targets only. Terra's browser
-preview intentionally reports the native core unavailable.
+`check` includes tests. Root `build` runs `build:web` targets only. The optional
+Terra browser-only Nx preview intentionally reports the native core unavailable.
 
 ### Nx Process Lifetime
 
@@ -160,15 +224,18 @@ Terra's Windows debug build, runtime staging, and six native tests now pass afte
 correcting the Win32 call sites and renderer declarations. The native renderer
 requires Windows 10 version 1607 or newer because it directly imports
 `GetDpiForWindow`; its `WINVER` and `_WIN32_WINNT` definitions target Windows 10.
-Hardware streaming, release builds, and Linux execution remain unverified. Sol
-gets past dependency extraction; previously uninitialized libvirtualhid nested
-submodules have been restored to their pins. Its latest configure attempt fails
-in the upstream WiX 4.0.4 tool restore, not in extraction. Streaming remains unverified.
+Hardware streaming, release builds, and Linux execution remain unverified. Sol's
+development debug build now compiles and links, including `test_sol.exe`.
+The full launcher was verified with live backend/frontend responses, Terra's
+rendered UI reporting Core ready, and desktop-close shutdown releasing every
+development port while leaving the installed Sunshine process running.
 
 Sol's imported WiX CMake code restores tools into the build-local `.wix`
-directory during configure. One restore succeeded during diagnosis, but the next
-reported that version 4.0.4 could not be found in the configured NuGet feeds. No
-system-wide toolchain changes or alternate tool versions were introduced.
+directory during configure. Reinstalling an already installed tool produced a
+misleading NuGet "version not found" error. Configure now installs only when the
+local executable is absent and verifies the exact pinned release before adding
+extensions. A mismatched or broken executable fails explicitly. Repeated real
+configure/build runs passed; no alternate WiX version or feed was introduced.
 
 Do not relax the Boost pin, substitute toolchains, disable required features, or
 invent missing-tool workarounds. Report the actual blocker; dependency installation

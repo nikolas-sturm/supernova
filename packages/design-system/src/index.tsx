@@ -40,13 +40,13 @@ export function Button({ variant, outline, small, className, ...props }: ButtonP
   )
 }
 
-/** @brief Terra identity shared by host and client; subtitle identifies the surface. */
-export function TerraBrand({ subtitle }: { subtitle: string }) {
+/** @brief Shared wordmark styling with an explicit host or client product name. */
+export function AppBrand({ product, subtitle }: { product: 'SOL' | 'TERRA'; subtitle: string }) {
   return (
     <span className={identity.brand}>
       <span className={identity.mark} aria-hidden="true" />
       <span>
-        <strong>TERRA</strong>
+        <strong>{product}</strong>
         <small>{subtitle}</small>
       </span>
     </span>

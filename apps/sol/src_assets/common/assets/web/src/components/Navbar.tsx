@@ -5,7 +5,7 @@
  * is the minimal bar used by the welcome and logout pages.
  */
 
-import { TerraBrand } from '@supernova/design-system'
+import { AppBrand } from '@supernova/design-system'
 import { Link, useRouterState } from '@tanstack/react-router'
 import {
   CircleUserRound,
@@ -91,8 +91,8 @@ export function AppNavbar() {
   return (
     <nav className={styles.navbar} aria-label="Primary navigation">
       <div className={styles.inner}>
-        <Link to="/" className={styles.brand} title="Terra / Sol host">
-          <TerraBrand subtitle="SOL / HOST ADMIN" />
+        <Link to="/" className={styles.brand} title="Sol host">
+          <AppBrand product="SOL" subtitle="HOST ADMIN" />
         </Link>
         <button
           type="button"
@@ -170,8 +170,8 @@ export function SimpleNavbar() {
   return (
     <nav className={`${styles.navbar} ${styles.simple}`} aria-label="Primary navigation">
       <div className={styles.inner}>
-        <span className={styles.brand} title="Terra / Sol host">
-          <TerraBrand subtitle="SOL / HOST ADMIN" />
+        <span className={styles.brand} title="Sol host">
+          <AppBrand product="SOL" subtitle="HOST ADMIN" />
         </span>
         <ThemeMenu />
       </div>

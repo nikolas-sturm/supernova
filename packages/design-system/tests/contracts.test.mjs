@@ -18,10 +18,11 @@ test('every original palette remains available under its persisted selector', ()
   assert.match(themes, /:root:not\(\[data-theme\]\),\s*\[data-theme="dark"\]/)
 })
 
-test('shared branding and button hooks use Terra without changing the dark preference', () => {
+test('shared branding uses explicit product names without changing theme hooks', () => {
   const components = read('../src/index.tsx')
-  assert.match(components, /export function TerraBrand\(/)
-  assert.match(components, /<strong>TERRA<\/strong>/)
+  assert.match(components, /export function AppBrand\(/)
+  assert.match(components, /<strong>\{product\}<\/strong>/)
+  assert.match(read(`${sol}components/Navbar.tsx`), /product="SOL"/)
   assert.match(components, /data-terra-button=""/)
   assert.match(components, /'Terra \/ Dark'/)
   assert.doesNotMatch(components, /EclipseBrand|data-eclipse-button/)

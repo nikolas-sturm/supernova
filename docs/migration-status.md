@@ -2,6 +2,26 @@
 
 ## Official Product Names
 
+The current launcher uses Sol's standard native HTTPS UI on 47990 and rebuilds
+its frontend assets in watch mode. It no longer starts a Sol Vite server on 5173.
+`dev:sol` starts only Sol; `dev:terra` builds and opens only Terra's native desktop,
+without a 5174 listener. A live Terra-only run showed its game library and Core
+ready state, and closing the window exited the command successfully.
+Launcher regression tests pass; a live run on standard ports requires stopping
+the installed Sunshine host that currently occupies them.
+
+Prior split-port Windows development verification: `npm run dev` built Sol and Terra,
+served Sol's HTTP endpoint on 48989 and both Vite frontends on 5173/5174, and
+opened Terra with its native core ready (verified through UI Automation and a
+screenshot). Closing Terra exited the command successfully and released all
+development ports. The existing Sunshine process on default ports was untouched.
+This verifies startup and shutdown, not paired video/audio/input streaming.
+Sol's native test executable was built; its full native test suite was not run.
+
+WiX 4.0.4 fresh installation succeeded, while a second unconditional installation
+failed during NuGet resolution. Version-checked reuse fixes repeated configure;
+the tool and UI/Util extension pins remain 4.0.4.
+
 The current host is Sol (`apps/sol`, Nx project `sol`); the current client is
 Terra. Sunshine/Progenitor and Moonlight/Eclipse are historical product names,
 not additional first-party projects or CLI aliases. Historical verification and

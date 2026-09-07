@@ -76,6 +76,12 @@ namespace confighttp {
   void getAsset(const resp_https_t &response, const req_https_t &request);
   void browseDirectory(const resp_https_t &response, const req_https_t &request);
   void getLocale(const resp_https_t &response, const req_https_t &request);
+  /**
+   * @brief Return configuration and account username after authenticating the request.
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void getConfig(const resp_https_t &response, const req_https_t &request);
   void getCSRFToken(const resp_https_t &response, const req_https_t &request);
 
   /**

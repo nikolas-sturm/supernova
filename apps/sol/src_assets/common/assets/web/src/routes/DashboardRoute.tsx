@@ -40,10 +40,11 @@ export default function DashboardRoute() {
 function DashboardContent() {
   const { t } = useTranslation()
   const { platform, version, config } = useConfigValues()
+  const username = typeof config.username === 'string' ? config.username : ''
 
   return (
     <>
-      <h1>{t('index.welcome')}</h1>
+      <h1>{username ? t('index.welcome', { username }) : t('index.welcome_generic')}</h1>
       <p>{t('index.description')}</p>
 
       <FatalLogsAlert />

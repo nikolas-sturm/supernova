@@ -6,27 +6,28 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const root = fileURLToPath(new URL('../../', import.meta.url))
 export const usage =
-  'Usage: node tooling/native/build.mjs <sol|terra> <configure|build|test> <debug|release>'
+  'Usage: node tooling/native/build.mjs <sol|terra> <configure|build|test> <debug|release> [--dev]'
 
 /** Validate the public CLI before inspecting or invoking native tools. */
 export function parseArgs(args) {
   const [app, operation, config] = args
   if (
-    args.length !== 3 ||
+    (args.length !== 3 &&
+      !(args.length === 4 && args[3] === '--dev' && app === 'sol' && config === 'debug')) ||
     !['sol', 'terra'].includes(app) ||
     !['configure', 'build', 'test'].includes(operation) ||
     !['debug', 'release'].includes(config)
   ) {
     throw new Error(usage)
   }
-  return { app, operation, config }
+  return { app, operation, config, ...(args.length === 4 ? { dev: true } : {}) }
 }
 
 /** Keep upstream source roots and all generated outputs config-specific. */
-export function commandsFor({ app, operation, config }, platform = process.platform) {
+export function commandsFor({ app, operation, config, dev = false }, platform = process.platform) {
   const appRoot = path.join(root, 'apps', app)
   const source = app === 'terra' ? path.join(appRoot, 'native') : appRoot
-  const build = path.join(appRoot, `cmake-build-${platform}-${config}`)
+  const build = path.join(appRoot, `cmake-build-${platform}-${dev ? 'dev-' : ''}${config}`)
   const configuration = config === 'debug' ? 'Debug' : 'Release'
   if (operation === 'configure') {
     const command = [
@@ -47,6 +48,8 @@ export function commandsFor({ app, operation, config }, platform = process.platf
         ? ['-DSOL_BUILD_WEB_UI=OFF', '-DBUILD_DOCS=OFF', '-DBUILD_TESTS=ON']
         : ['-DBUILD_TESTING=ON']),
     )
+    if (dev)
+      command.push(`-DSOL_ASSETS_DIR_DEF=${path.join(build, 'assets').replaceAll('\\', '/')}`)
     return [command]
   }
   if (operation === 'build') {

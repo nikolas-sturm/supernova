@@ -4,7 +4,7 @@ Run from any working directory using Node.js; no npm dependencies are needed by
 the wrapper. Supported hosts: Windows MSYS2 UCRT64 and Linux only.
 
 ```text
-node tooling/native/build.mjs <sol|terra> <configure|build|test> <debug|release>
+node tooling/native/build.mjs <sol|terra> <configure|build|test> <debug|release> [--dev]
 node --test tooling/native/build.test.mjs
 ```
 
