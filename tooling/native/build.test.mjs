@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -93,6 +102,71 @@ const cmake =
       )
     : 'cmake'
 const hasCmake = spawnSync(cmake, ['--version']).status === 0
+
+test('Windows shader staging handles existing and dangling junctions without deleting targets', {
+  skip: process.platform !== 'win32' || !hasCmake,
+}, () => {
+  const temporary = mkdtempSync(path.join(tmpdir(), 'supernova-shaders-'))
+  const helper = fileURLToPath(
+    new URL('../../apps/sol/cmake/packaging/windows_shaders.cmake', import.meta.url),
+  ).replaceAll('\\', '/')
+  const script = path.join(temporary, 'fixture.cmake')
+  writeFileSync(
+    script,
+    `cmake_minimum_required(VERSION 3.24)\ninclude("${helper}")\nsol_prepare_shader_directory("\${SOURCE}" "\${DESTINATION}")\n`,
+  )
+  try {
+    for (const mode of ['fresh', 'valid', 'stale', 'dangling', 'directory', 'file']) {
+      const root = path.join(temporary, mode)
+      const source = path.join(root, 'shader source')
+      const old = path.join(root, 'old source')
+      const destination = path.join(root, 'shaders')
+      mkdirSync(source, { recursive: true })
+      writeFileSync(path.join(source, 'shader.hlsl'), 'source shader')
+      if (mode === 'stale') {
+        mkdirSync(old)
+        writeFileSync(path.join(old, 'keep.txt'), 'old source')
+      }
+      if (['valid', 'stale', 'dangling'].includes(mode))
+        symlinkSync(mode === 'valid' ? source : old, destination, 'junction')
+      if (mode === 'directory') {
+        mkdirSync(destination)
+        writeFileSync(path.join(destination, 'keep.txt'), 'existing directory')
+      }
+      if (mode === 'file') writeFileSync(destination, 'existing file')
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const result = spawnSync(
+          cmake,
+          [
+            `-DSOURCE=${source.replaceAll('\\', '/')}`,
+            `-DDESTINATION=${destination.replaceAll('\\', '/')}`,
+            '-P',
+            script,
+          ],
+          { encoding: 'utf8', timeout: 10000 },
+        )
+        if (mode === 'file') {
+          assert.notEqual(result.status, 0)
+          assert.match(result.stderr, /not a directory/)
+          assert.equal(readFileSync(destination, 'utf8'), 'existing file')
+        } else {
+          assert.equal(result.status, 0, `${mode}: ${result.stdout}${result.stderr}`)
+          if (mode === 'directory')
+            assert.equal(
+              readFileSync(path.join(destination, 'keep.txt'), 'utf8'),
+              'existing directory',
+            )
+          else assert.equal(realpathSync(destination), realpathSync(source))
+        }
+        assert.equal(readFileSync(path.join(source, 'shader.hlsl'), 'utf8'), 'source shader')
+        if (mode === 'stale')
+          assert.equal(readFileSync(path.join(old, 'keep.txt'), 'utf8'), 'old source')
+      }
+    }
+  } finally {
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
 
 test('WiX installs once, reuses the exact pin, and rejects mismatched or broken tools', {
   skip: !hasCmake,

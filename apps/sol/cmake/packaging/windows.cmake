@@ -49,14 +49,9 @@ install(DIRECTORY "${SOL_SOURCE_ASSETS_DIR}/windows/assets/"
 file(COPY "${SOL_SOURCE_ASSETS_DIR}/windows/assets/"
         DESTINATION "${CMAKE_BINARY_DIR}/assets"
         PATTERN "shaders" EXCLUDE)
-# use junction for shaders directory
-cmake_path(CONVERT "${SOL_SOURCE_ASSETS_DIR}/windows/assets/shaders"
-        TO_NATIVE_PATH_LIST shaders_in_build_src_native)
-cmake_path(CONVERT "${CMAKE_BINARY_DIR}/assets/shaders" TO_NATIVE_PATH_LIST shaders_in_build_dest_native)
-if(NOT EXISTS "${CMAKE_BINARY_DIR}/assets/shaders")
-    execute_process(COMMAND cmd.exe /c mklink /J "${shaders_in_build_dest_native}" "${shaders_in_build_src_native}"
-            COMMAND_ERROR_IS_FATAL ANY)
-endif()
+# Use a junction for live shader edits, including relocated or stale build trees.
+include("${CMAKE_CURRENT_LIST_DIR}/windows_shaders.cmake")
+sol_prepare_shader_directory("${SOL_SOURCE_ASSETS_DIR}/windows/assets/shaders" "${CMAKE_BINARY_DIR}/assets/shaders")
 
 set(CPACK_PACKAGE_ICON "${CMAKE_SOURCE_DIR}\\\\sol.ico")
 
