@@ -31,6 +31,10 @@ test('Nx project listing exits without a persistent daemon', () => {
 
 test('workspace uses one lockfile and one first-party language toolchain', () => {
   const manifest = json('package.json')
+  const workflow = read('.github/workflows/workspace.yml')
+  const setupNpm = `npm install --global ${manifest.packageManager}`
+  assert.ok(workflow.includes(setupNpm), 'CI must install the pinned npm version')
+  assert.ok(workflow.indexOf(setupNpm) < workflow.indexOf('npm ci'))
   assert.equal(manifest.scripts['dev:sol'], 'nx run sol:dev:web')
   assert.deepEqual(
     Object.keys(manifest.scripts)
