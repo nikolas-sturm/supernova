@@ -28,7 +28,7 @@
 #include <openssl/x509.h>
 #include <pugixml.hpp>
 
-namespace eclipse {
+namespace terra {
 namespace {
 using Bytes = std::vector<unsigned char>;
 
@@ -116,7 +116,7 @@ Endpoint parseEndpoint(std::string address) {
     if (address.starts_with(httpPrefix)) {
         address.erase(0, httpPrefix.size());
     } else if (address.starts_with(httpsPrefix)) {
-        throw std::invalid_argument("Enter Sunshine HTTP address, not an HTTPS URL.");
+        throw std::invalid_argument("Enter Sol HTTP address, not an HTTPS URL.");
     }
     if (address.empty() || address.find_first_of("/?#") != std::string::npos) {
         throw std::invalid_argument("Enter a host name or IP address without a path.");
@@ -219,7 +219,7 @@ std::string request(const Endpoint& endpoint, std::uint16_t port, bool https,
         throw std::runtime_error(response ? response->errorMsg : "No HTTP response.");
     }
     if (response->statusCode != 200) {
-        throw std::runtime_error("Sunshine returned HTTP " + std::to_string(response->statusCode) + ".");
+        throw std::runtime_error("Sol returned HTTP " + std::to_string(response->statusCode) + ".");
     }
     return response->body;
 }
@@ -227,16 +227,16 @@ std::string request(const Endpoint& endpoint, std::uint16_t port, bool https,
 pugi::xml_node parseRoot(pugi::xml_document& document, const std::string& xml) {
     const auto parsed = document.load_buffer(xml.data(), xml.size());
     if (!parsed) {
-        throw std::runtime_error("Sunshine returned malformed XML.");
+        throw std::runtime_error("Sol returned malformed XML.");
     }
     const auto root = document.child("root");
     if (!root) {
-        throw std::runtime_error("Sunshine response is missing root element.");
+        throw std::runtime_error("Sol response is missing root element.");
     }
     const auto statusCode = root.attribute("status_code").as_int(-1);
     if (statusCode != 200) {
         const auto message = root.attribute("status_message").as_string("Unknown error");
-        throw std::runtime_error("Sunshine status " + std::to_string(statusCode) + ": " + message);
+        throw std::runtime_error("Sol status " + std::to_string(statusCode) + ": " + message);
     }
     return root;
 }
@@ -270,13 +270,13 @@ std::string toHex(const std::string& data) {
 
 Bytes fromHex(const std::string& value) {
     if (value.size() % 2 != 0) {
-        throw std::runtime_error("Sunshine returned invalid hexadecimal data.");
+        throw std::runtime_error("Sol returned invalid hexadecimal data.");
     }
     const auto nibble = [](const unsigned char character) -> unsigned char {
         if (character >= '0' && character <= '9') return character - '0';
         if (character >= 'a' && character <= 'f') return character - 'a' + 10;
         if (character >= 'A' && character <= 'F') return character - 'A' + 10;
-        throw std::runtime_error("Sunshine returned invalid hexadecimal data.");
+        throw std::runtime_error("Sol returned invalid hexadecimal data.");
     };
     Bytes output(value.size() / 2);
     for (std::size_t index = 0; index < output.size(); ++index) {
@@ -339,7 +339,7 @@ OpenSslPointer<X509, X509_free> parseCertificate(const std::string& pem) {
     OpenSslPointer<X509, X509_free> certificate{
         PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr)};
     if (!certificate) {
-        throwOpenSsl("Sunshine certificate is unreadable");
+        throwOpenSsl("Sol certificate is unreadable");
     }
     return certificate;
 }
@@ -394,7 +394,7 @@ Bytes sign(std::span<const unsigned char> data, EVP_PKEY* privateKey) {
 
 void requirePaired(const pugi::xml_node& root, const char* stage) {
     if (childText(root, "paired") != "1") {
-        throw std::runtime_error(std::string{"Sunshine rejected pairing "} + stage + ".");
+        throw std::runtime_error(std::string{"Sol rejected pairing "} + stage + ".");
     }
 }
 
@@ -405,7 +405,7 @@ int majorVersion(const std::string& value) {
         !std::all_of(component.begin(), component.end(), [](const unsigned char character) {
             return std::isdigit(character);
         })) {
-        throw std::runtime_error("Sunshine app version is invalid.");
+        throw std::runtime_error("Sol app version is invalid.");
     }
     return std::stoi(component);
 }
@@ -462,7 +462,7 @@ ServerInfo GameStreamClient::probe(const std::string& address, std::uint16_t htt
         .paired = childText(root, "PairStatus") == "1",
     };
     if (info.serverName.empty() || info.serverUniqueId.empty()) {
-        throw std::runtime_error("Endpoint is not a compatible Sunshine host.");
+        throw std::runtime_error("Endpoint is not a compatible Sol host.");
     }
     return info;
 }
@@ -482,7 +482,7 @@ std::vector<GameStreamApp> GameStreamClient::apps(
         const auto title = node.child("AppTitle");
         const auto id = node.child("ID").text().as_int(0);
         if (!title || id <= 0) {
-            throw std::runtime_error("Sunshine returned an invalid application list.");
+            throw std::runtime_error("Sol returned an invalid application list.");
         }
         result.push_back({
             .id = id,
@@ -558,7 +558,7 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
     const auto root = parseRoot(document, response);
     result.sessionUrl = childText(root, "sessionUrl0");
     if (result.sessionUrl.empty()) {
-        throw std::runtime_error("Sunshine launch response is missing session URL.");
+        throw std::runtime_error("Sol launch response is missing session URL.");
     }
     return result;
 }
@@ -617,7 +617,7 @@ std::string GameStreamClient::pair(const std::string& address, std::uint16_t htt
         requirePaired(certificateRoot, "certificate stage");
         const auto certificateBytes = fromHex(childText(certificateRoot, "plaincert"));
         if (certificateBytes.empty()) {
-            throw std::runtime_error("Sunshine is already handling another pairing request.");
+            throw std::runtime_error("Sol is already handling another pairing request.");
         }
         const std::string serverCertificate{certificateBytes.begin(), certificateBytes.end()};
         auto serverX509 = parseCertificate(serverCertificate);
@@ -635,7 +635,7 @@ std::string GameStreamClient::pair(const std::string& address, std::uint16_t htt
         const auto challengeData = cipher(fromHex(childText(challengeRoot, "challengeresponse")),
                                           aesKey, false);
         if (challengeData.size() < hashLength + 16) {
-            throw std::runtime_error("Sunshine challenge response is too short.");
+            throw std::runtime_error("Sol challenge response is too short.");
         }
 
         const auto clientSecret = randomBytes(16);
@@ -657,7 +657,7 @@ std::string GameStreamClient::pair(const std::string& address, std::uint16_t htt
         requirePaired(responseRoot, "verification stage");
         const auto pairingSecret = fromHex(childText(responseRoot, "pairingsecret"));
         if (pairingSecret.size() <= 16) {
-            throw std::runtime_error("Sunshine pairing secret is invalid.");
+            throw std::runtime_error("Sol pairing secret is invalid.");
         }
         const Bytes serverSecret{pairingSecret.begin(), pairingSecret.begin() + 16};
         const Bytes serverSignature{pairingSecret.begin() + 16, pairingSecret.end()};
@@ -696,4 +696,4 @@ std::string GameStreamClient::pair(const std::string& address, std::uint16_t htt
     }
 }
 
-}  // namespace eclipse
+}  // namespace terra

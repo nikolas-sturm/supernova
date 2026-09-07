@@ -33,20 +33,20 @@ export function Button({ variant, outline, small, className, ...props }: ButtonP
   return (
     <button
       type="button"
-      data-eclipse-button=""
+      data-terra-button=""
       {...props}
       className={buttonClassName({ variant, outline, small, className })}
     />
   )
 }
 
-/** @brief Eclipse identity shared by host and client; subtitle identifies the surface. */
-export function EclipseBrand({ subtitle }: { subtitle: string }) {
+/** @brief Terra identity shared by host and client; subtitle identifies the surface. */
+export function TerraBrand({ subtitle }: { subtitle: string }) {
   return (
     <span className={identity.brand}>
       <span className={identity.mark} aria-hidden="true" />
       <span>
-        <strong>ECLIPSE</strong>
+        <strong>TERRA</strong>
         <small>{subtitle}</small>
       </span>
     </span>
@@ -55,7 +55,7 @@ export function EclipseBrand({ subtitle }: { subtitle: string }) {
 
 const defaultThemeLabel = (theme: ThemePreference) =>
   theme === 'dark'
-    ? 'Eclipse / Dark'
+    ? 'Terra / Dark'
     : theme === 'auto'
       ? 'System'
       : theme

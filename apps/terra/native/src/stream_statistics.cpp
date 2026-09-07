@@ -6,7 +6,7 @@
 #include <iomanip>
 #include <sstream>
 
-namespace eclipse {
+namespace terra {
 namespace {
 
 std::uint64_t difference(std::uint64_t current, std::uint64_t previous) noexcept {
@@ -290,4 +290,4 @@ OverlayBitmap rasterizePerformanceOverlay(const std::string& text, int scale) {
     return bitmap;
 }
 
-}  // namespace eclipse
+}  // namespace terra

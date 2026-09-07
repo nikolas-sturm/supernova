@@ -1,5 +1,5 @@
 import { defineConfig } from 'vite'
-import { browserTarget, reactCompiler } from '../../tooling/frontend/config.ts'
+import { browserTarget, nativeWatchIgnored, reactCompiler } from '../../tooling/frontend/config.ts'
 
 export default defineConfig({
   plugins: [reactCompiler()],
@@ -9,6 +9,7 @@ export default defineConfig({
     target: browserTarget,
   },
   server: {
+    watch: { ignored: nativeWatchIgnored },
     host: '127.0.0.1',
     port: 5174,
     strictPort: true,

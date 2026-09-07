@@ -121,26 +121,26 @@ extern "C" int LiSendMultiControllerEvent(short controllerNumber, short mask, in
 }
 
 int main() {
-#if defined(ECLIPSE_HAS_LIBPLACEBO)
+#if defined(TERRA_HAS_LIBPLACEBO)
     const int formatCapabilities = SCM_H264 | SCM_H264_HIGH8_444 | SCM_HEVC |
                                    SCM_HEVC_MAIN10 | SCM_HEVC_REXT8_444 |
                                    SCM_HEVC_REXT10_444 | SCM_AV1_MAIN8 | SCM_AV1_MAIN10 |
                                    SCM_AV1_HIGH8_444 | SCM_AV1_HIGH10_444;
-    expect(eclipse::selectVideoFormat(eclipse::VideoCodec::automatic, formatCapabilities, false,
+    expect(terra::selectVideoFormat(terra::VideoCodec::automatic, formatCapabilities, false,
                                       true) == VIDEO_FORMAT_H264_HIGH8_444,
            "Automatic Linux 4:4:4 selection did not prefer H.264.");
-    expect(eclipse::selectVideoFormat(eclipse::VideoCodec::automatic, formatCapabilities, true,
+    expect(terra::selectVideoFormat(terra::VideoCodec::automatic, formatCapabilities, true,
                                       false) == VIDEO_FORMAT_H265_MAIN10,
            "Automatic Linux HDR selection did not choose HEVC Main10.");
-    expect(eclipse::selectVideoFormat(eclipse::VideoCodec::automatic, formatCapabilities, true,
+    expect(terra::selectVideoFormat(terra::VideoCodec::automatic, formatCapabilities, true,
                                       true) == VIDEO_FORMAT_H265_REXT10_444,
            "Combined Linux HDR 4:4:4 selection did not choose HEVC RExt10.");
-    expect(eclipse::selectVideoFormat(eclipse::VideoCodec::av1, formatCapabilities, true, true) ==
+    expect(terra::selectVideoFormat(terra::VideoCodec::av1, formatCapabilities, true, true) ==
                VIDEO_FORMAT_AV1_HIGH10_444,
            "Explicit AV1 HDR 4:4:4 selection used wrong profile.");
     bool rejectedH264Hdr = false;
     try {
-        static_cast<void>(eclipse::selectVideoFormat(eclipse::VideoCodec::h264,
+        static_cast<void>(terra::selectVideoFormat(terra::VideoCodec::h264,
                                                       formatCapabilities, true, false));
     } catch (const std::runtime_error&) {
         rejectedH264Hdr = true;
@@ -148,7 +148,7 @@ int main() {
     expect(rejectedH264Hdr, "H.264 HDR selection was not rejected.");
     bool rejectedMissingProfile = false;
     try {
-        static_cast<void>(eclipse::selectVideoFormat(eclipse::VideoCodec::hevc, SCM_HEVC,
+        static_cast<void>(terra::selectVideoFormat(terra::VideoCodec::hevc, SCM_HEVC,
                                                       false, true));
     } catch (const std::runtime_error&) {
         rejectedMissingProfile = true;
@@ -156,13 +156,13 @@ int main() {
     expect(rejectedMissingProfile, "Missing HEVC 4:4:4 host profile was not rejected.");
 #endif
 
-    expect(eclipse::prepareClipboardText("line 1\r\nline 2") == "line 1\nline 2",
+    expect(terra::prepareClipboardText("line 1\r\nline 2") == "line 1\nline 2",
            "Clipboard newline normalization failed.");
-    expect(eclipse::prepareClipboardText("\xF0\x9F\x8C\x91").has_value(),
+    expect(terra::prepareClipboardText("\xF0\x9F\x8C\x91").has_value(),
            "Valid non-ASCII clipboard text was rejected.");
-    expect(!eclipse::prepareClipboardText("\xF0\x28\x8C\x28"),
+    expect(!terra::prepareClipboardText("\xF0\x28\x8C\x28"),
            "Malformed UTF-8 clipboard text was accepted.");
-    expect(!eclipse::prepareClipboardText(std::string(16 * 1024 + 1, 'x')),
+    expect(!terra::prepareClipboardText(std::string(16 * 1024 + 1, 'x')),
            "Oversized clipboard text was accepted.");
 
     SDL_setenv("SDL_VIDEODRIVER", "dummy", 0);
@@ -176,7 +176,7 @@ int main() {
     description.nbuttons = SDL_CONTROLLER_BUTTON_MAX;
     description.button_mask = (1U << SDL_CONTROLLER_BUTTON_MAX) - 1;
     description.axis_mask = (1U << SDL_CONTROLLER_AXIS_MAX) - 1;
-    description.name = "Eclipse test controller";
+    description.name = "Terra test controller";
     description.Rumble = virtualRumble;
     description.SetLED = virtualLed;
 
@@ -185,7 +185,7 @@ int main() {
         SDL_JoystickAttachVirtualEx(&description),
     };
     expect(devices[0] >= 0 && devices[1] >= 0, "Could not attach virtual controllers.");
-    expect(eclipse::connectedGamepadMask() == 3, "Launch mask did not include both controllers.");
+    expect(terra::connectedGamepadMask() == 3, "Launch mask did not include both controllers.");
 
     std::array<SDL_JoystickID, 2> instanceIds{
         SDL_JoystickGetDeviceInstanceID(devices[0]),
@@ -195,9 +195,9 @@ int main() {
     auto* window = SDL_CreateWindow("input-test", 0, 0, 1280, 720, SDL_WINDOW_HIDDEN);
     expect(window != nullptr, "Could not create test window.");
 
-    eclipse::InputSettings settings;
+    terra::InputSettings settings;
     settings.backgroundGamepad = true;
-    eclipse::InputForwarder input;
+    terra::InputForwarder input;
     int statisticsToggles = 0;
     int fullscreenToggles = 0;
     int overlayOpens = 0;
@@ -271,7 +271,7 @@ int main() {
     event.cbutton.which = instanceIds[0];
     event.cbutton.state = SDL_PRESSED;
     input.handleEvent(event);
-    expect(lastController == 0 && lastMask == 3 && eclipse::gamepadTransportAvailable(),
+    expect(lastController == 0 && lastMask == 3 && terra::gamepadTransportAvailable(),
            "One failed controller update disabled remaining controller transport.");
 
     input.setGamepadRumble(1, 100, 200);

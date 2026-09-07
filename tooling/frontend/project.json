@@ -1,0 +1,7 @@
+{
+  "name": "frontend-tooling",
+  "projectType": "library",
+  "targets": {
+    "test": { "command": "node --test tooling/frontend/config.test.mjs", "cache": false }
+  }
+}

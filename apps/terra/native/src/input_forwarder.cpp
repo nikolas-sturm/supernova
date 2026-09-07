@@ -2,7 +2,7 @@
 
 #include <utility>
 
-namespace eclipse {
+namespace terra {
 bool gamepadTransportAvailable() noexcept { return true; }
 
 std::optional<std::string> prepareClipboardText(std::string_view text) {
@@ -52,7 +52,7 @@ std::optional<std::string> prepareClipboardText(std::string_view text) {
     return normalized.empty() ? std::nullopt
                               : std::optional<std::string>{std::move(normalized)};
 }
-}  // namespace eclipse
+}  // namespace terra
 
 #ifdef _WIN32
 
@@ -71,7 +71,7 @@ std::optional<std::string> prepareClipboardText(std::string_view text) {
 #include <unordered_set>
 #include <vector>
 
-namespace eclipse {
+namespace terra {
 namespace {
 
 constexpr UINT_PTR kGamepadTimer = 1;
@@ -112,7 +112,7 @@ short invertStickAxis(SHORT value) {
     return static_cast<short>(std::clamp(-static_cast<int>(value), -32768, 32767));
 }
 
-int moonlightButtons(WORD buttons, bool swapFaceButtons) {
+int terraButtons(WORD buttons, bool swapFaceButtons) {
     int result = 0;
     result |= (buttons & XINPUT_GAMEPAD_A) != 0 ? (swapFaceButtons ? B_FLAG : A_FLAG) : 0;
     result |= (buttons & XINPUT_GAMEPAD_B) != 0 ? (swapFaceButtons ? A_FLAG : B_FLAG) : 0;
@@ -218,7 +218,7 @@ struct InputForwarder::Impl {
 
     void updateWindowTitle() const {
         if (!window) return;
-        std::wstring title = L"Eclipse Stream [" + streamLabel + L"] - ";
+        std::wstring title = L"Terra Stream [" + streamLabel + L"] - ";
         if (inputResult && *inputResult != 0) {
             title += L"Input queue failed (" + std::to_wstring(*inputResult) + L")";
         } else if (!enabled) {
@@ -506,7 +506,7 @@ struct InputForwarder::Impl {
     void toggleCursorDisplay() {
         if (!settings.absoluteMouseMode) return;
         localCursorVisible = !localCursorVisible;
-        SetCursor(localCursorVisible ? LoadCursorW(nullptr, IDC_ARROW) : nullptr);
+        SetCursor(localCursorVisible ? LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)) : nullptr);
     }
 
     void togglePointerRegionLock() {
@@ -982,7 +982,7 @@ struct InputForwarder::Impl {
             const auto& pad = states[index].Gamepad;
             const int result = LiSendMultiControllerEvent(
                 static_cast<short>(index), static_cast<short>(nextMask),
-                moonlightButtons(pad.wButtons, settings.swapFaceButtons), pad.bLeftTrigger,
+                terraButtons(pad.wButtons, settings.swapFaceButtons), pad.bLeftTrigger,
                 pad.bRightTrigger, pad.sThumbLX, invertStickAxis(pad.sThumbLY), pad.sThumbRX,
                 invertStickAxis(pad.sThumbRY));
             noteControllerResult(result);
@@ -1281,9 +1281,9 @@ bool InputForwarder::handleMessage(UINT message, WPARAM wparam, LPARAM lparam, L
     return false;
 }
 
-}  // namespace eclipse
+}  // namespace terra
 
-#elif defined(__linux__) && defined(ECLIPSE_HAS_LINUX_VIDEO)
+#elif defined(__linux__) && defined(TERRA_HAS_LINUX_VIDEO)
 
 #include <Limelight.h>
 
@@ -1299,7 +1299,7 @@ bool InputForwarder::handleMessage(UINT message, WPARAM wparam, LPARAM lparam, L
 #include <unordered_map>
 #include <unordered_set>
 
-namespace eclipse {
+namespace terra {
 namespace {
 
 struct KeyMapping {
@@ -1396,7 +1396,7 @@ std::optional<KeyMapping> windowsVirtualKey(SDL_Scancode scanCode) {
     }
 }
 
-std::optional<int> moonlightMouseButton(Uint8 button) {
+std::optional<int> terraMouseButton(Uint8 button) {
     switch (button) {
         case SDL_BUTTON_LEFT: return BUTTON_LEFT;
         case SDL_BUTTON_MIDDLE: return BUTTON_MIDDLE;
@@ -1411,7 +1411,7 @@ short clampedShort(int value) {
     return static_cast<short>(std::clamp(value, -32768, 32767));
 }
 
-char moonlightModifiers(SDL_Keymod modifiers, bool includeMeta) {
+char terraModifiers(SDL_Keymod modifiers, bool includeMeta) {
     char result = 0;
     if ((modifiers & KMOD_SHIFT) != 0) result |= MODIFIER_SHIFT;
     if ((modifiers & KMOD_CTRL) != 0) result |= MODIFIER_CTRL;
@@ -1424,7 +1424,7 @@ constexpr std::uint32_t kStandardGamepadButtons =
     A_FLAG | B_FLAG | X_FLAG | Y_FLAG | UP_FLAG | DOWN_FLAG | LEFT_FLAG | RIGHT_FLAG | LB_FLAG |
     RB_FLAG | PLAY_FLAG | BACK_FLAG | SPECIAL_FLAG | LS_CLK_FLAG | RS_CLK_FLAG;
 
-std::optional<int> moonlightControllerButton(Uint8 button, bool swapFaceButtons) {
+std::optional<int> terraControllerButton(Uint8 button, bool swapFaceButtons) {
     if (swapFaceButtons) {
         switch (button) {
             case SDL_CONTROLLER_BUTTON_A: button = SDL_CONTROLLER_BUTTON_B; break;
@@ -1616,7 +1616,7 @@ struct InputForwarder::Impl {
 
     void updateWindowTitle() const {
         if (!window) return;
-        std::string title = "Eclipse Stream [" + streamLabel + "] - ";
+        std::string title = "Terra Stream [" + streamLabel + "] - ";
         if (!inputError.empty()) {
             title += inputError;
         } else if (!enabled) {
@@ -1685,7 +1685,7 @@ struct InputForwarder::Impl {
 #if SDL_VERSION_ATLEAST(2, 0, 14)
         std::uint32_t supported = 0;
         for (int button = 0; button < SDL_CONTROLLER_BUTTON_MAX; ++button) {
-            const auto mapped = moonlightControllerButton(static_cast<Uint8>(button),
+            const auto mapped = terraControllerButton(static_cast<Uint8>(button),
                                                           settings.swapFaceButtons);
             if (mapped && SDL_GameControllerHasButton(
                               controller, static_cast<SDL_GameControllerButton>(button))) {
@@ -1933,7 +1933,7 @@ struct InputForwarder::Impl {
                                             static_cast<SDL_GameControllerButton>(button)) == 0) {
                 continue;
             }
-            if (const auto mapped = moonlightControllerButton(
+            if (const auto mapped = terraControllerButton(
                     static_cast<Uint8>(button), settings.swapFaceButtons)) {
                 slot.buttons |= *mapped;
             }
@@ -2133,7 +2133,7 @@ struct InputForwarder::Impl {
         const auto index = controllerIndex(event.which);
         if (!index) return;
         auto& slot = controllers[*index];
-        const auto button = moonlightControllerButton(event.button, settings.swapFaceButtons);
+        const auto button = terraControllerButton(event.button, settings.swapFaceButtons);
         if (!button) return;
         if (event.state == SDL_PRESSED) {
             slot.buttons |= *button;
@@ -2567,7 +2567,7 @@ struct InputForwarder::Impl {
         const int result = LiSendKeyboardEvent2(
             static_cast<short>(0x8000U | static_cast<unsigned short>(mapping->key)),
             pressed ? KEY_ACTION_DOWN : KEY_ACTION_UP,
-            moonlightModifiers(static_cast<SDL_Keymod>(event.keysym.mod), captureSystemKeys),
+            terraModifiers(static_cast<SDL_Keymod>(event.keysym.mod), captureSystemKeys),
             mapping->flags);
         noteInputResult(result);
         if (result != 0) return;
@@ -2579,7 +2579,7 @@ struct InputForwarder::Impl {
     }
 
     void sendMouseButton(Uint8 sdlButton, bool pressed) {
-        auto button = moonlightMouseButton(sdlButton);
+        auto button = terraMouseButton(sdlButton);
         if (!button) return;
         if (settings.swapMouseButtons) {
             if (*button == BUTTON_LEFT) {
@@ -2983,14 +2983,14 @@ void InputForwarder::handleEvent(const SDL_Event& event) {
     }
 }
 
-}  // namespace eclipse
+}  // namespace terra
 
 #else
 
-namespace eclipse {
+namespace terra {
 
 std::uint16_t connectedGamepadMask() { return 0; }
 
-}  // namespace eclipse
+}  // namespace terra
 
 #endif

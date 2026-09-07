@@ -8,7 +8,7 @@ extern "C" {
 #include <Limelight.h>
 }
 
-namespace eclipse {
+namespace terra {
 
 class AudioRenderer {
 public:
@@ -30,4 +30,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace eclipse
+}  // namespace terra

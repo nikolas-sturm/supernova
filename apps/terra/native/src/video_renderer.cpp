@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace eclipse {
+namespace terra {
 namespace {
 
 bool supportedVideoFormat(int videoFormat) {
@@ -51,14 +51,15 @@ const char* videoCodecName(int videoFormat) {
 }
 
 }  // namespace
-}  // namespace eclipse
+}  // namespace terra
 
-#if defined(_WIN32) && defined(ECLIPSE_HAS_WINDOWS_VIDEO)
+#if defined(_WIN32) && defined(TERRA_HAS_WINDOWS_VIDEO)
 
 #include "input_forwarder.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cwchar>
@@ -82,9 +83,12 @@ extern "C" {
 #include <libavutil/pixfmt.h>
 }
 
-namespace eclipse {
+namespace terra {
 namespace {
 using Microsoft::WRL::ComPtr;
+// DXVA_ModeAV1_VLD_Profile0; UCRT64 declares it but does not export it in libuuid.
+constexpr GUID kAv1Profile0{
+    0xb8be4ccb, 0xcf53, 0x46ba, {0x8d, 0x59, 0xd6, 0xb8, 0xa6, 0xda, 0x5d, 0x2a}};
 constexpr UINT kDestroyWindowMessage = WM_APP + 1;
 constexpr UINT kSetInputEnabledMessage = WM_APP + 2;
 constexpr UINT kSetGamepadRumbleMessage = WM_APP + 3;
@@ -186,12 +190,12 @@ int selectVideoFormat(VideoCodec preference, int serverCodecModeSupport, bool en
                 codecId = AV_CODEC_ID_HEVC;
                 break;
             case VIDEO_FORMAT_AV1_MAIN8:
-                profile = &D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0;
+                profile = &kAv1Profile0;
                 textureFormat = DXGI_FORMAT_NV12;
                 codecId = AV_CODEC_ID_AV1;
                 break;
             case VIDEO_FORMAT_AV1_MAIN10:
-                profile = &D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0;
+                profile = &kAv1Profile0;
                 textureFormat = DXGI_FORMAT_P010;
                 codecId = AV_CODEC_ID_AV1;
                 break;
@@ -371,7 +375,7 @@ struct VideoRenderer::Impl {
             windowClass.hInstance = instance;
             windowClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
             windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
-            windowClass.lpszClassName = L"EclipseStreamWindow";
+            windowClass.lpszClassName = L"TerraStreamWindow";
             RegisterClassW(&windowClass);
 
             auto displays = displayMonitors();
@@ -423,7 +427,7 @@ struct VideoRenderer::Impl {
                             ((workArea.bottom - workArea.top) - (bounds.bottom - bounds.top)) / 2;
             }
             const auto created = CreateWindowExW(
-                0, windowClass.lpszClassName, L"Eclipse Stream", style, positionX,
+                0, windowClass.lpszClassName, L"Terra Stream", style, positionX,
                 positionY, bounds.right - bounds.left, bounds.bottom - bounds.top, nullptr,
                 nullptr, instance, this);
             {
@@ -1255,9 +1259,9 @@ void VideoRenderer::setGamepadLed(std::uint16_t controllerNumber, std::uint8_t r
     impl_->setGamepadLed(controllerNumber, red, green, blue);
 }
 
-}  // namespace eclipse
+}  // namespace terra
 
-#elif defined(__linux__) && defined(ECLIPSE_HAS_LINUX_VIDEO)
+#elif defined(__linux__) && defined(TERRA_HAS_LINUX_VIDEO)
 
 #include "input_forwarder.h"
 
@@ -1276,7 +1280,7 @@ void VideoRenderer::setGamepadLed(std::uint16_t controllerNumber, std::uint8_t r
 
 #include <SDL.h>
 #include <SDL_syswm.h>
-#if defined(ECLIPSE_HAS_LIBPLACEBO)
+#if defined(TERRA_HAS_LIBPLACEBO)
 #include <SDL_vulkan.h>
 #include <libplacebo/log.h>
 #include <libplacebo/renderer.h>
@@ -1285,14 +1289,14 @@ void VideoRenderer::setGamepadLed(std::uint16_t controllerNumber, std::uint8_t r
 #define PL_LIBAV_IMPLEMENTATION 0
 #include <libplacebo/utils/libav.h>
 #endif
-#if defined(ECLIPSE_HAS_VAAPI_X11)
+#if defined(TERRA_HAS_VAAPI_X11)
 #include <X11/Xlib.h>
 #include <va/va.h>
 #include <va/va_x11.h>
 #endif
 
-#if defined(ECLIPSE_HAS_VAAPI_X11) && defined(SDL_VIDEO_DRIVER_X11)
-#define ECLIPSE_USE_VAAPI_X11 1
+#if defined(TERRA_HAS_VAAPI_X11) && defined(SDL_VIDEO_DRIVER_X11)
+#define TERRA_USE_VAAPI_X11 1
 #endif
 
 extern "C" {
@@ -1300,13 +1304,13 @@ extern "C" {
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/mastering_display_metadata.h>
-#if defined(ECLIPSE_HAS_VAAPI_X11)
+#if defined(TERRA_HAS_VAAPI_X11)
 #include <libavutil/hwcontext_vaapi.h>
 #endif
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 }
-namespace eclipse {
+namespace terra {
 namespace {
 
 std::string ffmpegError(int error) {
@@ -1347,7 +1351,7 @@ std::string sdlError(const char* message) {
 
 int selectVideoFormat(VideoCodec preference, int serverCodecModeSupport, bool enableHdr,
                       bool enableYuv444) {
-#if !defined(ECLIPSE_HAS_LIBPLACEBO)
+#if !defined(TERRA_HAS_LIBPLACEBO)
     if (enableHdr || enableYuv444) {
         throw std::runtime_error(
             "Linux HDR and YUV 4:4:4 require optional Vulkan/libplacebo support.");
@@ -1488,7 +1492,7 @@ struct VideoRenderer::Impl {
         }
         if (codecContext) avcodec_free_context(&codecContext);
         av_buffer_unref(&hardwareDevice);
-#if defined(ECLIPSE_USE_VAAPI_X11)
+#if defined(TERRA_USE_VAAPI_X11)
         if (vaapiDisplay) vaTerminate(vaapiDisplay);
         if (vaapiX11Display) XCloseDisplay(vaapiX11Display);
 #endif
@@ -1503,7 +1507,7 @@ struct VideoRenderer::Impl {
 
     void setHdrMode(bool enabled) noexcept { hdrModeRequested.store(enabled); }
 
-#if defined(ECLIPSE_HAS_LIBPLACEBO)
+#if defined(TERRA_HAS_LIBPLACEBO)
     bool surfaceSupportsHdr(VkPhysicalDevice device) const {
         const auto getSurfaceFormats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
             placeboInstance->get_proc_addr(placeboInstance->instance,
@@ -1618,10 +1622,10 @@ struct VideoRenderer::Impl {
 
     void cleanupSdl() {
         inputForwarder.stop();
-#if defined(ECLIPSE_HAS_LIBPLACEBO)
+#if defined(TERRA_HAS_LIBPLACEBO)
         cleanupPlacebo();
 #endif
-#if defined(ECLIPSE_USE_VAAPI_X11)
+#if defined(TERRA_USE_VAAPI_X11)
         if (vaapiX11Display) XSync(vaapiX11Display, False);
 #endif
         if (overlayTexture) SDL_DestroyTexture(overlayTexture);
@@ -1659,7 +1663,7 @@ struct VideoRenderer::Impl {
     }
 
     void initializeSdl(int width, int height, int frameRate) {
-#if defined(ECLIPSE_USE_VAAPI_X11)
+#if defined(TERRA_USE_VAAPI_X11)
         XInitThreads();
 #endif
         if (SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) {
@@ -1710,7 +1714,7 @@ struct VideoRenderer::Impl {
         }
 
         Uint32 windowFlags = SDL_WINDOW_ALLOW_HIGHDPI;
-#if defined(ECLIPSE_HAS_LIBPLACEBO)
+#if defined(TERRA_HAS_LIBPLACEBO)
         const bool waylandSession = std::getenv("XDG_SESSION_TYPE") &&
                                     std::string_view{std::getenv("XDG_SESSION_TYPE")} == "wayland";
         const bool usePlacebo = settings.enableHdr || settings.enableYuv444 || waylandSession;
@@ -1745,7 +1749,7 @@ struct VideoRenderer::Impl {
         }
 
         const int windowPosition = SDL_WINDOWPOS_CENTERED_DISPLAY(displayIndex);
-        window = SDL_CreateWindow("Eclipse Stream", windowPosition, windowPosition, outputWidth,
+        window = SDL_CreateWindow("Terra Stream", windowPosition, windowPosition, outputWidth,
                                   outputHeight, windowFlags);
         if (!window) throw std::runtime_error(sdlError("Cannot create SDL stream window"));
         int presentationRefreshRate = hasDesktopMode ? desktopMode.refresh_rate : 0;
@@ -1767,11 +1771,11 @@ struct VideoRenderer::Impl {
             }
         }
 
-#if defined(ECLIPSE_HAS_LIBPLACEBO)
+#if defined(TERRA_HAS_LIBPLACEBO)
         if (usePlacebo) initializePlacebo();
 #endif
 
-#if defined(ECLIPSE_USE_VAAPI_X11)
+#if defined(TERRA_USE_VAAPI_X11)
         if (!placeboActive && !settings.showPerformanceStats &&
             (!std::getenv("XDG_SESSION_TYPE") ||
              std::string_view{std::getenv("XDG_SESSION_TYPE")} != "wayland")) {
@@ -1877,7 +1881,7 @@ struct VideoRenderer::Impl {
                 avcodec_free_context(&codecContext);
                 return false;
             }
-#if defined(ECLIPSE_USE_VAAPI_X11)
+#if defined(TERRA_USE_VAAPI_X11)
             if (directPresentationEnabled.load() && vaapiDisplay) {
                 hardwareDevice = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VAAPI);
                 if (hardwareDevice) {
@@ -1934,10 +1938,10 @@ struct VideoRenderer::Impl {
         decoderWidth = width;
         decoderHeight = height;
         bool hardwarePresentationAvailable = false;
-#if defined(ECLIPSE_HAS_LIBPLACEBO)
+#if defined(TERRA_HAS_LIBPLACEBO)
         hardwarePresentationAvailable = placeboActive;
 #endif
-#if defined(ECLIPSE_USE_VAAPI_X11)
+#if defined(TERRA_USE_VAAPI_X11)
         hardwarePresentationAvailable =
             hardwarePresentationAvailable || directPresentationEnabled.load();
 #endif
@@ -2444,7 +2448,7 @@ struct VideoRenderer::Impl {
                        : FrameQueueResult::failed;
         }
 
-#if defined(ECLIPSE_HAS_LIBPLACEBO)
+#if defined(TERRA_HAS_LIBPLACEBO)
         if (placeboActive) {
             AVFrame* ownedFrame = av_frame_clone(frame);
             if (!ownedFrame) return FrameQueueResult::failed;
@@ -2468,7 +2472,7 @@ struct VideoRenderer::Impl {
         }
 #endif
         if (hardwareDecoderConfigured) {
-#if defined(ECLIPSE_USE_VAAPI_X11)
+#if defined(TERRA_USE_VAAPI_X11)
             if (!directPresentationEnabled.load()) {
                 return fallBackToSoftwareDecoder("No GPU presentation path accepts VAAPI frames.")
                            ? FrameQueueResult::decoderFallback
@@ -2552,7 +2556,7 @@ struct VideoRenderer::Impl {
         return true;
     }
 
-#if defined(ECLIPSE_USE_VAAPI_X11)
+#if defined(TERRA_USE_VAAPI_X11)
     bool renderVaapiSurface(const PendingFrame& frame) {
         if (!frame.hardwareFrame || !vaapiDisplay || !vaapiX11Display || !vaapiX11Window) {
             return false;
@@ -2602,7 +2606,7 @@ struct VideoRenderer::Impl {
     }
 #endif
 
-#if defined(ECLIPSE_HAS_LIBPLACEBO)
+#if defined(TERRA_HAS_LIBPLACEBO)
     void updatePlaceboOverlay(std::chrono::steady_clock::time_point now) {
         if (!statistics || !overlayVisible || overlayDisabled ||
             (placeboOverlayTexture && now < nextOverlayUpdate)) {
@@ -2730,7 +2734,7 @@ struct VideoRenderer::Impl {
 #endif
 
     bool render(const PendingFrame& frame) {
-#if defined(ECLIPSE_HAS_LIBPLACEBO)
+#if defined(TERRA_HAS_LIBPLACEBO)
         if (frame.avFrame) {
             const auto renderStarted = std::chrono::steady_clock::now();
             const bool rendered = renderPlacebo(frame.avFrame.get());
@@ -2753,7 +2757,7 @@ struct VideoRenderer::Impl {
         }
 #endif
         if (frame.hardwareFrame) {
-#if defined(ECLIPSE_USE_VAAPI_X11)
+#if defined(TERRA_USE_VAAPI_X11)
             if (directPresentationEnabled.load() && renderVaapiSurface(frame)) return true;
 #endif
             directPresentationEnabled.store(false);
@@ -2970,7 +2974,7 @@ struct VideoRenderer::Impl {
     std::atomic_bool directPresentationUsed{false};
     std::atomic_bool hardwarePresentationFallbackRequested{false};
     bool placeboActive = false;
-#if defined(ECLIPSE_HAS_LIBPLACEBO)
+#if defined(TERRA_HAS_LIBPLACEBO)
     pl_log placeboLog = nullptr;
     pl_vk_inst placeboInstance = nullptr;
     VkSurfaceKHR placeboSurface = VK_NULL_HANDLE;
@@ -2980,7 +2984,7 @@ struct VideoRenderer::Impl {
     std::array<pl_tex, 4> placeboTextures{};
     pl_tex placeboOverlayTexture = nullptr;
 #endif
-#if defined(ECLIPSE_USE_VAAPI_X11)
+#if defined(TERRA_USE_VAAPI_X11)
     Display* vaapiX11Display = nullptr;
     ::Window vaapiX11Window = 0;
     VADisplay vaapiDisplay = nullptr;
@@ -3097,11 +3101,11 @@ void VideoRenderer::setGamepadLed(std::uint16_t controllerNumber, std::uint8_t r
     impl_->setGamepadLed(controllerNumber, red, green, blue);
 }
 
-}  // namespace eclipse
+}  // namespace terra
 
 #else
 
-namespace eclipse {
+namespace terra {
 int selectVideoFormat(VideoCodec preference, int, bool enableHdr, bool enableYuv444) {
     if (preference == VideoCodec::hevc || preference == VideoCodec::av1 || enableHdr ||
         enableYuv444) {
@@ -3138,6 +3142,6 @@ void VideoRenderer::setGamepadRumble(std::uint16_t, std::uint16_t, std::uint16_t
 void VideoRenderer::setGamepadTriggerRumble(std::uint16_t, std::uint16_t, std::uint16_t) {}
 void VideoRenderer::setGamepadMotionEventState(std::uint16_t, std::uint8_t, std::uint16_t) {}
 void VideoRenderer::setGamepadLed(std::uint16_t, std::uint8_t, std::uint8_t, std::uint8_t) {}
-}  // namespace eclipse
+}  // namespace terra
 
 #endif

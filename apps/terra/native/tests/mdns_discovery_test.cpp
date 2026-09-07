@@ -66,8 +66,8 @@ int main() {
     appendRecord(packet, "Studio PC._nvstream._tcp.local", 33, service);
     appendRecord(packet, "studio.local", 1, {192, 168, 1, 40});
 
-    const auto services = eclipse::parseMdnsResponse(packet);
-    expect(services.size() == 1, "Complete Sunshine DNS-SD response was not resolved.");
+    const auto services = terra::parseMdnsResponse(packet);
+    expect(services.size() == 1, "Complete Sol DNS-SD response was not resolved.");
     expect(services.front().name == "studio pc", "Service instance name was not parsed.");
     expect(services.front().hostname == "studio.local", "SRV hostname was not parsed.");
     expect(services.front().address == "192.168.1.40", "IPv4 address was not parsed.");
@@ -86,21 +86,21 @@ int main() {
     appendRecord(ipv6Packet, "IPv6 PC._nvstream._tcp.local", 33, ipv6Service);
     appendRecord(ipv6Packet, "ipv6.local", 28,
                  {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x40});
-    const auto ipv6Services = eclipse::parseMdnsResponse(ipv6Packet);
-    expect(ipv6Services.size() == 1, "AAAA-only Sunshine response was not resolved.");
+    const auto ipv6Services = terra::parseMdnsResponse(ipv6Packet);
+    expect(ipv6Services.size() == 1, "AAAA-only Sol response was not resolved.");
     expect(ipv6Services.front().address == "2001:db8::40", "IPv6 address was not parsed.");
 
     auto linkLocalPacket = ipv6Packet;
     linkLocalPacket.resize(linkLocalPacket.size() - 16);
     linkLocalPacket.insert(linkLocalPacket.end(),
                            {0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});
-    const auto linkLocalServices = eclipse::parseMdnsResponse(linkLocalPacket, 7);
+    const auto linkLocalServices = terra::parseMdnsResponse(linkLocalPacket, 7);
     expect(linkLocalServices.size() == 1 && linkLocalServices.front().address == "fe80::1%7",
            "Link-local AAAA record lost its interface scope.");
 
     bool rejected = false;
     try {
-        static_cast<void>(eclipse::parseMdnsResponse(std::vector<std::uint8_t>{0, 1, 2}));
+        static_cast<void>(terra::parseMdnsResponse(std::vector<std::uint8_t>{0, 1, 2}));
     } catch (const std::runtime_error&) {
         rejected = true;
     }
@@ -116,7 +116,7 @@ int main() {
     appendU16(invalidRecord, 0);
     rejected = false;
     try {
-        static_cast<void>(eclipse::parseMdnsResponse(invalidRecord));
+        static_cast<void>(terra::parseMdnsResponse(invalidRecord));
     } catch (const std::runtime_error&) {
         rejected = true;
     }

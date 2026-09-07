@@ -136,7 +136,7 @@ export const useClientStore = create<ClientState>()(
             hostId,
             pin,
             state: 'pairing',
-            message: "Enter this PIN in Sunshine's web interface.",
+            message: "Enter this PIN in Sol's web interface.",
           },
         }),
       updatePairing: (update) =>
@@ -211,6 +211,7 @@ export const useClientStore = create<ClientState>()(
         })),
     }),
     {
+      // Persisted contract: keep existing profiles across the Terra branding rename.
       name: 'eclipse-client-settings',
       storage: createJSONStorage(() => settingsStorage),
       version: 1,

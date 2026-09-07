@@ -4,7 +4,7 @@ import { test } from 'node:test'
 
 const read = (relative) => readFileSync(new URL(relative, import.meta.url), 'utf8')
 const terra = '../../../apps/terra/src/'
-const progenitor = '../../../apps/progenitor/src_assets/common/assets/web/src/'
+const sol = '../../../apps/sol/src_assets/common/assets/web/src/'
 
 test('every original palette remains available under its persisted selector', () => {
   const themes = read('../src/themes.css')
@@ -12,8 +12,20 @@ test('every original palette remains available under its persisted selector', ()
   const names = [...catalog.matchAll(/^\s+'([a-z-]+)',/gm)].map((match) => match[1])
   assert.equal(names.length, 21)
   assert.equal(new Set(names).size, 21)
+  assert.ok(names.includes('sunshine'))
+  assert.ok(names.includes('moonlight'))
   for (const name of names) assert.ok(themes.includes(`[data-theme="${name}"]`), name)
   assert.match(themes, /:root:not\(\[data-theme\]\),\s*\[data-theme="dark"\]/)
+})
+
+test('shared branding and button hooks use Terra without changing the dark preference', () => {
+  const components = read('../src/index.tsx')
+  assert.match(components, /export function TerraBrand\(/)
+  assert.match(components, /<strong>TERRA<\/strong>/)
+  assert.match(components, /data-terra-button=""/)
+  assert.match(components, /'Terra \/ Dark'/)
+  assert.doesNotMatch(components, /EclipseBrand|data-eclipse-button/)
+  assert.match(read('../src/theme.ts'), /preference: 'dark'/)
 })
 
 test('all static Terra component classes survive the stylesheet replacement', () => {
@@ -35,7 +47,7 @@ test('main client CSS uses defined shared semantic tokens rather than old aliase
 })
 
 test('both app entrypoints load the shared stylesheet and theme initialization', () => {
-  for (const app of [terra, progenitor]) {
+  for (const app of [terra, sol]) {
     const main = read(`${app}main.tsx`)
     assert.match(main, /@supernova\/design-system\/styles\.css/)
     assert.match(main, /useThemeStore\.getState\(\)\.initialize\(\)/)

@@ -18,7 +18,7 @@
   --color-on-warning: #1a1a1a;
 }
 
-/* Eclipse is the default dark palette; the persisted "dark" selector is retained. */
+/* Terra is the default dark palette; the persisted "dark" selector is retained. */
 :root:not([data-theme]),
 [data-theme="dark"] {
   color-scheme: dark;

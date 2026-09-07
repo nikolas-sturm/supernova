@@ -11,8 +11,8 @@ void expect(bool condition, const char* message) {
 
 int main() {
     using namespace std::chrono_literals;
-    const eclipse::StreamStatistics::Clock::time_point started{};
-    eclipse::StreamStatistics statistics{started};
+    const terra::StreamStatistics::Clock::time_point started{};
+    terra::StreamStatistics statistics{started};
     statistics.recordVideoUnit(10, 500'000, 20, 1000);
     statistics.recordVideoUnit(12, 500'000, 40, 3000);
     statistics.recordDecoded(2000);
@@ -53,7 +53,7 @@ int main() {
     expect(secondSample && secondSample->sequence == 2 && secondSample->statistics.receivedFps == 1,
            "Second statistics window did not contain its delta.");
 
-    const auto text = eclipse::formatStreamStatistics(sample, 1920, 1080, "H.264");
+    const auto text = terra::formatStreamStatistics(sample, 1920, 1080, "H.264");
     expect(text.find("Video stream: 1920x1080 3.00 FPS (Codec: H.264)") != std::string::npos,
            "Overlay text omitted stream summary.");
     expect(text.find("Incoming frame rate from network: 2.00 FPS") != std::string::npos,
@@ -73,7 +73,7 @@ int main() {
     expect(text.find("Average rendering time (including monitor V-sync latency): 1.00 ms") !=
                std::string::npos,
            "Overlay text omitted rendering latency.");
-    const auto bitmap = eclipse::rasterizePerformanceOverlay(text);
+    const auto bitmap = terra::rasterizePerformanceOverlay(text);
     expect(bitmap.width > 0 && bitmap.height > 0 &&
                bitmap.rgba.size() == static_cast<std::size_t>(bitmap.width * bitmap.height * 4),
            "Overlay rasterizer produced invalid dimensions.");

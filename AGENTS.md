@@ -5,19 +5,23 @@
 - First-party code uses C++23 and TypeScript 7. Use Node.js 26.8.1, npm 12, the root
   lockfile/workspaces, and locally installed Nx 23.2. Preserve vendored standards,
   licenses, checksums, and submodule pins.
-- Read app-local instructions before editing. Reuse the shared Eclipse CSS design
-  system; retain all 21 themes and the `dark` Eclipse default.
-- Native roots: `apps/progenitor` and `apps/terra/native`. Use
+- Read app-local instructions before editing. Reuse the shared Terra CSS design
+  system; retain all 21 themes and the `dark` Terra default.
+- Native roots: `apps/sol` and `apps/terra/native`. Use
   `tooling/native/build.mjs`; Windows requires MSYS2 UCRT64, Linux its own toolchain.
   Keep app/configuration/platform build trees separate with `cmake-build-` names.
-- Terra debug/release builds share `apps/terra/extensions/eclipse-core/bin` when
+- Terra debug/release builds share `apps/terra/extensions/terra-core/bin` when
   staged. Stop the app and serialize staging, launch, and packaging.
+- Keep native build/vendor/staging trees excluded from Vite watchers through the
+  shared frontend configuration. Windows watcher handles can block CMake renames;
+  do not weaken filesystem permissions or replace pinned dependencies to bypass it.
 - Add or update relevant tests for behavior changes. Run only authorized checks;
   `check`, Terra `build`, and Terra `bundle` include tests. Report unrun checks and
   blockers, never inferred passes. Follow explicit no-tests/no-Nx task restrictions.
-- Nx is the intended orchestrator, but automation process lifetime remains
-  unresolved: graph output appeared and the tool hung. Direct workspace validation
-  commands are available, not a permanent replacement or proof of an Nx fix.
+- Nx runs without its optional persistent daemon (`useDaemonProcess: false`).
+  The automation runner waits on surviving detached processes even after the CLI
+  exits; do not enable the daemon or launch background servers through that runner.
+  Project graph and task caching remain enabled.
 - Do not install missing tools, switch toolchains, relax pins, or disable required
   features to bypass blockers without authorization. See `docs/development.md`.
 - Keep app versions independent. Shared admin API/IPC contracts are not yet

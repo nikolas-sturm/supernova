@@ -26,13 +26,13 @@ typedef struct {
 static void maybe_report_ready(OverlayState* state) {
     if (state->prewarm && state->page_loaded && !state->prewarm_reported) {
         state->prewarm_reported = TRUE;
-        puts("ECLIPSE_OVERLAY_PREWARMED");
+        puts("TERRA_OVERLAY_PREWARMED");
         fflush(stdout);
     }
     if (state->show_requested && state->layer_configured && state->page_loaded &&
         !state->ready_reported) {
         state->ready_reported = TRUE;
-        puts("ECLIPSE_OVERLAY_READY");
+        puts("TERRA_OVERLAY_READY");
         fflush(stdout);
     }
 }
@@ -96,7 +96,7 @@ static void apply_layer_shell(GtkWidget* widget, gpointer user_data) {
     struct wl_surface* wayland_surface = gdk_wayland_window_get_wl_surface(window);
     state->surface = zwlr_layer_shell_v1_get_layer_surface(
         state->shell, wayland_surface, NULL, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
-        "eclipse-stream-overlay");
+        "terra-stream-overlay");
     if (!state->surface) exit(EXIT_FAILURE);
 
     zwlr_layer_surface_v1_add_listener(state->surface, &layer_listener, state);
@@ -126,7 +126,7 @@ static void close_overlay(WebKitUserContentManager* manager, WebKitJavascriptRes
     const char* action = strcmp(requested_action, "disconnect") == 0
                              ? "disconnect"
                              : strcmp(requested_action, "quit") == 0 ? "quit" : "resume";
-    printf("ECLIPSE_OVERLAY_CLOSED %s\n", action);
+    printf("TERRA_OVERLAY_CLOSED %s\n", action);
     fflush(stdout);
     g_free(requested_action);
     if (!state->prewarm) {
@@ -167,7 +167,7 @@ static gboolean read_command(GIOChannel* channel, GIOCondition condition, gpoint
 
     g_strchomp(line);
     if (g_str_has_prefix(line, "SHOW ") && line[5] != '\0') {
-        gchar* script = g_strdup_printf("window.ECLIPSE_OVERLAY_SET_REQUEST('%s')", line + 5);
+        gchar* script = g_strdup_printf("window.TERRA_OVERLAY_SET_REQUEST('%s')", line + 5);
         webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL, NULL, NULL, NULL,
                                             NULL);
         g_free(script);
@@ -177,7 +177,7 @@ static gboolean read_command(GIOChannel* channel, GIOCondition condition, gpoint
         maybe_report_ready(state);
     } else if (g_str_has_prefix(line, "STATS ") && line[6] != '\0') {
         gchar* script =
-            g_strdup_printf("window.ECLIPSE_OVERLAY_SET_STATISTICS('%s')", line + 6);
+            g_strdup_printf("window.TERRA_OVERLAY_SET_STATISTICS('%s')", line + 6);
         webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL, NULL, NULL, NULL,
                                             NULL);
         g_free(script);
@@ -220,7 +220,7 @@ int main(int argc, char** argv) {
     state.prewarm = prewarm;
     state.show_requested = !prewarm;
     state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(state.window), "Eclipse Stream Overlay");
+    gtk_window_set_title(GTK_WINDOW(state.window), "Terra Stream Overlay");
     gtk_window_set_decorated(GTK_WINDOW(state.window), FALSE);
     g_signal_connect(state.window, "realize", G_CALLBACK(apply_layer_shell), &state);
     g_signal_connect(state.window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
@@ -231,19 +231,19 @@ int main(int argc, char** argv) {
     gtk_widget_set_app_paintable(state.window, TRUE);
 
     WebKitUserContentManager* manager = webkit_user_content_manager_new();
-    g_signal_connect(manager, "script-message-received::eclipseOverlayClose",
+    g_signal_connect(manager, "script-message-received::terraOverlayClose",
                      G_CALLBACK(close_overlay), &state);
     if (!webkit_user_content_manager_register_script_message_handler(manager,
-                                                                      "eclipseOverlayClose")) {
+                                                                      "terraOverlayClose")) {
         return EXIT_FAILURE;
     }
     const char* bridge =
-        "window.ECLIPSE_OVERLAY_NATIVE={close:function(action){window.webkit.messageHandlers."
-        "eclipseOverlayClose.postMessage(action||'resume')}};"
-        "window.ECLIPSE_OVERLAY_SET_REQUEST=function(value){window.dispatchEvent(new CustomEvent("
-        "'eclipse-overlay-request',{detail:JSON.parse(decodeURIComponent(value))}))};"
-        "window.ECLIPSE_OVERLAY_SET_STATISTICS=function(value){window.dispatchEvent(new CustomEvent("
-        "'eclipse-overlay-statistics',{detail:JSON.parse(decodeURIComponent(value))}))};";
+        "window.TERRA_OVERLAY_NATIVE={close:function(action){window.webkit.messageHandlers."
+        "terraOverlayClose.postMessage(action||'resume')}};"
+        "window.TERRA_OVERLAY_SET_REQUEST=function(value){window.dispatchEvent(new CustomEvent("
+        "'terra-overlay-request',{detail:JSON.parse(decodeURIComponent(value))}))};"
+        "window.TERRA_OVERLAY_SET_STATISTICS=function(value){window.dispatchEvent(new CustomEvent("
+        "'terra-overlay-statistics',{detail:JSON.parse(decodeURIComponent(value))}))};";
     WebKitUserScript* script = webkit_user_script_new(
         bridge, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
         NULL, NULL);

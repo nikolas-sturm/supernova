@@ -38,7 +38,7 @@ let neutralinoInitialized = false
 
 declare global {
   interface Window {
-    ECLIPSE_OVERLAY_NATIVE?: { close: (action?: OverlayCloseAction) => void }
+    TERRA_OVERLAY_NATIVE?: { close: (action?: OverlayCloseAction) => void }
   }
 }
 
@@ -59,7 +59,7 @@ export function StreamOverlay() {
   const readyRef = useRef(false)
   const route = /^\/stream-overlay\/([^/]+)$/.exec(window.location.pathname)
   const expectedRequestId = route?.[1] ? decodeURIComponent(route[1]) : undefined
-  const nativeBridge = window.ECLIPSE_OVERLAY_NATIVE
+  const nativeBridge = window.TERRA_OVERLAY_NATIVE
 
   const exitOverlay = useEffectEvent(
     async (notifyParent: boolean, action: OverlayCloseAction = 'resume') => {
@@ -107,9 +107,9 @@ export function StreamOverlay() {
   useEffect(() => {
     const handleStatistics = (event: Event) =>
       acceptStatistics((event as CustomEvent<unknown>).detail)
-    window.addEventListener('eclipse-overlay-statistics', handleStatistics)
+    window.addEventListener('terra-overlay-statistics', handleStatistics)
     if (nativeBridge || !hasNeutralinoRuntime()) {
-      return () => window.removeEventListener('eclipse-overlay-statistics', handleStatistics)
+      return () => window.removeEventListener('terra-overlay-statistics', handleStatistics)
     }
     const refresh = async () => {
       try {
@@ -122,7 +122,7 @@ export function StreamOverlay() {
     const timer = setInterval(() => void refresh(), 200)
     return () => {
       clearInterval(timer)
-      window.removeEventListener('eclipse-overlay-statistics', handleStatistics)
+      window.removeEventListener('terra-overlay-statistics', handleStatistics)
     }
   }, [])
 
@@ -155,10 +155,10 @@ export function StreamOverlay() {
           readyRef.current = true
           setRequest(result.data)
         }
-        window.addEventListener('eclipse-overlay-request', handleRequest)
+        window.addEventListener('terra-overlay-request', handleRequest)
         window.addEventListener('keydown', handleKeyDown, true)
         return () => {
-          window.removeEventListener('eclipse-overlay-request', handleRequest)
+          window.removeEventListener('terra-overlay-request', handleRequest)
           window.removeEventListener('keydown', handleKeyDown, true)
         }
       }
@@ -277,7 +277,7 @@ export function StreamOverlay() {
         <div className={styles.identity}>
           <span className={styles.signal} aria-hidden="true" />
           <div>
-            <strong>ECLIPSE</strong>
+            <strong>TERRA</strong>
             <span>STREAM OVERLAY</span>
           </div>
         </div>
@@ -516,7 +516,7 @@ function TabContent({ activeTab, request, currentStatistics, disconnect, quit }:
           <Row
             label="USB forwarding"
             value="Unavailable"
-            note="Eclipse does not expose USB redirection in this build."
+            note="Terra does not expose USB redirection in this build."
           />
         </div>
       </>
@@ -565,11 +565,11 @@ function TabContent({ activeTab, request, currentStatistics, disconnect, quit }:
     <>
       <PanelTitle
         eyebrow="CLIENT"
-        title="About Eclipse"
-        description="Open game streaming client powered by Moonlight common and Sunshine-compatible hosts."
+        title="About Terra"
+        description="Terra streams from Sol and compatible hosts, powered by Moonlight common."
       />
       <div className={styles.settingsList}>
-        <Row label="Eclipse client" value="0.1.0" />
+        <Row label="Terra client" value="0.1.0" />
         <Row label="Overlay protocol" value="Version 1" />
         <Row label="Telemetry window" value="60 seconds / 1 Hz" />
         <Row label="Session generation" value={request?.generation ?? 'Unavailable'} />

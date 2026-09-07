@@ -6,7 +6,7 @@ The applications entered this monorepo through **unsquashed subtree imports**:
 
 | Source | Imported revision | Monorepo prefix |
 | --- | --- | --- |
-| Progenitor | `74273db` | `apps/progenitor/` |
+| Progenitor (now Sol) | `74273db` | `apps/sol/` |
 | Terra | `3333223` | `apps/terra/` |
 
 Original commits and ancestry remain available, and the original source
@@ -15,11 +15,16 @@ to simplify the monorepo. Third-party recursive submodules are distinct from
 these first-party subtree imports; their recorded gitlinks and `.gitmodules`
 paths remain the dependency source of truth.
 
+The host's original import prefix was `apps/progenitor/`; its current prefix is
+`apps/sol/`. Submodule section names preserve the original `progenitor/` identity,
+while their paths follow the current prefix. This is a working-tree relocation,
+not a rewrite of the original import commit or source checkout.
+
 ## Selective Updates
 
 Bring in reviewed fixes selectively rather than merging an upstream root tree
 over the monorepo. Fetching a source repository does not itself make its paths
-match `apps/progenitor/` or `apps/terra/`.
+match `apps/sol/` or `apps/terra/`.
 
 1. Identify the source repository, full commit SHA, parent/base, license, and
    prerequisites. Inspect the complete diff, including renames, binary files,
@@ -73,7 +78,7 @@ platform integration, and application behavior must be assessed and ported into
 Terra's Neutralino/C++ implementation where relevant. A pin update is not proof
 that equivalent application behavior exists or works.
 
-Progenitor has a separate `apps/progenitor/third-party/moonlight-common-c` pin.
+Sol has a separate `apps/sol/third-party/moonlight-common-c` pin.
 Do not assume the host and client dependency pointers move together. Preserve
 upstream standards, checksums, licenses, and unsupported-platform source while
 reviewing any pin update. None of that expands Supernova's Windows/Linux support

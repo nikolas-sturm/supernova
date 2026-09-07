@@ -18,7 +18,7 @@
 #include "stream_statistics.h"
 #include "stream_settings.h"
 
-namespace eclipse {
+namespace terra {
 
 struct StreamSessionEvent;
 
@@ -154,4 +154,4 @@ private:
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> lastWakeRequests_;
 };
 
-}  // namespace eclipse
+}  // namespace terra

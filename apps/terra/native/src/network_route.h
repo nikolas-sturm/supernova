@@ -2,7 +2,7 @@
 
 #include <string_view>
 
-namespace eclipse {
+namespace terra {
 
 enum class RouteReachability { unknown, lan, vpn };
 enum class StreamingLocation { automatic, local, remote };
@@ -18,4 +18,4 @@ struct StreamNetworkConfiguration {
     RouteReachability reachability) noexcept;
 [[nodiscard]] RouteReachability detectRouteReachability(std::string_view host) noexcept;
 
-}  // namespace eclipse
+}  // namespace terra

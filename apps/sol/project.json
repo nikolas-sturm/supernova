@@ -1,0 +1,60 @@
+{
+  "name": "sol",
+  "projectType": "application",
+  "implicitDependencies": ["design-system", "native-tooling", "frontend-tooling"],
+  "targets": {
+    "lint": { "command": "npm run lint --workspace apps/sol" },
+    "typecheck": { "command": "npm run typecheck --workspace apps/sol" },
+    "test": { "command": "npm run test --workspace apps/sol" },
+    "build:web": {
+      "cache": false,
+      "command": "npm run build --workspace apps/sol",
+      "outputs": ["{projectRoot}/build/assets/web"],
+      "inputs": [
+        "production",
+        "^production",
+        { "env": "SOL_SOURCE_ASSETS_DIR" },
+        { "env": "SOL_ASSETS_DIR" },
+        { "env": "SOL_BUILD_HOMEBREW" },
+        { "env": "GITHUB_REPOSITORY" }
+      ]
+    },
+    "dev:web": {
+      "command": "npm run dev --workspace apps/sol",
+      "continuous": true,
+      "cache": false
+    },
+    "native:configure": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "debug",
+      "options": { "command": "node tooling/native/build.mjs sol configure debug" },
+      "configurations": {
+        "debug": {},
+        "release": { "command": "node tooling/native/build.mjs sol configure release" }
+      }
+    },
+    "native:build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["native:configure"],
+      "defaultConfiguration": "debug",
+      "options": { "command": "node tooling/native/build.mjs sol build debug" },
+      "configurations": {
+        "debug": {},
+        "release": { "command": "node tooling/native/build.mjs sol build release" }
+      }
+    },
+    "native:test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["native:build"],
+      "defaultConfiguration": "debug",
+      "options": { "command": "node tooling/native/build.mjs sol test debug" },
+      "configurations": {
+        "debug": {},
+        "release": { "command": "node tooling/native/build.mjs sol test release" }
+      }
+    }
+  }
+}

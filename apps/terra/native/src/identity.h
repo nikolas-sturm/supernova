@@ -5,7 +5,7 @@
 
 #include <openssl/types.h>
 
-namespace eclipse {
+namespace terra {
 
 class Identity {
 public:
@@ -33,4 +33,4 @@ private:
     EVP_PKEY* privateKey_ = nullptr;
 };
 
-}  // namespace eclipse
+}  // namespace terra

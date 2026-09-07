@@ -12,7 +12,7 @@ extern "C" {
 #include <Limelight.h>
 }
 
-namespace eclipse {
+namespace terra {
 
 class StreamStatistics;
 
@@ -64,4 +64,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace eclipse
+}  // namespace terra

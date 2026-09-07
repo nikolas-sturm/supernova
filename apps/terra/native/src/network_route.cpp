@@ -20,7 +20,7 @@
 #include <unistd.h>
 #endif
 
-namespace eclipse {
+namespace terra {
 namespace {
 constexpr auto kStreamPort = "47989";
 
@@ -273,4 +273,4 @@ RouteReachability detectRouteReachability(std::string_view host) noexcept {
     return result;
 }
 
-}  // namespace eclipse
+}  // namespace terra

@@ -25,7 +25,7 @@
 #include "video_renderer.h"
 #include "wake_on_lan.h"
 
-namespace eclipse {
+namespace terra {
 namespace {
 using Json = nlohmann::json;
 
@@ -139,7 +139,7 @@ std::string imageDataUrl(const std::string& bytes) {
                static_cast<unsigned char>(bytes[2]) == 0xff) {
         mime = "image/jpeg";
     } else {
-        throw std::runtime_error("Sunshine returned unsupported application artwork.");
+        throw std::runtime_error("Sol returned unsupported application artwork.");
     }
 
     std::string encoded(4 * ((bytes.size() + 2) / 3), '\0');
@@ -438,7 +438,7 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
     {
         std::scoped_lock lock{mutex_};
         if (transport_ || session_) {
-            throw std::runtime_error("Eclipse already has an active stream. Stop it before launching again.");
+            throw std::runtime_error("Terra already has an active stream. Stop it before launching again.");
         }
         const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
             return value.id == hostId;
@@ -831,9 +831,9 @@ void ControlPlane::cleanupSessions() {
         try {
             finishSessionDisconnect(request);
         } catch (const std::exception& exception) {
-            std::fprintf(stderr, "[eclipse-core] session cleanup failed: %s\n", exception.what());
+            std::fprintf(stderr, "[terra-core] session cleanup failed: %s\n", exception.what());
         } catch (...) {
-            std::fputs("[eclipse-core] session cleanup failed with an unknown error.\n", stderr);
+            std::fputs("[terra-core] session cleanup failed with an unknown error.\n", stderr);
         }
     }
 }
@@ -1094,4 +1094,4 @@ void ControlPlane::saveLocked() const {
     }
 }
 
-}  // namespace eclipse
+}  // namespace terra

@@ -21,16 +21,16 @@ import {
 } from './overlayWindow'
 import { hasNeutralinoRuntime, initializeNeutralinoRuntime } from './runtime'
 
-const extensionId = 'dev.eclipse.core'
-const statusEvent = 'eclipse.core.status'
-const hostsEvent = 'eclipse.hosts.changed'
-const hostErrorEvent = 'eclipse.host.error'
-const pairingEvent = 'eclipse.pairing.changed'
-const appsEvent = 'eclipse.apps.changed'
-const artworkEvent = 'eclipse.app.art.changed'
-const sessionEvent = 'eclipse.session.changed'
-const streamOverlayEvent = 'eclipse.stream.overlay.requested'
-const streamStatisticsEvent = 'eclipse.stream.statistics'
+const extensionId = 'dev.terra.core'
+const statusEvent = 'terra.core.status'
+const hostsEvent = 'terra.hosts.changed'
+const hostErrorEvent = 'terra.host.error'
+const pairingEvent = 'terra.pairing.changed'
+const appsEvent = 'terra.apps.changed'
+const artworkEvent = 'terra.app.art.changed'
+const sessionEvent = 'terra.session.changed'
+const streamOverlayEvent = 'terra.stream.overlay.requested'
+const streamStatisticsEvent = 'terra.stream.statistics'
 
 const statusSchema = z.object({
   schemaVersion: z.literal(1),
@@ -230,7 +230,7 @@ export function startCoreBridge({
     onStatus({
       state: 'error',
       label: 'Core disconnected',
-      detail: 'Native core exited. Restart Eclipse before sending host commands.',
+      detail: 'Native core exited. Restart Terra before sending host commands.',
     })
   }
 
@@ -292,7 +292,7 @@ export function startCoreBridge({
           }),
     ).catch((error: unknown) => {
       onHostError(
-        error instanceof Error ? error.message : 'Eclipse could not open the stream overlay.',
+        error instanceof Error ? error.message : 'Terra could not open the stream overlay.',
       )
     })
   }

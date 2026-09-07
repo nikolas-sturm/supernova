@@ -42,7 +42,7 @@ function shellQuote(value: string) {
 }
 
 function waylandChildCommand(url: string, prewarm = false) {
-  const executable = `${window.NL_PATH}/extensions/eclipse-core/bin/eclipse-wayland-overlay`
+  const executable = `${window.NL_PATH}/extensions/terra-core/bin/terra-wayland-overlay`
   return [executable, ...(prewarm ? ['--prewarm'] : []), url].map(shellQuote).join(' ')
 }
 
@@ -125,7 +125,7 @@ function watchSpawnedProcesses() {
       detail.action === 'stdOut' &&
       'data' in detail &&
       typeof detail.data === 'string' &&
-      detail.data.includes('ECLIPSE_OVERLAY_PREWARMED')
+      detail.data.includes('TERRA_OVERLAY_PREWARMED')
     ) {
       if (detail.id === warmProcess?.id) {
         warmProcess.ready = true
@@ -138,7 +138,7 @@ function watchSpawnedProcesses() {
       detail.action === 'stdOut' &&
       'data' in detail &&
       typeof detail.data === 'string' &&
-      detail.data.includes('ECLIPSE_OVERLAY_READY')
+      detail.data.includes('TERRA_OVERLAY_READY')
     ) {
       if (detail.id === childProcess?.id) {
         childReady = true
@@ -155,7 +155,7 @@ function watchSpawnedProcesses() {
       detail.action === 'stdOut' &&
       'data' in detail &&
       typeof detail.data === 'string' &&
-      detail.data.includes('ECLIPSE_OVERLAY_CLOSED') &&
+      detail.data.includes('TERRA_OVERLAY_CLOSED') &&
       detail.id === childProcess?.id
     ) {
       const action = detail.data.includes(' quit')
@@ -321,7 +321,7 @@ export async function openStreamOverlay(request: StreamOverlayRequest, onClosed:
       }
     } else {
       await neutralinoWindow.create(route, {
-        title: 'Eclipse Stream Overlay',
+        title: 'Terra Stream Overlay',
         x: request.bounds.x,
         y: request.bounds.y,
         width: request.bounds.width,

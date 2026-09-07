@@ -1,9 +1,9 @@
 import { z } from 'zod'
 
-export const overlayRequestStorageKey = 'eclipse_stream_overlay_request'
-export const overlayClosedStorageKey = 'eclipse_stream_overlay_closed'
-export const overlayReadyStorageKey = 'eclipse_stream_overlay_ready'
-export const overlayStatisticsStorageKey = 'eclipse_stream_overlay_statistics'
+export const overlayRequestStorageKey = 'terra_stream_overlay_request'
+export const overlayClosedStorageKey = 'terra_stream_overlay_closed'
+export const overlayReadyStorageKey = 'terra_stream_overlay_ready'
+export const overlayStatisticsStorageKey = 'terra_stream_overlay_statistics'
 
 export const overlayCloseActionSchema = z.enum(['resume', 'disconnect', 'quit'])
 

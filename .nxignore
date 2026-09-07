@@ -1,7 +1,7 @@
 # Vendored projects are not independently orchestrated workspace projects.
 # Native targets are uncached; review and validate submodule updates explicitly.
-apps/progenitor/third-party/**/*
-apps/progenitor/packaging/linux/flatpak/deps/**/*
+apps/sol/third-party/**/*
+apps/sol/packaging/linux/flatpak/deps/**/*
 apps/terra/refs/**/*
 **/cmake-build-*/**
 **/build/**
@@ -10,3 +10,4 @@ apps/terra/refs/**/*
 **/coverage/**
 **/.venv/**
 apps/terra/extensions/eclipse-core/bin/**
+apps/terra/extensions/terra-core/bin/**

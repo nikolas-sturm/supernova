@@ -2,7 +2,7 @@
 
 #include <stdexcept>
 
-#if defined(_WIN32) && defined(ECLIPSE_HAS_WINDOWS_VIDEO)
+#if defined(_WIN32) && defined(TERRA_HAS_WINDOWS_VIDEO)
 
 #include <atomic>
 #include <condition_variable>
@@ -29,7 +29,7 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
-namespace eclipse {
+namespace terra {
 namespace {
 using Microsoft::WRL::ComPtr;
 
@@ -335,7 +335,7 @@ bool AudioRenderer::supportsOutputChannels(int channels) noexcept {
     if (SUCCEEDED(result)) result = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
     if (SUCCEEDED(result)) {
         result = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
-                                  IID_PPV_ARGS(&client));
+                                  reinterpret_cast<void**>(client.GetAddressOf()));
     }
 
     WAVEFORMATEXTENSIBLE format{};
@@ -365,9 +365,9 @@ bool AudioRenderer::supportsOutputChannels(int channels) noexcept {
     return result == S_OK;
 }
 
-}  // namespace eclipse
+}  // namespace terra
 
-#elif defined(__linux__) && defined(ECLIPSE_HAS_LINUX_AUDIO)
+#elif defined(__linux__) && defined(TERRA_HAS_LINUX_AUDIO)
 
 #include <algorithm>
 #include <atomic>
@@ -388,7 +388,7 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
-namespace eclipse {
+namespace terra {
 namespace {
 
 constexpr int kOutputSampleRate = 48000;
@@ -687,11 +687,11 @@ bool AudioRenderer::supportsOutputChannels(int channels) noexcept {
     return supported;
 }
 
-}  // namespace eclipse
+}  // namespace terra
 
 #else
 
-namespace eclipse {
+namespace terra {
 struct AudioRenderer::Impl {
     explicit Impl(StatusListener) {}
 };
@@ -704,6 +704,6 @@ void AudioRenderer::initialize(const OPUS_MULTISTREAM_CONFIGURATION&) {
 void AudioRenderer::submit(const char*, int) {}
 bool AudioRenderer::recoveryRequired() const noexcept { return false; }
 bool AudioRenderer::supportsOutputChannels(int channels) noexcept { return channels == 2; }
-}  // namespace eclipse
+}  // namespace terra
 
 #endif

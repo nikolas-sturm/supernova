@@ -8,13 +8,13 @@
 
 #include "stream_settings.h"
 
-namespace eclipse {
+namespace terra {
 
 std::uint16_t connectedGamepadMask();
 bool gamepadTransportAvailable() noexcept;
 [[nodiscard]] std::optional<std::string> prepareClipboardText(std::string_view text);
 
-}  // namespace eclipse
+}  // namespace terra
 
 #if defined(_WIN32)
 
@@ -22,7 +22,7 @@ bool gamepadTransportAvailable() noexcept;
 
 #include <memory>
 
-namespace eclipse {
+namespace terra {
 
 class InputForwarder {
  public:
@@ -55,15 +55,15 @@ class InputForwarder {
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace eclipse
+}  // namespace terra
 
-#elif defined(__linux__) && defined(ECLIPSE_HAS_LINUX_VIDEO)
+#elif defined(__linux__) && defined(TERRA_HAS_LINUX_VIDEO)
 
 #include <memory>
 
 #include <SDL.h>
 
-namespace eclipse {
+namespace terra {
 
 class InputForwarder {
  public:
@@ -96,6 +96,6 @@ class InputForwarder {
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace eclipse
+}  // namespace terra
 
 #endif

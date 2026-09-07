@@ -229,7 +229,7 @@ export function SettingsView({ section = 'profile' }: { section?: 'profile' | 'g
                 onChange={(gamepadMouse) => update({ gamepadMouse })}
               />
               <Toggle
-                label="Process gamepad input while Eclipse is in background"
+                label="Process gamepad input while Terra is in background"
                 checked={settings.backgroundGamepad}
                 onChange={(backgroundGamepad) => update({ backgroundGamepad })}
               />
@@ -393,7 +393,7 @@ export function SettingsView({ section = 'profile' }: { section?: 'profile' | 'g
                 onChange={(muteHostAudio) => update({ muteHostAudio })}
               />
               <Toggle
-                label="Mute audio stream when Eclipse is not active"
+                label="Mute audio stream when Terra is not active"
                 note="Planned: focus-aware WASAPI control"
                 checked={settings.muteOnFocusLoss}
                 disabled
@@ -423,7 +423,7 @@ export function SettingsView({ section = 'profile' }: { section?: 'profile' | 'g
               <div className={styles.toggleStack}>
                 <Toggle
                   label="Leave desktop available after disconnecting"
-                  note="Keeps the Sunshine application running for fast reconnection"
+                  note="Keeps the host application running for fast reconnection"
                   checked={!settings.quitAppAfter}
                   onChange={(leaveRunning) => update({ quitAppAfter: !leaveRunning })}
                 />
@@ -516,7 +516,7 @@ export function SettingsView({ section = 'profile' }: { section?: 'profile' | 'g
               />
               <Toggle
                 label="Use touchscreen as a virtual trackpad"
-                note="Turn off to send direct Sunshine touch and pen input"
+                note="Turn off to send direct Sol touch and pen input"
                 checked={settings.touchscreenTrackpad}
                 onChange={(touchscreenTrackpad) => update({ touchscreenTrackpad })}
               />
@@ -589,7 +589,7 @@ export function SettingsView({ section = 'profile' }: { section?: 'profile' | 'g
               />
               <Toggle
                 label="Automatically find PCs on local network"
-                note="Discovers Sunshine hosts through local DNS-SD"
+                note="Discovers compatible hosts through local DNS-SD"
                 checked={settings.autoDiscoverHosts}
                 onChange={(autoDiscoverHosts) => update({ autoDiscoverHosts })}
               />

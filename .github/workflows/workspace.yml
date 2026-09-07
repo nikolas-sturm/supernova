@@ -28,8 +28,8 @@ jobs:
           cache: npm
       - run: npm --version
       - run: npm ci
-      # Direct validation until automation process lifetime with Nx is resolved.
+      # Includes workspace invariants and a bounded Nx process-exit regression.
       # This job does not validate native compilation or hardware streaming.
       - run: npm run check:workspace
-      - run: npm run build --workspace apps/progenitor
+      - run: npm run build --workspace apps/sol
       - run: npm run build:web --workspace apps/terra

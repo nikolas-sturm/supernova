@@ -104,7 +104,7 @@ describe('overlayWindow', () => {
     Object.defineProperties(window, {
       NL_ARGS: {
         configurable: true,
-        value: ['/opt/eclipse', '--path=/opt/app resources', '--window-width=1280'],
+        value: ['/opt/terra', '--path=/opt/app resources', '--window-width=1280'],
       },
       NL_PATH: { configurable: true, value: '/opt/app' },
     })
@@ -128,7 +128,7 @@ describe('overlayWindow', () => {
     expect(neutralino.create).not.toHaveBeenCalled()
     expect(neutralino.spawnProcess).toHaveBeenCalledWith(
       expect.stringContaining(
-        "'/opt/app/extensions/eclipse-core/bin/eclipse-wayland-overlay' 'http://localhost:",
+        "'/opt/app/extensions/terra-core/bin/terra-wayland-overlay' 'http://localhost:",
       ),
     )
     expect(neutralino.spawnProcess.mock.calls[0]?.[0]).toContain('/stream-overlay/')
@@ -162,7 +162,7 @@ describe('overlayWindow', () => {
     expect(neutralino.spawnProcess.mock.calls[0]?.[0]).toContain('/stream-overlay/prewarm')
     neutralino.eventHandlers.get('spawnedProcess')?.(
       new CustomEvent('spawnedProcess', {
-        detail: { id: 1, action: 'stdOut', data: 'ECLIPSE_OVERLAY_PREWARMED\n' },
+        detail: { id: 1, action: 'stdOut', data: 'TERRA_OVERLAY_PREWARMED\n' },
       }),
     )
 
@@ -189,7 +189,7 @@ describe('overlayWindow', () => {
     )
     neutralino.eventHandlers.get('spawnedProcess')?.(
       new CustomEvent('spawnedProcess', {
-        detail: { id: 1, action: 'stdOut', data: 'ECLIPSE_OVERLAY_CLOSED\n' },
+        detail: { id: 1, action: 'stdOut', data: 'TERRA_OVERLAY_CLOSED\n' },
       }),
     )
 
@@ -270,7 +270,7 @@ describe('overlayWindow', () => {
       )
       neutralino.eventHandlers.get('spawnedProcess')?.(
         new CustomEvent('spawnedProcess', {
-          detail: { id: 1, action: 'stdOut', data: 'ECLIPSE_OVERLAY_READY\n' },
+          detail: { id: 1, action: 'stdOut', data: 'TERRA_OVERLAY_READY\n' },
         }),
       )
 

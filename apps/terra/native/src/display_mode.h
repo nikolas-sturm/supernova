@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <span>
 
-namespace eclipse {
+namespace terra {
 
 struct DisplayModeSpec {
     int width = 0;
@@ -59,4 +59,4 @@ struct DisplayModeSpec {
     return best.refreshRate > 0 ? best : desktopMode;
 }
 
-}  // namespace eclipse
+}  // namespace terra

@@ -1,7 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-  <title>Eclipse</title>
-  <rect width="128" height="128" rx="28" fill="#08090b"/>
-  <circle cx="64" cy="64" r="39" fill="#d7ff4f"/>
-  <circle cx="76" cy="55" r="39" fill="#15131c"/>
-  <path d="M22 78c17 27 55 35 82 9" fill="none" stroke="#9d7bff" stroke-width="5" stroke-linecap="round"/>
-</svg>

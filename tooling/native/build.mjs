@@ -6,14 +6,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const root = fileURLToPath(new URL('../../', import.meta.url))
 export const usage =
-  'Usage: node tooling/native/build.mjs <progenitor|terra> <configure|build|test> <debug|release>'
+  'Usage: node tooling/native/build.mjs <sol|terra> <configure|build|test> <debug|release>'
 
 /** Validate the public CLI before inspecting or invoking native tools. */
 export function parseArgs(args) {
   const [app, operation, config] = args
   if (
     args.length !== 3 ||
-    !['progenitor', 'terra'].includes(app) ||
+    !['sol', 'terra'].includes(app) ||
     !['configure', 'build', 'test'].includes(operation) ||
     !['debug', 'release'].includes(config)
   ) {
@@ -43,8 +43,8 @@ export function commandsFor({ app, operation, config }, platform = process.platf
       command.push('-DCMAKE_C_COMPILER=gcc', '-DCMAKE_CXX_COMPILER=g++')
     }
     command.push(
-      ...(app === 'progenitor'
-        ? ['-DSUNSHINE_BUILD_WEB_UI=OFF', '-DBUILD_DOCS=OFF', '-DBUILD_TESTS=ON']
+      ...(app === 'sol'
+        ? ['-DSOL_BUILD_WEB_UI=OFF', '-DBUILD_DOCS=OFF', '-DBUILD_TESTS=ON']
         : ['-DBUILD_TESTING=ON']),
     )
     return [command]
@@ -54,8 +54,8 @@ export function commandsFor({ app, operation, config }, platform = process.platf
     if (app === 'terra') commands.push(['cmake', '--build', build, '--target', 'stage-extension'])
     return commands
   }
-  return app === 'progenitor'
-    ? [[path.join(build, 'tests', `test_sunshine${platform === 'win32' ? '.exe' : ''}`)]]
+  return app === 'sol'
+    ? [[path.join(build, 'tests', `test_sol${platform === 'win32' ? '.exe' : ''}`)]]
     : [['ctest', '--test-dir', build, '--output-on-failure', '--no-tests=error']]
 }
 
@@ -74,9 +74,7 @@ export function main(args) {
   }
   const commands = commandsFor(options)
   const commandDirectory =
-    options.app === 'progenitor' && options.operation === 'test'
-      ? path.dirname(commands[0][0])
-      : root
+    options.app === 'sol' && options.operation === 'test' ? path.dirname(commands[0][0]) : root
   const run = (command, argv, extra = {}) => {
     const result = spawnSync(command, argv, { cwd: root, stdio: 'inherit', ...extra })
     if (result.error) throw new Error(`Cannot run ${command}: ${result.error.message}`)

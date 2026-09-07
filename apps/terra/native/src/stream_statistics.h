@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace eclipse {
+namespace terra {
 
 struct StreamStatisticsSnapshot {
     double totalFps = 0;
@@ -96,4 +96,4 @@ private:
                                                   const std::string& codec);
 [[nodiscard]] OverlayBitmap rasterizePerformanceOverlay(const std::string& text, int scale = 2);
 
-}  // namespace eclipse
+}  // namespace terra

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(eclipse-client LANGUAGES C CXX)
+project(terra-client LANGUAGES C CXX)
 
 include(FetchContent)
 include(CTest)
@@ -11,17 +11,17 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(ECLIPSE_LINK_MOONLIGHT_COMMON "Build and link pinned moonlight-common-c" ON)
-option(ECLIPSE_ENABLE_WINDOWS_VIDEO "Build FFmpeg D3D11VA video output on Windows" ON)
-option(ECLIPSE_ENABLE_LINUX_VIDEO "Build FFmpeg SDL video output on Linux" ON)
-option(ECLIPSE_ENABLE_LINUX_AUDIO "Build FFmpeg SDL audio output on Linux" ON)
-option(ECLIPSE_ENABLE_VAAPI_X11 "Enable direct VAAPI presentation on native X11" ON)
-option(ECLIPSE_ENABLE_LIBPLACEBO "Enable Vulkan HDR and YUV 4:4:4 presentation on Linux" ON)
+option(TERRA_LINK_MOONLIGHT_COMMON "Build and link pinned moonlight-common-c" ON)
+option(TERRA_ENABLE_WINDOWS_VIDEO "Build FFmpeg D3D11VA video output on Windows" ON)
+option(TERRA_ENABLE_LINUX_VIDEO "Build FFmpeg SDL video output on Linux" ON)
+option(TERRA_ENABLE_LINUX_AUDIO "Build FFmpeg SDL audio output on Linux" ON)
+option(TERRA_ENABLE_VAAPI_X11 "Enable direct VAAPI presentation on native X11" ON)
+option(TERRA_ENABLE_LIBPLACEBO "Enable Vulkan HDR and YUV 4:4:4 presentation on Linux" ON)
 
-set(ECLIPSE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
-set(MOONLIGHT_QT_ROOT "${ECLIPSE_ROOT}/refs/moonlight-qt")
+set(TERRA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
+set(MOONLIGHT_QT_ROOT "${TERRA_ROOT}/refs/moonlight-qt")
 set(MOONLIGHT_COMMON_ROOT "${MOONLIGHT_QT_ROOT}/moonlight-common-c/moonlight-common-c")
-set(ECLIPSE_EXTENSION_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/extension/$<CONFIG>")
+set(TERRA_EXTENSION_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/extension/$<CONFIG>")
 
 if(NOT EXISTS "${MOONLIGHT_QT_ROOT}/.git")
   message(FATAL_ERROR "Moonlight submodule missing. Run: git submodule update --init --recursive")
@@ -29,7 +29,7 @@ endif()
 
 find_package(Git QUIET)
 
-function(eclipse_git_revision directory output_variable)
+function(terra_git_revision directory output_variable)
   if(Git_FOUND)
     execute_process(
       COMMAND "${GIT_EXECUTABLE}" rev-parse --short=12 HEAD
@@ -47,8 +47,8 @@ function(eclipse_git_revision directory output_variable)
   set(${output_variable} "${revision}" PARENT_SCOPE)
 endfunction()
 
-eclipse_git_revision("${MOONLIGHT_QT_ROOT}" ECLIPSE_MOONLIGHT_QT_REVISION)
-eclipse_git_revision("${MOONLIGHT_COMMON_ROOT}" ECLIPSE_MOONLIGHT_COMMON_REVISION)
+terra_git_revision("${MOONLIGHT_QT_ROOT}" TERRA_MOONLIGHT_QT_REVISION)
+terra_git_revision("${MOONLIGHT_COMMON_ROOT}" TERRA_MOONLIGHT_COMMON_REVISION)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static dependencies" FORCE)
 set(USE_TLS ON CACHE BOOL "IXWebSocket TLS support" FORCE)
@@ -76,7 +76,7 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(ixwebsocket nlohmann_json pugixml)
 
-if(WIN32 AND ECLIPSE_ENABLE_WINDOWS_VIDEO)
+if(WIN32 AND TERRA_ENABLE_WINDOWS_VIDEO)
   FetchContent_Declare(
     ffmpeg_prebuilt
     URL https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-full_build-shared.7z
@@ -115,7 +115,7 @@ if(WIN32 AND ECLIPSE_ENABLE_WINDOWS_VIDEO)
   )
 endif()
 
-if(ECLIPSE_LINK_MOONLIGHT_COMMON)
+if(TERRA_LINK_MOONLIGHT_COMMON)
   if(NOT EXISTS "${MOONLIGHT_COMMON_ROOT}/CMakeLists.txt")
     message(FATAL_ERROR "moonlight-common-c is missing. Initialize recursive submodules.")
   endif()
@@ -128,19 +128,19 @@ find_package(OpenSSL REQUIRED)
 # Dependencies retain their upstream standards; first-party C++ uses C++23.
 set(CMAKE_CXX_STANDARD 23)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (ECLIPSE_ENABLE_LINUX_VIDEO OR ECLIPSE_ENABLE_LINUX_AUDIO))
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (TERRA_ENABLE_LINUX_VIDEO OR TERRA_ENABLE_LINUX_AUDIO))
   find_package(PkgConfig REQUIRED)
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ECLIPSE_ENABLE_LINUX_VIDEO)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TERRA_ENABLE_LINUX_VIDEO)
   pkg_check_modules(LINUX_VIDEO REQUIRED IMPORTED_TARGET sdl2>=2.0.16 libavcodec>=59 libavutil>=57)
   pkg_check_modules(LINUX_WAYLAND REQUIRED IMPORTED_TARGET wayland-client wayland-protocols)
   pkg_check_modules(LINUX_GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0>=3.22)
   pkg_check_modules(LINUX_WEBKIT REQUIRED IMPORTED_TARGET webkit2gtk-4.1>=2.40)
-  if(ECLIPSE_ENABLE_VAAPI_X11)
+  if(TERRA_ENABLE_VAAPI_X11)
     pkg_check_modules(LINUX_VAAPI_X11 QUIET IMPORTED_TARGET libva>=1.8 libva-x11>=1.8 x11)
   endif()
-  if(ECLIPSE_ENABLE_LIBPLACEBO)
+  if(TERRA_ENABLE_LIBPLACEBO)
     pkg_check_modules(LINUX_LIBPLACEBO QUIET IMPORTED_TARGET libplacebo>=7 vulkan libavformat>=59)
   endif()
 endif()
@@ -176,7 +176,7 @@ if(TARGET PkgConfig::LINUX_WAYLAND AND TARGET PkgConfig::LINUX_GTK3)
     VERBATIM
   )
 
-  add_executable(eclipse-wayland-overlay
+  add_executable(terra-wayland-overlay
     src/wayland_overlay.c
     "${XDG_SHELL_SOURCE}"
     "${WLR_LAYER_SHELL_SOURCE}"
@@ -186,31 +186,31 @@ if(TARGET PkgConfig::LINUX_WAYLAND AND TARGET PkgConfig::LINUX_GTK3)
     "${WLR_LAYER_SHELL_SOURCE}"
     PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden"
   )
-  target_include_directories(eclipse-wayland-overlay PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-  target_link_libraries(eclipse-wayland-overlay PRIVATE
+  target_include_directories(terra-wayland-overlay PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+  target_link_libraries(terra-wayland-overlay PRIVATE
     PkgConfig::LINUX_GTK3
     PkgConfig::LINUX_WEBKIT
     PkgConfig::LINUX_WAYLAND
   )
-  target_compile_options(eclipse-wayland-overlay PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(terra-wayland-overlay PRIVATE -Wall -Wextra -Wpedantic)
   set_target_properties(
-    eclipse-wayland-overlay
-    PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${ECLIPSE_EXTENSION_OUTPUT}"
+    terra-wayland-overlay
+    PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TERRA_EXTENSION_OUTPUT}"
   )
   add_custom_command(
-    TARGET eclipse-wayland-overlay
+    TARGET terra-wayland-overlay
     POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E rm -f
-            "${ECLIPSE_EXTENSION_OUTPUT}/libeclipse-wayland-parent.so"
+            "${TERRA_EXTENSION_OUTPUT}/libterra-wayland-parent.so"
   )
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ECLIPSE_ENABLE_LINUX_AUDIO)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TERRA_ENABLE_LINUX_AUDIO)
   pkg_check_modules(LINUX_AUDIO REQUIRED IMPORTED_TARGET sdl2>=2.0.16 libavcodec>=59 libavutil>=57 libswresample>=4)
 endif()
 
 add_executable(
-  eclipse-core
+  terra-core
   src/control_plane.cpp
   src/audio_renderer.cpp
   src/gamestream_client.cpp
@@ -226,7 +226,7 @@ add_executable(
 )
 
 target_link_libraries(
-  eclipse-core
+  terra-core
   PRIVATE
     ixwebsocket::ixwebsocket
     nlohmann_json::nlohmann_json
@@ -234,81 +234,82 @@ target_link_libraries(
     pugixml::pugixml
 )
 
-if(ECLIPSE_LINK_MOONLIGHT_COMMON)
-  target_link_libraries(eclipse-core PRIVATE moonlight-common-c)
-  target_compile_definitions(eclipse-core PRIVATE ECLIPSE_HAS_MOONLIGHT_COMMON=1)
+if(TERRA_LINK_MOONLIGHT_COMMON)
+  target_link_libraries(terra-core PRIVATE moonlight-common-c)
+  target_compile_definitions(terra-core PRIVATE TERRA_HAS_MOONLIGHT_COMMON=1)
 endif()
 
 if(WIN32)
-  target_link_libraries(eclipse-core PRIVATE Crypt32 Iphlpapi)
-  target_compile_definitions(eclipse-core PRIVATE _WIN32_WINNT=0x0602 WINVER=0x0602 NOMINMAX)
-  if(ECLIPSE_ENABLE_WINDOWS_VIDEO)
-    target_link_libraries(eclipse-core PRIVATE ffmpeg-avcodec ffmpeg-avutil ffmpeg-swresample d3d11 d3dcompiler dxgi ole32 uuid)
-    target_compile_definitions(eclipse-core PRIVATE ECLIPSE_HAS_WINDOWS_VIDEO=1)
+  target_link_libraries(terra-core PRIVATE Crypt32 Iphlpapi)
+  # The renderer directly uses GetDpiForWindow (Windows 10 version 1607+).
+  target_compile_definitions(terra-core PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 NOMINMAX)
+  if(TERRA_ENABLE_WINDOWS_VIDEO)
+    target_link_libraries(terra-core PRIVATE ffmpeg-avcodec ffmpeg-avutil ffmpeg-swresample d3d11 d3dcompiler dxgi ole32 uuid)
+    target_compile_definitions(terra-core PRIVATE TERRA_HAS_WINDOWS_VIDEO=1)
   endif()
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ECLIPSE_ENABLE_LINUX_VIDEO)
-  target_link_libraries(eclipse-core PRIVATE PkgConfig::LINUX_VIDEO)
-  target_compile_definitions(eclipse-core PRIVATE ECLIPSE_HAS_LINUX_VIDEO=1)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TERRA_ENABLE_LINUX_VIDEO)
+  target_link_libraries(terra-core PRIVATE PkgConfig::LINUX_VIDEO)
+  target_compile_definitions(terra-core PRIVATE TERRA_HAS_LINUX_VIDEO=1)
   if(TARGET PkgConfig::LINUX_VAAPI_X11)
-    target_link_libraries(eclipse-core PRIVATE PkgConfig::LINUX_VAAPI_X11)
-    target_compile_definitions(eclipse-core PRIVATE ECLIPSE_HAS_VAAPI_X11=1)
+    target_link_libraries(terra-core PRIVATE PkgConfig::LINUX_VAAPI_X11)
+    target_compile_definitions(terra-core PRIVATE TERRA_HAS_VAAPI_X11=1)
   endif()
   if(TARGET PkgConfig::LINUX_LIBPLACEBO)
-    target_sources(eclipse-core PRIVATE src/placebo_libav.c)
-    target_link_libraries(eclipse-core PRIVATE PkgConfig::LINUX_LIBPLACEBO)
-    target_compile_definitions(eclipse-core PRIVATE ECLIPSE_HAS_LIBPLACEBO=1)
+    target_sources(terra-core PRIVATE src/placebo_libav.c)
+    target_link_libraries(terra-core PRIVATE PkgConfig::LINUX_LIBPLACEBO)
+    target_compile_definitions(terra-core PRIVATE TERRA_HAS_LIBPLACEBO=1)
   endif()
-  set(ECLIPSE_GAMEPAD_DATABASE "${ECLIPSE_EXTENSION_OUTPUT}/gamecontrollerdb.txt")
+  set(TERRA_GAMEPAD_DATABASE "${TERRA_EXTENSION_OUTPUT}/gamecontrollerdb.txt")
   add_custom_command(
-    OUTPUT "${ECLIPSE_GAMEPAD_DATABASE}"
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${ECLIPSE_EXTENSION_OUTPUT}"
+    OUTPUT "${TERRA_GAMEPAD_DATABASE}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${TERRA_EXTENSION_OUTPUT}"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
       "${MOONLIGHT_QT_ROOT}/app/SDL_GameControllerDB/gamecontrollerdb.txt"
-      "${ECLIPSE_GAMEPAD_DATABASE}"
+      "${TERRA_GAMEPAD_DATABASE}"
     DEPENDS "${MOONLIGHT_QT_ROOT}/app/SDL_GameControllerDB/gamecontrollerdb.txt"
     VERBATIM
   )
-  add_custom_target(eclipse-gamepad-database ALL DEPENDS "${ECLIPSE_GAMEPAD_DATABASE}")
-  add_dependencies(eclipse-core eclipse-gamepad-database)
+  add_custom_target(terra-gamepad-database ALL DEPENDS "${TERRA_GAMEPAD_DATABASE}")
+  add_dependencies(terra-core terra-gamepad-database)
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ECLIPSE_ENABLE_LINUX_AUDIO)
-  target_link_libraries(eclipse-core PRIVATE PkgConfig::LINUX_AUDIO)
-  target_compile_definitions(eclipse-core PRIVATE ECLIPSE_HAS_LINUX_AUDIO=1)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TERRA_ENABLE_LINUX_AUDIO)
+  target_link_libraries(terra-core PRIVATE PkgConfig::LINUX_AUDIO)
+  target_compile_definitions(terra-core PRIVATE TERRA_HAS_LINUX_AUDIO=1)
 endif()
 
 target_compile_definitions(
-  eclipse-core
+  terra-core
   PRIVATE
-    ECLIPSE_MOONLIGHT_QT_REVISION="${ECLIPSE_MOONLIGHT_QT_REVISION}"
-    ECLIPSE_MOONLIGHT_COMMON_REVISION="${ECLIPSE_MOONLIGHT_COMMON_REVISION}"
+    TERRA_MOONLIGHT_QT_REVISION="${TERRA_MOONLIGHT_QT_REVISION}"
+    TERRA_MOONLIGHT_COMMON_REVISION="${TERRA_MOONLIGHT_COMMON_REVISION}"
 )
 
 if(MSVC)
-  target_compile_options(eclipse-core PRIVATE /W4 /permissive- /EHsc)
+  target_compile_options(terra-core PRIVATE /W4 /permissive- /EHsc)
 else()
-  target_compile_options(eclipse-core PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(terra-core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 set_target_properties(
-  eclipse-core
+  terra-core
   PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${ECLIPSE_EXTENSION_OUTPUT}"
+    RUNTIME_OUTPUT_DIRECTORY "${TERRA_EXTENSION_OUTPUT}"
 )
 
 if(WIN32)
-  get_filename_component(ECLIPSE_COMPILER_DIRECTORY "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  get_filename_component(TERRA_COMPILER_DIRECTORY "${CMAKE_CXX_COMPILER}" DIRECTORY)
 
   add_custom_command(
-    TARGET eclipse-core
+    TARGET terra-core
     POST_BUILD
     COMMAND
       "${CMAKE_COMMAND}"
-      "-DECLIPSE_EXECUTABLE=$<TARGET_FILE:eclipse-core>"
-      "-DECLIPSE_OUTPUT_DIR=$<TARGET_FILE_DIR:eclipse-core>"
-      "-DECLIPSE_SEARCH_DIRECTORIES=${ECLIPSE_COMPILER_DIRECTORY};${FFMPEG_BIN_DIR}"
+      "-DTERRA_EXECUTABLE=$<TARGET_FILE:terra-core>"
+      "-DTERRA_OUTPUT_DIR=$<TARGET_FILE_DIR:terra-core>"
+      "-DTERRA_SEARCH_DIRECTORIES=${TERRA_COMPILER_DIRECTORY};${FFMPEG_BIN_DIR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CopyRuntimeDependencies.cmake"
     VERBATIM
   )
@@ -317,140 +318,140 @@ endif()
 # Shared runtime location is populated only by an explicit staging operation.
 add_custom_target(stage-extension
   COMMAND "${CMAKE_COMMAND}"
-    "-DECLIPSE_STAGE_SOURCE=${ECLIPSE_EXTENSION_OUTPUT}"
-    "-DECLIPSE_STAGE_DESTINATION=${ECLIPSE_ROOT}/extensions/eclipse-core/bin"
+    "-DTERRA_STAGE_SOURCE=${TERRA_EXTENSION_OUTPUT}"
+    "-DTERRA_STAGE_DESTINATION=${TERRA_ROOT}/extensions/terra-core/bin"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StageExtension.cmake"
-  DEPENDS eclipse-core
+  DEPENDS terra-core
   VERBATIM
 )
-if(TARGET eclipse-wayland-overlay)
-  add_dependencies(stage-extension eclipse-wayland-overlay)
+if(TARGET terra-wayland-overlay)
+  add_dependencies(stage-extension terra-wayland-overlay)
 endif()
 
 if(BUILD_TESTING)
   find_package(Threads REQUIRED)
   add_executable(
-    eclipse-stream-session-test
+    terra-stream-session-test
     tests/stream_session_test.cpp
     src/network_route.cpp
     src/stream_session.cpp
     src/stream_statistics.cpp
   )
   target_include_directories(
-    eclipse-stream-session-test
+    terra-stream-session-test
     PRIVATE
       src
       "${MOONLIGHT_COMMON_ROOT}/src"
   )
-  target_link_libraries(eclipse-stream-session-test PRIVATE Threads::Threads)
+  target_link_libraries(terra-stream-session-test PRIVATE Threads::Threads)
   if(MSVC)
-    target_compile_options(eclipse-stream-session-test PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(terra-stream-session-test PRIVATE /W4 /permissive- /EHsc)
   else()
-    target_compile_options(eclipse-stream-session-test PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(terra-stream-session-test PRIVATE -Wall -Wextra -Wpedantic)
   endif()
-  add_test(NAME stream-session-lifecycle COMMAND eclipse-stream-session-test)
+  add_test(NAME stream-session-lifecycle COMMAND terra-stream-session-test)
 
   add_executable(
-    eclipse-network-route-test
+    terra-network-route-test
     tests/network_route_test.cpp
     src/network_route.cpp
   )
-  target_include_directories(eclipse-network-route-test PRIVATE src)
+  target_include_directories(terra-network-route-test PRIVATE src)
   if(MSVC)
-    target_compile_options(eclipse-network-route-test PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(terra-network-route-test PRIVATE /W4 /permissive- /EHsc)
   else()
-    target_compile_options(eclipse-network-route-test PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(terra-network-route-test PRIVATE -Wall -Wextra -Wpedantic)
   endif()
-  add_test(NAME network-route COMMAND eclipse-network-route-test)
+  add_test(NAME network-route COMMAND terra-network-route-test)
 
-  add_executable(eclipse-display-mode-test tests/display_mode_test.cpp)
-  target_include_directories(eclipse-display-mode-test PRIVATE src)
+  add_executable(terra-display-mode-test tests/display_mode_test.cpp)
+  target_include_directories(terra-display-mode-test PRIVATE src)
   if(MSVC)
-    target_compile_options(eclipse-display-mode-test PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(terra-display-mode-test PRIVATE /W4 /permissive- /EHsc)
   else()
-    target_compile_options(eclipse-display-mode-test PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(terra-display-mode-test PRIVATE -Wall -Wextra -Wpedantic)
   endif()
-  add_test(NAME display-mode COMMAND eclipse-display-mode-test)
+  add_test(NAME display-mode COMMAND terra-display-mode-test)
 
   add_executable(
-    eclipse-wake-on-lan-test
+    terra-wake-on-lan-test
     tests/wake_on_lan_test.cpp
     src/wake_on_lan.cpp
   )
-  target_include_directories(eclipse-wake-on-lan-test PRIVATE src)
+  target_include_directories(terra-wake-on-lan-test PRIVATE src)
   if(MSVC)
-    target_compile_options(eclipse-wake-on-lan-test PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(terra-wake-on-lan-test PRIVATE /W4 /permissive- /EHsc)
   else()
-    target_compile_options(eclipse-wake-on-lan-test PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(terra-wake-on-lan-test PRIVATE -Wall -Wextra -Wpedantic)
   endif()
-  add_test(NAME wake-on-lan COMMAND eclipse-wake-on-lan-test)
+  add_test(NAME wake-on-lan COMMAND terra-wake-on-lan-test)
 
   add_executable(
-    eclipse-mdns-discovery-test
+    terra-mdns-discovery-test
     tests/mdns_discovery_test.cpp
     src/mdns_discovery.cpp
   )
-  target_include_directories(eclipse-mdns-discovery-test PRIVATE src)
-  target_link_libraries(eclipse-mdns-discovery-test PRIVATE Threads::Threads)
+  target_include_directories(terra-mdns-discovery-test PRIVATE src)
+  target_link_libraries(terra-mdns-discovery-test PRIVATE Threads::Threads)
   if(MSVC)
-    target_compile_options(eclipse-mdns-discovery-test PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(terra-mdns-discovery-test PRIVATE /W4 /permissive- /EHsc)
   else()
-    target_compile_options(eclipse-mdns-discovery-test PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(terra-mdns-discovery-test PRIVATE -Wall -Wextra -Wpedantic)
   endif()
-  add_test(NAME mdns-discovery COMMAND eclipse-mdns-discovery-test)
+  add_test(NAME mdns-discovery COMMAND terra-mdns-discovery-test)
 
   add_executable(
-    eclipse-stream-statistics-test
+    terra-stream-statistics-test
     tests/stream_statistics_test.cpp
     src/stream_statistics.cpp
   )
-  target_include_directories(eclipse-stream-statistics-test PRIVATE src)
+  target_include_directories(terra-stream-statistics-test PRIVATE src)
   if(MSVC)
-    target_compile_options(eclipse-stream-statistics-test PRIVATE /W4 /permissive- /EHsc)
+    target_compile_options(terra-stream-statistics-test PRIVATE /W4 /permissive- /EHsc)
   else()
-    target_compile_options(eclipse-stream-statistics-test PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(terra-stream-statistics-test PRIVATE -Wall -Wextra -Wpedantic)
   endif()
-  add_test(NAME stream-statistics COMMAND eclipse-stream-statistics-test)
+  add_test(NAME stream-statistics COMMAND terra-stream-statistics-test)
 
-  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ECLIPSE_ENABLE_LINUX_VIDEO)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TERRA_ENABLE_LINUX_VIDEO)
     add_executable(
-      eclipse-input-forwarder-test
+      terra-input-forwarder-test
       tests/input_forwarder_test.cpp
       src/input_forwarder.cpp
       src/stream_statistics.cpp
       src/video_renderer.cpp
     )
     target_include_directories(
-      eclipse-input-forwarder-test
+      terra-input-forwarder-test
       PRIVATE
         src
         "${MOONLIGHT_COMMON_ROOT}/src"
     )
-    target_link_libraries(eclipse-input-forwarder-test PRIVATE PkgConfig::LINUX_VIDEO)
-    target_compile_definitions(eclipse-input-forwarder-test PRIVATE ECLIPSE_HAS_LINUX_VIDEO=1)
+    target_link_libraries(terra-input-forwarder-test PRIVATE PkgConfig::LINUX_VIDEO)
+    target_compile_definitions(terra-input-forwarder-test PRIVATE TERRA_HAS_LINUX_VIDEO=1)
     if(TARGET PkgConfig::LINUX_LIBPLACEBO)
-      target_sources(eclipse-input-forwarder-test PRIVATE src/placebo_libav.c)
-      target_link_libraries(eclipse-input-forwarder-test PRIVATE PkgConfig::LINUX_LIBPLACEBO)
-      target_compile_definitions(eclipse-input-forwarder-test PRIVATE ECLIPSE_HAS_LIBPLACEBO=1)
+      target_sources(terra-input-forwarder-test PRIVATE src/placebo_libav.c)
+      target_link_libraries(terra-input-forwarder-test PRIVATE PkgConfig::LINUX_LIBPLACEBO)
+      target_compile_definitions(terra-input-forwarder-test PRIVATE TERRA_HAS_LIBPLACEBO=1)
     endif()
-    target_compile_options(eclipse-input-forwarder-test PRIVATE -Wall -Wextra -Wpedantic)
-    add_test(NAME input-forwarder COMMAND eclipse-input-forwarder-test)
+    target_compile_options(terra-input-forwarder-test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME input-forwarder COMMAND terra-input-forwarder-test)
     set_tests_properties(input-forwarder PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
   endif()
 endif()
 
 if(WIN32)
-  target_link_libraries(eclipse-core PRIVATE Ws2_32)
-  if(TARGET eclipse-wake-on-lan-test)
-    target_link_libraries(eclipse-wake-on-lan-test PRIVATE Ws2_32)
+  target_link_libraries(terra-core PRIVATE Ws2_32)
+  if(TARGET terra-wake-on-lan-test)
+    target_link_libraries(terra-wake-on-lan-test PRIVATE Ws2_32)
   endif()
-  if(TARGET eclipse-mdns-discovery-test)
-    target_link_libraries(eclipse-mdns-discovery-test PRIVATE Ws2_32 Iphlpapi)
+  if(TARGET terra-mdns-discovery-test)
+    target_link_libraries(terra-mdns-discovery-test PRIVATE Ws2_32 Iphlpapi)
   endif()
-  if(TARGET eclipse-stream-session-test)
-    target_link_libraries(eclipse-stream-session-test PRIVATE Ws2_32 Iphlpapi)
+  if(TARGET terra-stream-session-test)
+    target_link_libraries(terra-stream-session-test PRIVATE Ws2_32 Iphlpapi)
   endif()
-  if(TARGET eclipse-network-route-test)
-    target_link_libraries(eclipse-network-route-test PRIVATE Ws2_32 Iphlpapi)
+  if(TARGET terra-network-route-test)
+    target_link_libraries(terra-network-route-test PRIVATE Ws2_32 Iphlpapi)
   endif()
 endif()

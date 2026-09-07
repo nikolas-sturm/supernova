@@ -90,7 +90,7 @@ describe('StreamOverlay', () => {
     neutralino.off.mockClear()
     window.history.replaceState({}, '', '/stream-overlay/overlay-1')
     Object.defineProperty(window, 'NL_OS', { configurable: true, value: 'Linux' })
-    Object.defineProperty(window, 'ECLIPSE_OVERLAY_NATIVE', {
+    Object.defineProperty(window, 'TERRA_OVERLAY_NATIVE', {
       configurable: true,
       value: undefined,
     })
@@ -99,7 +99,7 @@ describe('StreamOverlay', () => {
   it('loads standalone Wayland request and closes through native bridge', async () => {
     const close = vi.fn()
     const waylandRequest = { ...request(), wayland: true, fullscreen: true }
-    Object.defineProperty(window, 'ECLIPSE_OVERLAY_NATIVE', {
+    Object.defineProperty(window, 'TERRA_OVERLAY_NATIVE', {
       configurable: true,
       value: { close },
     })
@@ -118,7 +118,7 @@ describe('StreamOverlay', () => {
 
   it('accepts requests in a prewarmed native overlay', async () => {
     const close = vi.fn()
-    Object.defineProperty(window, 'ECLIPSE_OVERLAY_NATIVE', {
+    Object.defineProperty(window, 'TERRA_OVERLAY_NATIVE', {
       configurable: true,
       value: { close },
     })
@@ -126,7 +126,7 @@ describe('StreamOverlay', () => {
     render(<StreamOverlay />)
 
     window.dispatchEvent(
-      new CustomEvent('eclipse-overlay-request', {
+      new CustomEvent('terra-overlay-request', {
         detail: { ...request(), wayland: true, fullscreen: false },
       }),
     )

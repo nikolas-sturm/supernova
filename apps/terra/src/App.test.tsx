@@ -33,6 +33,9 @@ describe('App', () => {
 
     expect((await screen.findAllByText('Web preview')).length).toBeGreaterThan(0)
     expect(screen.getByText('Connect your first gaming rig')).toBeInTheDocument()
+    expect(screen.getByText('TERRA')).toBeVisible()
+    expect(screen.queryByText('ECLIPSE')).not.toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Terra / Dark' })).toHaveValue('dark')
   })
 
   it('switches shared themes without resetting client modes or stream settings', () => {
@@ -156,7 +159,7 @@ describe('App', () => {
     expect(screen.getByText('offline')).toBeInTheDocument()
   })
 
-  it('shows the active Sunshine pairing PIN', () => {
+  it('shows the active Sol pairing PIN', () => {
     useClientStore.setState({
       hosts: [
         {
@@ -182,7 +185,7 @@ describe('App', () => {
         hostId: 'host-1',
         pin: '0427',
         state: 'pairing',
-        message: "Enter this PIN in Sunshine's web interface.",
+        message: "Enter this PIN in Sol's web interface.",
       },
     })
 
@@ -190,6 +193,7 @@ describe('App', () => {
 
     expect(screen.getByRole('dialog', { name: 'Pair Studio PC' })).toBeInTheDocument()
     expect(screen.getByLabelText('Pairing PIN 0427')).toHaveTextContent('0427')
+    expect(screen.getByText("Enter this PIN in Sol's web interface.")).toBeVisible()
   })
 
   it('offers Wake-on-LAN for authenticated offline hosts', async () => {
@@ -357,7 +361,7 @@ describe('App', () => {
 
     render(<App />)
 
-    expect(await screen.findByText('Running Sunshine application')).toBeVisible()
+    expect(await screen.findByText('Running host application')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Stop host app' })).toBeEnabled()
   })
 
@@ -395,7 +399,7 @@ describe('App', () => {
 
     render(<App />)
 
-    expect(await screen.findByText('Running Sunshine application')).toBeVisible()
+    expect(await screen.findByText('Running host application')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Stop host app' })).toBeEnabled()
   })
 })

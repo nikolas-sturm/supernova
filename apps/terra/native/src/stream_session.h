@@ -17,7 +17,7 @@ extern "C" {
 #include <Limelight.h>
 }
 
-namespace eclipse {
+namespace terra {
 
 struct StreamSessionConfig {
     std::string hostId;
@@ -158,4 +158,4 @@ private:
     static std::atomic<StreamSession*> active_;
 };
 
-}  // namespace eclipse
+}  // namespace terra

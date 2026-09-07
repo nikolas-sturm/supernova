@@ -20,7 +20,7 @@
 #undef X509_NAME
 #endif
 
-namespace eclipse {
+namespace terra {
 namespace {
 template <typename Type, auto FreeFunction>
 struct OpenSslDeleter {
@@ -91,7 +91,7 @@ std::vector<unsigned char> protectKey(const std::string& key) {
     DATA_BLOB input{static_cast<DWORD>(key.size()),
                     reinterpret_cast<BYTE*>(const_cast<char*>(key.data()))};
     DATA_BLOB output{};
-    if (!CryptProtectData(&input, L"Eclipse GameStream identity", nullptr, nullptr, nullptr,
+    if (!CryptProtectData(&input, L"Terra GameStream identity", nullptr, nullptr, nullptr,
                           CRYPTPROTECT_UI_FORBIDDEN, &output)) {
         throw std::runtime_error("Windows could not protect client identity key.");
     }
@@ -261,4 +261,4 @@ void Identity::writeRuntimeKey() const {
 #endif
 }
 
-}  // namespace eclipse
+}  // namespace terra

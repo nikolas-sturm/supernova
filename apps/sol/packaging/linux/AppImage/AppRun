@@ -1,0 +1,101 @@
+#!/bin/bash
+
+# custom AppRun for Sol AppImage
+
+# path of the extracted AppRun
+HERE="$(dirname "$(readlink -f "${0}")")"
+SOL_PATH=/usr/bin/sol
+SOL_BIN_HERE=$HERE/usr/bin/sol
+SOL_SHARE_HERE=$HERE/usr/share/sol
+
+# Set APPDIR when running directly from the AppDir:
+if [ -z "$APPDIR" ]; then
+    ARGV0="AppRun"
+fi
+
+cd "$HERE" || exit 1
+
+function help() {
+echo "
+ ------------------------------
+   Sol AppImage package.
+ ------------------------------
+
+ sol.AppImage options
+ ------------------------
+
+ Usage:  $ARGV0  --help, -h
+ ------            # This message
+
+         $ARGV0  --install, -i
+                   # Install or update input rules and sol.service files.
+
+         $ARGV0  --remove, -r
+                   # Remove input rules sol.service files.
+
+         $ARGV0  --appimage-help
+                   # Show available AppImage options
+
+ sol options
+ ----------------
+"
+# print sol binary help, replacing the sol command in usage statement
+"$SOL_BIN_HERE" --help | sed -e "s#$SOL_BIN_HERE#$ARGV0#g"
+}
+
+function install() {
+  # user input rules
+  # shellcheck disable=SC2002
+  cat "$SOL_SHARE_HERE/udev/rules.d/60-sol.rules" | sudo tee /etc/udev/rules.d/60-sol.rules
+  cat "$SOL_SHARE_HERE/modules-load.d/60-sol.conf" | sudo tee /etc/modules-load.d/60-sol.conf
+  sudo modprobe uhid
+  sudo udevadm control --reload-rules
+  sudo udevadm trigger --property-match=DEVNAME=/dev/uinput
+  sudo udevadm trigger --property-match=DEVNAME=/dev/uhid
+  sudo udevadm trigger --subsystem-match=hidraw
+  sudo udevadm trigger --subsystem-match=input
+
+  # sol service
+  mkdir -p ~/.config/systemd/user
+  cp -r "$SOL_SHARE_HERE/systemd/user/" ~/.config/systemd/
+  # patch service executable path
+  sed -i -e "s#$SOL_PATH#$(readlink -f $ARGV0)#g" ~/.config/systemd/user/app-dev.lizardbyte.app.Sol.service
+
+  # setcap
+  sudo setcap cap_sys_admin,cap_sys_nice+p "$(readlink -f "$SOL_BIN_HERE")"
+}
+
+function remove() {
+  # remove input rules
+  sudo rm -f /etc/udev/rules.d/60-sol.rules
+  sudo udevadm control --reload-rules
+
+  # remove uhid module loading config
+  sudo rm -f /etc/modules-load.d/60-sol.conf
+
+  # remove service
+  sudo rm -f ~/.config/systemd/user/app-dev.lizardbyte.app.Sol.service
+}
+
+# process arguments
+if [ "x$1" == "xhelp" ] || [ "x$1" == "x--help" ] || [ "x$1" == "x-h" ] ; then
+    help
+    exit $?
+fi
+
+if [ "x$1" == "xinstall" ] || [ "x$1" == "x--install" ] || [ "x$1" == "x-i" ] ; then
+    install
+    exit $?
+fi
+
+if [ "x$1" == "xremove" ] || [ "x$1" == "x--remove" ] || [ "x$1" == "x-r" ] ; then
+    remove
+    exit $?
+fi
+
+# create config directory if it doesn't exist
+# https://github.com/LizardByte/Sunshine/issues/324
+mkdir -p ~/.config/sunshine
+
+# run sol
+"$SOL_BIN_HERE" $@

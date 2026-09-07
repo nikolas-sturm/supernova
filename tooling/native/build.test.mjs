@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { commandsFor, parseArgs, shellQuote } from './build.mjs'
 
 test('accepts every documented app, operation and configuration', () => {
-  for (const app of ['progenitor', 'terra']) {
+  for (const app of ['sol', 'terra']) {
     for (const operation of ['configure', 'build', 'test']) {
       for (const config of ['debug', 'release']) {
         assert.deepEqual(parseArgs([app, operation, config]), { app, operation, config })
@@ -43,7 +43,7 @@ test('CLI validation fails before native tools run', () => {
 })
 
 test('configure preserves upstream roots and isolates configurations', () => {
-  for (const app of ['terra', 'progenitor']) {
+  for (const app of ['terra', 'sol']) {
     const debug = commandsFor({ app, operation: 'configure', config: 'debug' }, 'linux')[0]
     const release = commandsFor({ app, operation: 'configure', config: 'release' }, 'linux')[0]
     assert.ok(debug[2].endsWith(path.join('apps', app, ...(app === 'terra' ? ['native'] : []))))
@@ -54,7 +54,7 @@ test('configure preserves upstream roots and isolates configurations', () => {
     assert.notEqual(windows[4], debug[4])
     assert.ok(debug.includes('-DCMAKE_BUILD_TYPE=Debug'))
     assert.ok(release.includes('-DCMAKE_BUILD_TYPE=Release'))
-    if (app === 'progenitor') assert.ok(debug.includes('-DSUNSHINE_BUILD_WEB_UI=OFF'))
+    if (app === 'sol') assert.ok(debug.includes('-DSOL_BUILD_WEB_UI=OFF'))
   }
 })
 
@@ -68,13 +68,13 @@ test('Windows explicitly selects GCC and Terra stages only after build', () => {
   assert.equal(commands.length, 2)
   assert.equal(commands[0].at(-1), '--parallel')
   assert.deepEqual(commands[1].slice(-2), ['--target', 'stage-extension'])
-  assert.equal(commandsFor({ app: 'progenitor', operation: 'build', config: 'debug' }).length, 1)
+  assert.equal(commandsFor({ app: 'sol', operation: 'build', config: 'debug' }).length, 1)
 })
 
-test('test uses Progenitor executable and Terra CTest with no-tests failure', () => {
-  const options = { app: 'progenitor', operation: 'test', config: 'debug' }
-  assert.ok(commandsFor(options, 'win32')[0][0].endsWith(path.join('tests', 'test_sunshine.exe')))
-  assert.ok(commandsFor(options, 'linux')[0][0].endsWith(path.join('tests', 'test_sunshine')))
+test('test uses Sol executable and Terra CTest with no-tests failure', () => {
+  const options = { app: 'sol', operation: 'test', config: 'debug' }
+  assert.ok(commandsFor(options, 'win32')[0][0].endsWith(path.join('tests', 'test_sol.exe')))
+  assert.ok(commandsFor(options, 'linux')[0][0].endsWith(path.join('tests', 'test_sol')))
   assert.ok(commandsFor({ ...options, app: 'terra' })[0].includes('--no-tests=error'))
 })
 
@@ -103,17 +103,17 @@ test('Terra staging replaces generated runtime files and preserves unrelated fil
     const destination = path.join(temporary, 'extension', 'bin')
     mkdirSync(source)
     mkdirSync(destination, { recursive: true })
-    writeFileSync(path.join(source, 'eclipse-core.exe'), 'debug')
+    writeFileSync(path.join(source, 'terra-core.exe'), 'debug')
     writeFileSync(path.join(source, 'current.dll'), 'current')
     writeFileSync(path.join(destination, 'obsolete.dll'), 'obsolete')
     writeFileSync(path.join(destination, 'gamecontrollerdb.txt'), 'obsolete')
-    writeFileSync(path.join(destination, 'eclipse-core.exe'), 'release')
+    writeFileSync(path.join(destination, 'terra-core.exe'), 'release')
     writeFileSync(path.join(destination, 'keep.txt'), 'keep')
     const result = spawnSync(
       cmake,
       [
-        `-DECLIPSE_STAGE_SOURCE=${source}`,
-        `-DECLIPSE_STAGE_DESTINATION=${destination}`,
+        `-DTERRA_STAGE_SOURCE=${source}`,
+        `-DTERRA_STAGE_DESTINATION=${destination}`,
         '-P',
         fileURLToPath(
           new URL('../../apps/terra/native/cmake/StageExtension.cmake', import.meta.url),
@@ -122,17 +122,17 @@ test('Terra staging replaces generated runtime files and preserves unrelated fil
       { encoding: 'utf8' },
     )
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(readFileSync(path.join(destination, 'eclipse-core.exe'), 'utf8'), 'debug')
+    assert.equal(readFileSync(path.join(destination, 'terra-core.exe'), 'utf8'), 'debug')
     assert.equal(readFileSync(path.join(destination, 'keep.txt'), 'utf8'), 'keep')
     assert.ok(existsSync(path.join(destination, 'current.dll')))
     assert.ok(!existsSync(path.join(destination, 'obsolete.dll')))
     assert.ok(!existsSync(path.join(destination, 'gamecontrollerdb.txt')))
-    rmSync(path.join(source, 'eclipse-core.exe'))
+    rmSync(path.join(source, 'terra-core.exe'))
     const missing = spawnSync(
       cmake,
       [
-        `-DECLIPSE_STAGE_SOURCE=${source}`,
-        `-DECLIPSE_STAGE_DESTINATION=${destination}`,
+        `-DTERRA_STAGE_SOURCE=${source}`,
+        `-DTERRA_STAGE_DESTINATION=${destination}`,
         '-P',
         fileURLToPath(
           new URL('../../apps/terra/native/cmake/StageExtension.cmake', import.meta.url),
@@ -142,7 +142,7 @@ test('Terra staging replaces generated runtime files and preserves unrelated fil
     )
     assert.notEqual(missing.status, 0)
     assert.match(missing.stderr, /Extension output missing/)
-    assert.equal(readFileSync(path.join(destination, 'eclipse-core.exe'), 'utf8'), 'debug')
+    assert.equal(readFileSync(path.join(destination, 'terra-core.exe'), 'utf8'), 'debug')
   } finally {
     rmSync(temporary, { recursive: true, force: true })
   }

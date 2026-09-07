@@ -11,7 +11,7 @@
 #include "identity.h"
 #include "stream_settings.h"
 
-namespace eclipse {
+namespace terra {
 
 inline constexpr int kBaselineCodecModeSupport = 0x00000001;
 
@@ -84,4 +84,4 @@ private:
     Identity identity_;
 };
 
-}  // namespace eclipse
+}  // namespace terra

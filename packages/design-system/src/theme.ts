@@ -44,7 +44,7 @@ const STORAGE_KEY = 'theme'
 
 /**
  * @brief Reads the persisted theme preference.
- * @returns A validated preference, or Eclipse dark when none is stored.
+ * @returns A validated preference, or Terra dark when none is stored.
  */
 export function getStoredThemePreference(): ThemePreference {
   try {

@@ -4,18 +4,18 @@ Run from any working directory using Node.js; no npm dependencies are needed by
 the wrapper. Supported hosts: Windows MSYS2 UCRT64 and Linux only.
 
 ```text
-node tooling/native/build.mjs <progenitor|terra> <configure|build|test> <debug|release>
+node tooling/native/build.mjs <sol|terra> <configure|build|test> <debug|release>
 node --test tooling/native/build.test.mjs
 ```
 
 Operations are separate: configure first, build second, test last. Build and test
-do not silently configure or install dependencies. Progenitor tests run
-`tests/test_sunshine` with the build tree's `tests` directory as its working
+do not silently configure or install dependencies. Sol tests run
+`tests/test_sol` with the build tree's `tests` directory as its working
 directory; Terra tests use CTest and fail if no tests are registered.
 
 | App | CMake source root | Build directory |
 | --- | --- | --- |
-| Progenitor | `apps/progenitor` | `apps/progenitor/cmake-build-<win32\|linux>-<debug\|release>` |
+| Sol | `apps/sol` | `apps/sol/cmake-build-<win32\|linux>-<debug\|release>` |
 | Terra | `apps/terra/native` | `apps/terra/cmake-build-<win32\|linux>-<debug\|release>` |
 
 ## Prerequisites
@@ -33,6 +33,12 @@ directory; Terra tests use CTest and fail if no tests are registered.
   directly, with the same platform toolchain. Wrapper configure reasserts its
   generator, configuration, tests, and native-only settings.
 
+Both Vite configurations exclude native build, vendor, and staging directories
+through `tooling/frontend/config.ts`. On Windows, watching directories inside an
+extraction tree can make its final rename fail with access denied. Restart old dev
+servers after watcher-config changes; do not change ACLs or dependency versions
+to compensate for an open watcher handle.
+
 ## Nx integration
 
 Use the interface above from Nx run-commands targets. Set `cache: false` on every
@@ -42,18 +48,18 @@ app/configuration build directory.
 
 ## Web assets
 
-Progenitor wrapper configure sets `SUNSHINE_BUILD_WEB_UI=OFF` and
+Sol wrapper configure sets `SOL_BUILD_WEB_UI=OFF` and
 `BUILD_DOCS=OFF`. Native compilation does not need Node/npm dependencies.
-With `SUNSHINE_BUILD_WEB_UI=ON`, the existing `web-ui` target calls
-`npm run build --workspace apps/progenitor` from the repository root. Root npm
+With `SOL_BUILD_WEB_UI=ON`, the existing `web-ui` target calls
+`npm run build --workspace apps/sol` from the repository root. Root npm
 installation is a precondition, never a recurring CMake build step. This npm
 script must remain a direct web build, not an Nx alias. On Windows, explicitly
 set `NPM` to native Windows `npm.cmd` when building web assets from UCRT64.
 
 Frontend can instead build independently through Nx. Before packaging, stage
 its complete output in the selected build tree's `assets/web`, or configure
-`SUNSHINE_WEB_ASSETS_DIR` to the absolute staged web directory (for example,
-`apps/progenitor/build/assets/web`). Installation/CPack fails if that directory
+`SOL_WEB_ASSETS_DIR` to the absolute staged web directory (for example,
+`apps/sol/build/assets/web`). Installation/CPack fails if that directory
 has no `index.html`. Native-only compilation does not imply deployable assets.
 
 ## Terra staging
@@ -62,7 +68,7 @@ Compiled runtime output is isolated under
 `apps/terra/cmake-build-<platform>-<config>/extension/<Debug|Release>`, including Windows DLLs
 and Linux overlay/gamepad assets. Wrapper `build` first builds everything, then
 explicitly builds `stage-extension` to populate
-`apps/terra/extensions/eclipse-core/bin`. Direct CMake builds do not stage unless
+`apps/terra/extensions/terra-core/bin`. Direct CMake builds do not stage unless
 that target is requested. Staging removes old generated runtime files so DLLs
 from another configuration cannot linger.
 

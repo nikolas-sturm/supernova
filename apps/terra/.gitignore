@@ -6,4 +6,6 @@ bin/
 .storage/
 *.log
 native/build*/
+extensions/terra-core/bin/
+# Keep previously staged binaries ignored; migration never modifies runtime artifacts.
 extensions/eclipse-core/bin/

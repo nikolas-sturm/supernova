@@ -10,15 +10,15 @@ void expect(bool condition, const char* message) {
 }
 
 int main() {
-    const auto address = eclipse::parseMacAddress(" 02:1A:2b:3C:4d:5E ");
+    const auto address = terra::parseMacAddress(" 02:1A:2b:3C:4d:5E ");
     expect(address.has_value(), "Valid MAC address was rejected.");
-    expect(eclipse::formatMacAddress(*address) == "02:1a:2b:3c:4d:5e",
+    expect(terra::formatMacAddress(*address) == "02:1a:2b:3c:4d:5e",
            "MAC address was not canonicalized.");
-    expect(!eclipse::parseMacAddress("00:00:00:00:00:00"), "Zero MAC address was accepted.");
-    expect(!eclipse::parseMacAddress("01:00:00:00:00:01"), "Multicast MAC address was accepted.");
-    expect(!eclipse::parseMacAddress("02:00-00:00:00:01"), "Mixed separators were accepted.");
+    expect(!terra::parseMacAddress("00:00:00:00:00:00"), "Zero MAC address was accepted.");
+    expect(!terra::parseMacAddress("01:00:00:00:00:01"), "Multicast MAC address was accepted.");
+    expect(!terra::parseMacAddress("02:00-00:00:00:01"), "Mixed separators were accepted.");
 
-    const auto packet = eclipse::makeWakePacket(*address);
+    const auto packet = terra::makeWakePacket(*address);
     expect(std::all_of(packet.begin(), packet.begin() + 6,
                        [](std::uint8_t value) { return value == 0xFF; }),
            "Wake packet prefix is invalid.");

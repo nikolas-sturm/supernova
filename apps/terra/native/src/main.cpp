@@ -26,7 +26,7 @@
 #include <windows.h>
 #endif
 
-#if ECLIPSE_HAS_MOONLIGHT_COMMON
+#if TERRA_HAS_MOONLIGHT_COMMON
 extern "C" {
 #include <Limelight.h>
 }
@@ -62,6 +62,7 @@ std::filesystem::path parseDataPath(int argc, char** argv) {
             return argv[index + 1];
         }
     }
+    // Preserve existing standalone identities and host certificate pins.
     return std::filesystem::current_path() / ".eclipse-data";
 }
 
@@ -76,11 +77,11 @@ ExtensionContext parseContext(const std::string& input) {
 }
 
 Json makeStatus() {
-#if ECLIPSE_HAS_MOONLIGHT_COMMON
+#if TERRA_HAS_MOONLIGHT_COMMON
     static_cast<void>(LiGetMillis());
 #endif
-#if defined(_WIN32) && defined(ECLIPSE_HAS_WINDOWS_VIDEO) || \
-    defined(__linux__) && defined(ECLIPSE_HAS_LINUX_VIDEO)
+#if defined(_WIN32) && defined(TERRA_HAS_WINDOWS_VIDEO) || \
+    defined(__linux__) && defined(TERRA_HAS_LINUX_VIDEO)
     constexpr bool streamingAvailable = true;
 #else
     constexpr bool streamingAvailable = false;
@@ -90,13 +91,13 @@ Json makeStatus() {
         {"schemaVersion", 1},
         {"state", "ready"},
         {"detail", "Secure host library and native session launch ready."},
-        {"moonlightQtRevision", ECLIPSE_MOONLIGHT_QT_REVISION},
-        {"moonlightCommonRevision", ECLIPSE_MOONLIGHT_COMMON_REVISION},
+        {"moonlightQtRevision", TERRA_MOONLIGHT_QT_REVISION},
+        {"moonlightCommonRevision", TERRA_MOONLIGHT_COMMON_REVISION},
         {"streamingAvailable", streamingAvailable},
     };
 }
 
-Json hostJson(const eclipse::HostRecord& host) {
+Json hostJson(const terra::HostRecord& host) {
     Json displayModes = Json::array();
     for (const auto& mode : host.displayModes) {
         displayModes.push_back({{"width", mode.width},
@@ -124,7 +125,7 @@ Json hostJson(const eclipse::HostRecord& host) {
     };
 }
 
-Json appJson(const eclipse::GameStreamApp& app) {
+Json appJson(const terra::GameStreamApp& app) {
     return {
         {"id", app.id},
         {"name", app.name},
@@ -133,29 +134,29 @@ Json appJson(const eclipse::GameStreamApp& app) {
     };
 }
 
-const char* displayModeName(eclipse::DisplayMode mode) {
+const char* displayModeName(terra::DisplayMode mode) {
     switch (mode) {
-        case eclipse::DisplayMode::fullscreen: return "fullscreen";
-        case eclipse::DisplayMode::borderless: return "borderless";
-        case eclipse::DisplayMode::windowed: return "windowed";
+        case terra::DisplayMode::fullscreen: return "fullscreen";
+        case terra::DisplayMode::borderless: return "borderless";
+        case terra::DisplayMode::windowed: return "windowed";
     }
     return "windowed";
 }
 
-const char* audioConfigName(eclipse::AudioConfig config) {
+const char* audioConfigName(terra::AudioConfig config) {
     switch (config) {
-        case eclipse::AudioConfig::surround51: return "5.1";
-        case eclipse::AudioConfig::surround71: return "7.1";
-        case eclipse::AudioConfig::stereo: return "stereo";
+        case terra::AudioConfig::surround51: return "5.1";
+        case terra::AudioConfig::surround71: return "7.1";
+        case terra::AudioConfig::stereo: return "stereo";
     }
     return "stereo";
 }
 
-const char* systemKeyCaptureName(eclipse::SystemKeyCapture capture) {
+const char* systemKeyCaptureName(terra::SystemKeyCapture capture) {
     switch (capture) {
-        case eclipse::SystemKeyCapture::fullscreen: return "fullscreen";
-        case eclipse::SystemKeyCapture::always: return "always";
-        case eclipse::SystemKeyCapture::off: return "off";
+        case terra::SystemKeyCapture::fullscreen: return "fullscreen";
+        case terra::SystemKeyCapture::always: return "always";
+        case terra::SystemKeyCapture::off: return "off";
     }
     return "off";
 }
@@ -166,8 +167,8 @@ const char* codecName(int videoFormat) {
     return "H.264";
 }
 
-eclipse::StreamSettings parseStreamSettings(const Json& value) {
-    eclipse::StreamSettings settings;
+terra::StreamSettings parseStreamSettings(const Json& value) {
+    terra::StreamSettings settings;
     settings.width = value.at("width").get<int>();
     settings.height = value.at("height").get<int>();
     settings.fps = value.at("fps").get<int>();
@@ -180,9 +181,9 @@ eclipse::StreamSettings parseStreamSettings(const Json& value) {
 
     const auto displayMode = value.at("displayMode").get<std::string>();
     if (displayMode == "fullscreen") {
-        settings.displayMode = eclipse::DisplayMode::fullscreen;
+        settings.displayMode = terra::DisplayMode::fullscreen;
     } else if (displayMode == "borderless") {
-        settings.displayMode = eclipse::DisplayMode::borderless;
+        settings.displayMode = terra::DisplayMode::borderless;
     } else if (displayMode != "windowed") {
         throw std::invalid_argument("Display mode is invalid.");
     }
@@ -193,9 +194,9 @@ eclipse::StreamSettings parseStreamSettings(const Json& value) {
 
     const auto audioConfig = value.at("audioConfig").get<std::string>();
     if (audioConfig == "5.1") {
-        settings.audioConfig = eclipse::AudioConfig::surround51;
+        settings.audioConfig = terra::AudioConfig::surround51;
     } else if (audioConfig == "7.1") {
-        settings.audioConfig = eclipse::AudioConfig::surround71;
+        settings.audioConfig = terra::AudioConfig::surround71;
     } else if (audioConfig != "stereo") {
         throw std::invalid_argument("Audio configuration is invalid.");
     }
@@ -205,11 +206,11 @@ eclipse::StreamSettings parseStreamSettings(const Json& value) {
     }
     const auto codec = value.at("videoCodec").get<std::string>();
     if (codec == "h264") {
-        settings.videoCodec = eclipse::VideoCodec::h264;
+        settings.videoCodec = terra::VideoCodec::h264;
     } else if (codec == "hevc") {
-        settings.videoCodec = eclipse::VideoCodec::hevc;
+        settings.videoCodec = terra::VideoCodec::hevc;
     } else if (codec == "av1") {
-        settings.videoCodec = eclipse::VideoCodec::av1;
+        settings.videoCodec = terra::VideoCodec::av1;
     } else if (codec != "automatic") {
         throw std::invalid_argument("Video codec is invalid.");
     }
@@ -227,13 +228,13 @@ eclipse::StreamSettings parseStreamSettings(const Json& value) {
     settings.input.absoluteMouseMode = value.at("absoluteMouseMode").get<bool>();
     const auto captureSystemKeys = value.at("captureSystemKeys").get<std::string>();
     if (captureSystemKeys == "fullscreen") {
-        settings.input.captureSystemKeys = eclipse::SystemKeyCapture::fullscreen;
+        settings.input.captureSystemKeys = terra::SystemKeyCapture::fullscreen;
     } else if (captureSystemKeys == "always") {
-        settings.input.captureSystemKeys = eclipse::SystemKeyCapture::always;
+        settings.input.captureSystemKeys = terra::SystemKeyCapture::always;
     } else if (captureSystemKeys != "off") {
         throw std::invalid_argument("System-key capture mode is invalid.");
     }
-    settings.input.fullscreen = settings.displayMode != eclipse::DisplayMode::windowed;
+    settings.input.fullscreen = settings.displayMode != terra::DisplayMode::windowed;
     settings.input.touchscreenTrackpad = value.at("touchscreenTrackpad").get<bool>();
     settings.input.swapMouseButtons = value.at("swapMouseButtons").get<bool>();
     settings.input.reverseScrollDirection = value.at("reverseScrollDirection").get<bool>();
@@ -267,16 +268,16 @@ int main(int argc, char** argv) {
         ix::initNetSystem();
 
         ix::WebSocket socket;
-        eclipse::ControlPlane controlPlane{parseDataPath(argc, argv)};
+        terra::ControlPlane controlPlane{parseDataPath(argc, argv)};
         std::mutex mutex;
         std::condition_variable closedCondition;
         std::atomic_bool closed = false;
         std::mutex workerMutex;
         std::vector<std::jthread> workers;
-        std::unique_ptr<eclipse::MdnsDiscovery> discovery;
+        std::unique_ptr<terra::MdnsDiscovery> discovery;
         std::mutex discoveryMutex;
         std::condition_variable discoveryCondition;
-        std::deque<eclipse::MdnsService> discoveryQueue;
+        std::deque<terra::MdnsService> discoveryQueue;
         std::unordered_set<std::string> queuedDiscoveries;
         std::atomic_bool discoveryEnabled = false;
 
@@ -285,12 +286,12 @@ int main(int argc, char** argv) {
             for (const auto& host : controlPlane.hosts()) {
                 hosts.push_back(hostJson(host));
             }
-            broadcast(socket, context, "eclipse.hosts.changed",
+            broadcast(socket, context, "terra.hosts.changed",
                       {{"schemaVersion", 1}, {"hosts", std::move(hosts)}});
         };
 
         const auto publishHostError = [&](const std::string& message) {
-            broadcast(socket, context, "eclipse.host.error",
+            broadcast(socket, context, "terra.host.error",
                       {{"schemaVersion", 1}, {"message", message}});
         };
 
@@ -312,7 +313,7 @@ int main(int argc, char** argv) {
 
         std::jthread discoveryWorker([&](std::stop_token stopToken) {
             while (!stopToken.stop_requested()) {
-                eclipse::MdnsService service;
+                terra::MdnsService service;
                 {
                     std::unique_lock lock{discoveryMutex};
                     discoveryCondition.wait(lock, [&] {
@@ -340,13 +341,13 @@ int main(int argc, char** argv) {
                         std::move(endpoint));
                     if (!closed) publishHosts();
                 } catch (const std::exception&) {
-                    // DNS-SD advertisements are untrusted until a Sunshine probe succeeds.
+                    // DNS-SD advertisements are untrusted until a Sol probe succeeds.
                 }
                 completeDiscovery();
             }
         });
 
-        discovery = std::make_unique<eclipse::MdnsDiscovery>([&](const auto& service) {
+        discovery = std::make_unique<terra::MdnsDiscovery>([&](const auto& service) {
             const auto key = service.address + ":" + std::to_string(service.port);
             {
                 std::scoped_lock lock{discoveryMutex};
@@ -362,7 +363,7 @@ int main(int argc, char** argv) {
 
         const auto publishPairing = [&](const std::string& hostId, const std::string& state,
                                         const std::string& message) {
-            broadcast(socket, context, "eclipse.pairing.changed",
+            broadcast(socket, context, "terra.pairing.changed",
                       {{"schemaVersion", 1},
                        {"hostId", hostId},
                        {"state", state},
@@ -371,7 +372,7 @@ int main(int argc, char** argv) {
 
         const auto pairHost = [&](const std::string& hostId, const std::string& pin) {
             publishPairing(hostId, "pairing",
-                           "Enter the displayed PIN in Sunshine's web interface.");
+                           "Enter the displayed PIN in Sol's web interface.");
             std::scoped_lock lock{workerMutex};
             workers.emplace_back([&, hostId, pin] {
                 try {
@@ -390,13 +391,13 @@ int main(int argc, char** argv) {
         };
 
         const auto publishApps = [&](const std::string& hostId, const std::string& state,
-                                     const std::vector<eclipse::GameStreamApp>& apps,
+                                     const std::vector<terra::GameStreamApp>& apps,
                                      const std::string& message = {}) {
             Json values = Json::array();
             for (const auto& app : apps) {
                 values.push_back(appJson(app));
             }
-            broadcast(socket, context, "eclipse.apps.changed",
+            broadcast(socket, context, "terra.apps.changed",
                       {{"schemaVersion", 1},
                        {"hostId", hostId},
                        {"state", state},
@@ -418,7 +419,7 @@ int main(int argc, char** argv) {
                         try {
                             const auto dataUrl = controlPlane.boxArtDataUrl(hostId, app.id);
                             if (!closed) {
-                                broadcast(socket, context, "eclipse.app.art.changed",
+                                broadcast(socket, context, "terra.app.art.changed",
                                           {{"schemaVersion", 1},
                                            {"hostId", hostId},
                                            {"appId", app.id},
@@ -427,7 +428,7 @@ int main(int argc, char** argv) {
                             }
                         } catch (const std::exception& exception) {
                             if (!closed) {
-                                broadcast(socket, context, "eclipse.app.art.changed",
+                                broadcast(socket, context, "terra.app.art.changed",
                                           {{"schemaVersion", 1},
                                            {"hostId", hostId},
                                            {"appId", app.id},
@@ -445,7 +446,7 @@ int main(int argc, char** argv) {
         const auto publishSession = [&](const std::string& hostId, int appId,
                                         const std::string& appName, const std::string& state,
                                         const std::string& message, bool resumed = false) {
-            broadcast(socket, context, "eclipse.session.changed",
+            broadcast(socket, context, "terra.session.changed",
                       {{"schemaVersion", 1},
                        {"hostId", hostId},
                        {"appId", appId},
@@ -455,7 +456,7 @@ int main(int argc, char** argv) {
                        {"resumed", resumed}});
         };
 
-        controlPlane.setSessionListener([&](const eclipse::SessionUpdate& update) {
+        controlPlane.setSessionListener([&](const terra::SessionUpdate& update) {
             if (!closed) {
                 publishSession(update.hostId, update.appId, update.appName, update.state,
                                update.message, update.resumed);
@@ -463,9 +464,9 @@ int main(int argc, char** argv) {
             }
         });
 
-        controlPlane.setStreamOverlayListener([&](const eclipse::StreamOverlayRequest& request) {
+        controlPlane.setStreamOverlayListener([&](const terra::StreamOverlayRequest& request) {
             if (!closed) {
-                broadcast(socket, context, "eclipse.stream.overlay.requested",
+                broadcast(socket, context, "terra.stream.overlay.requested",
                           {{"schemaVersion", 1},
                            {"hostId", request.hostId},
                            {"appId", request.appId},
@@ -508,10 +509,10 @@ int main(int argc, char** argv) {
             }
         });
 
-        controlPlane.setStreamStatisticsListener([&](const eclipse::StreamStatisticsUpdate& update) {
+        controlPlane.setStreamStatisticsListener([&](const terra::StreamStatisticsUpdate& update) {
             if (!closed) {
                 const auto& statistics = update.sample.statistics;
-                broadcast(socket, context, "eclipse.stream.statistics",
+                broadcast(socket, context, "terra.stream.statistics",
                           {{"schemaVersion", 1},
                            {"hostId", update.hostId},
                            {"generation", std::to_string(update.generation)},
@@ -540,7 +541,7 @@ int main(int argc, char** argv) {
         });
 
         const auto launchApp = [&](const std::string& hostId, int appId,
-                                    const eclipse::StreamSettings& settings) {
+                                    const terra::StreamSettings& settings) {
             std::scoped_lock lock{workerMutex};
             workers.emplace_back([&, hostId, appId, settings] {
                 try {
@@ -583,8 +584,8 @@ int main(int argc, char** argv) {
         socket.setOnMessageCallback([&](const ix::WebSocketMessagePtr& message) {
             switch (message->type) {
                 case ix::WebSocketMessageType::Open:
-                    std::cout << "[eclipse-core] connected" << std::endl;
-                    broadcast(socket, context, "eclipse.core.status", makeStatus());
+                    std::cout << "[terra-core] connected" << std::endl;
+                    broadcast(socket, context, "terra.core.status", makeStatus());
                     publishHosts();
                     for (const auto& hostId : controlPlane.hostIds()) {
                         probeHost(hostId);
@@ -598,7 +599,7 @@ int main(int argc, char** argv) {
 
                     const auto event = payload.value("event", "");
                     if (event == "core.status") {
-                        broadcast(socket, context, "eclipse.core.status", makeStatus());
+                        broadcast(socket, context, "terra.core.status", makeStatus());
                     } else if (event == "hosts.list") {
                         publishHosts();
                     } else if (event == "discovery.configure") {
@@ -690,7 +691,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 case ix::WebSocketMessageType::Error:
-                    std::cerr << "[eclipse-core] connection error: "
+                    std::cerr << "[terra-core] connection error: "
                               << message->errorInfo.reason << std::endl;
                     closed = true;
                     closedCondition.notify_one();
@@ -721,7 +722,7 @@ int main(int argc, char** argv) {
         ix::uninitNetSystem();
         return 0;
     } catch (const std::exception& exception) {
-        std::cerr << "[eclipse-core] fatal: " << exception.what() << std::endl;
+        std::cerr << "[terra-core] fatal: " << exception.what() << std::endl;
         return 1;
     }
 }

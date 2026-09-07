@@ -1,4 +1,4 @@
-import { Button, EclipseBrand, ThemePicker } from '@supernova/design-system'
+import { Button, ThemePicker } from '@supernova/design-system'
 import {
   Activity,
   ArrowRight,
@@ -103,7 +103,7 @@ const workstationScaffolds: Partial<
     eyebrow: 'ISOLATED WORKLOADS',
     title: 'App sandboxes need host support.',
     description:
-      'This surface will manage isolated host applications and workspace policies once Sunshine exposes lifecycle and policy controls.',
+      'This surface will manage isolated host applications and workspace policies once Sol exposes lifecycle and policy controls.',
   },
   hardware: {
     eyebrow: 'DEVICE BRIDGE',
@@ -190,14 +190,14 @@ export function App() {
 
   useEffect(() => {
     void applyUiDisplayMode(settings.uiDisplayMode).catch(() => {
-      setHostError('Eclipse could not apply the selected GUI display mode.')
+      setHostError('Terra could not apply the selected GUI display mode.')
     })
   }, [setHostError, settings.uiDisplayMode])
 
   useEffect(() => {
     if (bridge.state !== 'ready') return
     void configureCoreDiscovery(settings.autoDiscoverHosts).catch(() => {
-      setHostError('Eclipse could not update local-network discovery.')
+      setHostError('Terra could not update local-network discovery.')
     })
   }, [bridge.state, setHostError, settings.autoDiscoverHosts])
 
@@ -211,7 +211,7 @@ export function App() {
     setSelectedHostId(nextHost.id)
     if (nextHost.paired && nextHost.status === 'online' && library.hostId !== nextHost.id) {
       void loadCoreApps(nextHost.id).catch(() => {
-        setHostError('Eclipse could not load the active host library.')
+        setHostError('Terra could not load the active host library.')
       })
     }
   }, [hosts, library.hostId, selectedHostId, setHostError])
@@ -332,7 +332,7 @@ export function App() {
         <div className={styles.hostCommandIdentity}>
           <strong>
             {selectedHost.serverName || selectedHost.name}
-            {selectedHost.appVersion && <span>· Sunshine {selectedHost.appVersion}</span>}
+            {selectedHost.appVersion && <span>· Host {selectedHost.appVersion}</span>}
           </strong>
           <p>
             <span className={`${styles.hostState} ${styles[selectedHost.status]}`}>
@@ -345,7 +345,7 @@ export function App() {
       ) : (
         <div className={styles.hostCommandIdentity}>
           <strong>No active host</strong>
-          <p>Add and pair a Sunshine computer to populate this mode.</p>
+          <p>Add and pair a Sol computer to populate this mode.</p>
         </div>
       )}
       <div className={styles.hostCommandActions}>
@@ -381,7 +381,13 @@ export function App() {
         </div>
 
         <div className={styles.brand}>
-          <EclipseBrand subtitle="TERRA / OPEN STREAM CLIENT" />
+          <span className={styles.terraBrand}>
+            <span className={styles.terraMark} aria-hidden="true" />
+            <span>
+              <strong>TERRA</strong>
+              <small>TERRA / OPEN STREAM CLIENT</small>
+            </span>
+          </span>
         </div>
 
         <ModeSwitch value={appMode} onChange={setAppMode} label="Application mode" />
@@ -446,7 +452,18 @@ export function App() {
             <h1>{viewTitles[activeView]}</h1>
           </div>
           <div className={styles.headerActions}>
-            <ThemePicker />
+            <ThemePicker
+              themeLabel={(theme) =>
+                theme === 'dark'
+                  ? 'Terra / Dark'
+                  : theme === 'auto'
+                    ? 'System'
+                    : theme
+                        .split('-')
+                        .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+                        .join(' ')
+              }
+            />
             <div className={`${styles.corePill} ${styles[bridge.state]}`}>
               <span />
               {bridge.label}
@@ -529,7 +546,7 @@ export function App() {
                 </div>
                 <div>
                   <h3>Connect your first gaming rig</h3>
-                  <p>Add a Sunshine host to discover games and desktop applications.</p>
+                  <p>Add a Sol host to discover games and desktop applications.</p>
                 </div>
                 <button type="button" onClick={() => setShowAddHost(true)}>
                   Add computer <ArrowRight size={17} />
@@ -559,7 +576,7 @@ export function App() {
                     <div className={`${styles.sessionBanner} ${styles.connected}`}>
                       <div>
                         <span>host busy</span>
-                        <strong>Running Sunshine application</strong>
+                        <strong>Running host application</strong>
                         <p>Resume it below or stop the host application.</p>
                       </div>
                       <button
@@ -757,7 +774,7 @@ export function App() {
                 </div>
                 <div>
                   <h3>No workstation linked</h3>
-                  <p>Add a Sunshine host to build your remote workspace.</p>
+                  <p>Add a Sol host to build your remote workspace.</p>
                 </div>
                 <button type="button" onClick={() => setShowAddHost(true)}>
                   Add workstation <ArrowRight size={17} />
@@ -996,7 +1013,7 @@ export function App() {
             </button>
             <p className={styles.panelLabel}>MANUAL HOST</p>
             <h2 id="add-host-title">Add computer</h2>
-            <p>Save a Sunshine endpoint. Native core probes server information and persists it.</p>
+            <p>Save a Sol endpoint. Native core probes server information and persists it.</p>
             {hostError && <p className={styles.dialogError}>{hostError}</p>}
             <form onSubmit={handleAddHost}>
               <label>
@@ -1036,7 +1053,7 @@ export function App() {
             <h2 id="pairing-title">Pair {pairingHost?.name ?? 'computer'}</h2>
             {pairing.state === 'pairing' && (
               <>
-                <p>Open Sunshine web interface, select PIN, then enter this code now.</p>
+                <p>Open Sol web interface, select PIN, then enter this code now.</p>
                 <output className={styles.pinCode} aria-label={`Pairing PIN ${pairing.pin}`}>
                   {(['thousands', 'hundreds', 'tens', 'ones'] as const).map((position, index) => (
                     <span key={position}>{pairing.pin.charAt(index)}</span>

@@ -1,4 +1,4 @@
-/* Client layouts only. Palette, typography, controls, and identity live in the shared package. */
+/* Client layouts and branding use the shared palette, typography, and controls. */
 .appShell {
   min-height: 100vh;
   display: grid;
@@ -6,7 +6,7 @@
   color: var(--color-text-base);
   background: var(--color-bg-base);
 }
-.appShell :where(button:not([data-eclipse-button])) {
+.appShell :where(button:not([data-terra-button])) {
   min-height: 40px;
   display: inline-flex;
   align-items: center;
@@ -19,7 +19,7 @@
   background: var(--color-bg-subtle);
   font: 600 12px / 1.3 var(--font-body);
 }
-.appShell :where(button:not([data-eclipse-button])):hover:not(:disabled) {
+.appShell :where(button:not([data-terra-button])):hover:not(:disabled) {
   color: var(--color-primary);
   border-color: var(--color-primary);
 }
@@ -77,6 +77,35 @@
 }
 .brand {
   padding: 0 8px 28px;
+}
+.terraBrand {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--color-text-base);
+  text-align: left;
+}
+.terraBrand strong,
+.terraBrand small {
+  display: block;
+}
+.terraBrand strong {
+  font: 700 19px / 1 var(--font-display);
+  letter-spacing: 0.16em;
+}
+.terraBrand small {
+  margin-top: 7px;
+  color: var(--color-text-muted);
+  font: 600 9px / 1.3 var(--font-mono);
+  letter-spacing: 0.1em;
+}
+.terraMark {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--color-primary);
+  mask-image: radial-gradient(circle at 75% 25%, transparent 0 48%, #000 50%);
 }
 .modeSwitch {
   min-width: 0;

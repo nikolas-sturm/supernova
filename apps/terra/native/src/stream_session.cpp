@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace eclipse {
+namespace terra {
 namespace {
 std::recursive_mutex connectionMutex;
 std::mutex activeMutex;
@@ -30,11 +30,11 @@ std::string portDiagnostic(unsigned int portFlags) {
     LiStringifyPortFlags(portFlags, ", ", ports, sizeof(ports));
     const auto failed = LiTestClientConnectivity("qt.conntest.moonlight-stream.org", 443, portFlags);
     if (failed == ML_TEST_RESULT_INCONCLUSIVE) {
-        return std::string{" Connectivity test was inconclusive; verify Sunshine firewall access for "} +
+        return std::string{" Connectivity test was inconclusive; verify Sol firewall access for "} +
                ports + ".";
     }
     if (failed == 0) {
-        return std::string{" Local port test passed; verify Sunshine firewall or routing for "} + ports +
+        return std::string{" Local port test passed; verify Sol firewall or routing for "} + ports +
                ".";
     }
 
@@ -111,7 +111,7 @@ void StreamSession::start() {
             streamConfig.streamingRemotely = STREAM_CFG_AUTO;
             break;
     }
-    streamConfig.audioConfiguration = moonlightAudioConfiguration(config_.settings.audioConfig);
+    streamConfig.audioConfiguration = terraAudioConfiguration(config_.settings.audioConfig);
     streamConfig.supportedVideoFormats = config_.videoFormat;
     streamConfig.colorSpace = config_.settings.enableHdr ? COLORSPACE_REC_2020 : COLORSPACE_REC_709;
     streamConfig.colorRange = COLOR_RANGE_LIMITED;
@@ -354,7 +354,7 @@ void StreamSession::stageFailed(int stage, int errorCode) {
             if (usesDefaultStreamingPorts(session->config_)) {
                 message += portDiagnostic(LiGetPortFlagsFromStage(stage));
             } else {
-                message += " Automated port testing is unavailable for custom Sunshine ports.";
+                message += " Automated port testing is unavailable for custom Sol ports.";
             }
         }
         {
@@ -407,7 +407,7 @@ void StreamSession::connectionTerminated(int errorCode) {
                     portDiagnostic(LiGetPortFlagsFromTerminationErrorCode(errorCode));
             } else {
                 event.message +=
-                    " Automated port testing is unavailable for custom Sunshine ports.";
+                    " Automated port testing is unavailable for custom Sol ports.";
             }
         }
         disconnectListener = session->disconnectListener_;
@@ -757,4 +757,4 @@ void StreamSession::receiveAudio(char* data, int length) {
     }
 }
 
-}  // namespace eclipse
+}  // namespace terra

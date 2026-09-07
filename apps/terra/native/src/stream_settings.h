@@ -1,6 +1,6 @@
 #pragma once
 
-namespace eclipse {
+namespace terra {
 
 enum class DisplayMode {
     fullscreen,
@@ -27,7 +27,7 @@ enum class SystemKeyCapture {
     always,
 };
 
-constexpr int moonlightAudioConfiguration(AudioConfig config) noexcept {
+constexpr int terraAudioConfiguration(AudioConfig config) noexcept {
     switch (config) {
         case AudioConfig::surround51:
             return (0x3F << 16) | (6 << 8) | 0xCA;
@@ -40,7 +40,7 @@ constexpr int moonlightAudioConfiguration(AudioConfig config) noexcept {
 }
 
 constexpr int surroundAudioInfo(AudioConfig config) noexcept {
-    const auto audioConfiguration = moonlightAudioConfiguration(config);
+    const auto audioConfiguration = terraAudioConfiguration(config);
     return (audioConfiguration & 0xFFFF0000) | ((audioConfiguration >> 8) & 0xFF);
 }
 
@@ -87,4 +87,4 @@ struct StreamSettings {
     InputSettings input;
 };
 
-}  // namespace eclipse
+}  // namespace terra

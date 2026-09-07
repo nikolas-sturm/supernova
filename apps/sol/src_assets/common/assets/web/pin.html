@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sol</title>
+  <link rel="icon" type="image/x-icon" href="./images/sol.ico">
+  <script>
+    // Apply the persisted theme before first paint to avoid a flash of the wrong theme.
+    (() => {
+      const pref = localStorage.getItem('theme') || 'auto'
+      const resolve = (p) => (p === 'auto'
+        ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+        : p)
+      document.documentElement.dataset.theme = resolve(pref)
+    })()
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="./src/main.tsx"></script>
+</body>
+</html>

@@ -32,15 +32,15 @@ int connectivityTests = 0;
 int motionStateCallbacks = 0;
 int ledCallbacks = 0;
 int overlayResumes = 0;
-eclipse::VideoRenderer::OverlayListener savedOverlayListener;
-eclipse::StreamSession* cancelBeforeFirstStage = nullptr;
+terra::VideoRenderer::OverlayListener savedOverlayListener;
+terra::StreamSession* cancelBeforeFirstStage = nullptr;
 
 void expect(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-eclipse::StreamSessionConfig testConfig() {
-    eclipse::StreamSessionConfig config;
+terra::StreamSessionConfig testConfig() {
+    terra::StreamSessionConfig config;
     config.hostId = "host";
     config.appId = 1;
     config.appName = "Game";
@@ -123,7 +123,7 @@ extern "C" void LiStopConnection() { interrupted.store(true); }
 extern "C" bool LiGetEstimatedRttInfo(std::uint32_t*, std::uint32_t*) { return false; }
 extern "C" bool LiGetCurrentHostDisplayHdrMode() { return false; }
 
-namespace eclipse {
+namespace terra {
 
 struct VideoRenderer::Impl {};
 VideoRenderer::VideoRenderer(StreamSettings settings, StatusListener, CloseListener,
@@ -167,10 +167,10 @@ bool AudioRenderer::supportsOutputChannels(int) noexcept { return true; }
 int main() {
     {
         bool stoppedFromListener = false;
-        eclipse::StreamSession* sessionPointer = nullptr;
-        eclipse::StreamSession session(
+        terra::StreamSession* sessionPointer = nullptr;
+        terra::StreamSession session(
             testConfig(),
-            [&](const eclipse::StreamSessionEvent& event) {
+            [&](const terra::StreamSessionEvent& event) {
                 if (event.message == "Starting Moonlight transport.") {
                     sessionPointer->stop();
                     stoppedFromListener = true;
@@ -189,7 +189,7 @@ int main() {
     }
 
     {
-        eclipse::StreamSession session(testConfig(), [](const auto&) {}, [](auto, bool, bool) {});
+        terra::StreamSession session(testConfig(), [](const auto&) {}, [](auto, bool, bool) {});
         cancelBeforeFirstStage = &session;
         bool cancelled = false;
         try {
@@ -205,7 +205,7 @@ int main() {
         enteredStart.store(false);
         blockStart.store(true);
         std::atomic_bool cancelled = false;
-        eclipse::StreamSession session(testConfig(), [](const auto&) {}, [](auto, bool, bool) {});
+        terra::StreamSession session(testConfig(), [](const auto&) {}, [](auto, bool, bool) {});
         std::thread starter([&] {
             try {
                 session.start();
@@ -228,8 +228,8 @@ int main() {
         connectivityTests = 0;
         auto config = testConfig();
         config.settings.detectBlockedConnections = true;
-        std::vector<eclipse::StreamSessionEvent> failureEvents;
-        eclipse::StreamSession session(config,
+        std::vector<terra::StreamSessionEvent> failureEvents;
+        terra::StreamSession session(config,
                                        [&](const auto& event) { failureEvents.push_back(event); },
                                        [](auto, bool, bool) {});
         std::string failure;
@@ -253,17 +253,17 @@ int main() {
     int disconnects = 0;
     bool hostEnded = false;
     std::string terminalState;
-    std::vector<eclipse::StreamSessionEvent> events;
-    std::optional<eclipse::StreamWindowBounds> overlayBounds;
+    std::vector<terra::StreamSessionEvent> events;
+    std::optional<terra::StreamWindowBounds> overlayBounds;
     {
-        eclipse::StreamSession session(
+        terra::StreamSession session(
             testConfig(), [&](const auto& event) { events.push_back(event); },
-            [&](eclipse::StreamSessionEvent event, bool ended, bool) {
+            [&](terra::StreamSessionEvent event, bool ended, bool) {
                 ++disconnects;
                 hostEnded = ended;
                 terminalState = std::move(event.state);
             },
-            [&](const eclipse::StreamWindowBounds& bounds) { overlayBounds = bounds; });
+            [&](const terra::StreamWindowBounds& bounds) { overlayBounds = bounds; });
         session.start();
         expect(savedStreamConfiguration.packetSize == 1392 &&
                    savedStreamConfiguration.streamingRemotely == STREAM_CFG_LOCAL,
@@ -327,11 +327,11 @@ int main() {
     }
 
     {
-        eclipse::StreamSession* activeSession = nullptr;
+        terra::StreamSession* activeSession = nullptr;
         bool stoppedFromListener = false;
-        eclipse::StreamSession session(
+        terra::StreamSession session(
             testConfig(),
-            [&](const eclipse::StreamSessionEvent& event) {
+            [&](const terra::StreamSessionEvent& event) {
                 if (event.state == "receiving") {
                     activeSession->stop();
                     stoppedFromListener = true;
@@ -349,7 +349,7 @@ int main() {
     {
         auto config = testConfig();
         config.settings.displayIndex = 0;
-        eclipse::StreamSession session(config, [](const auto&) {}, [](auto, bool, bool) {});
+        terra::StreamSession session(config, [](const auto&) {}, [](auto, bool, bool) {});
         session.start();
         savedCallbacks.connectionStarted();
         expect(savedVideoCallbacks.setup(VIDEO_FORMAT_H264, 1280, 720, 60, nullptr, 0) == DR_OK,
@@ -365,7 +365,7 @@ int main() {
 
     {
         int recoveryDisconnects = 0;
-        eclipse::StreamSession session(
+        terra::StreamSession session(
             testConfig(), [](const auto&) {},
             [&](auto, bool, bool) { ++recoveryDisconnects; });
         session.start();
@@ -382,12 +382,12 @@ int main() {
     }
 
     for (const auto [audioConfig, expected] : {
-             std::pair{eclipse::AudioConfig::surround51, AUDIO_CONFIGURATION_51_SURROUND},
-             std::pair{eclipse::AudioConfig::surround71, AUDIO_CONFIGURATION_71_SURROUND},
+             std::pair{terra::AudioConfig::surround51, AUDIO_CONFIGURATION_51_SURROUND},
+             std::pair{terra::AudioConfig::surround71, AUDIO_CONFIGURATION_71_SURROUND},
          }) {
         auto config = testConfig();
         config.settings.audioConfig = audioConfig;
-        eclipse::StreamSession session(config, [](const auto&) {}, [](auto, bool, bool) {});
+        terra::StreamSession session(config, [](const auto&) {}, [](auto, bool, bool) {});
         session.start();
         expect(savedStreamConfiguration.audioConfiguration == expected,
                "Surround audio configuration was not negotiated.");
@@ -395,12 +395,12 @@ int main() {
     }
 
     {
-        eclipse::StreamSession activeSession(testConfig(), [](const auto&) {},
+        terra::StreamSession activeSession(testConfig(), [](const auto&) {},
                                              [](auto, bool, bool) {});
         activeSession.start();
         bool rejected = false;
         {
-            eclipse::StreamSession rejectedSession(testConfig(), [](const auto&) {},
+            terra::StreamSession rejectedSession(testConfig(), [](const auto&) {},
                                                    [](auto, bool, bool) {});
             try {
                 rejectedSession.start();
@@ -414,8 +414,8 @@ int main() {
     }
 
     {
-        eclipse::StreamSession* sessionPointer = nullptr;
-        eclipse::StreamSession session(
+        terra::StreamSession* sessionPointer = nullptr;
+        terra::StreamSession session(
             testConfig(), [](const auto&) {},
             [&](auto, bool, bool) { sessionPointer->stop(); });
         sessionPointer = &session;

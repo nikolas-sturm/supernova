@@ -29,7 +29,7 @@
 #include <unistd.h>
 #endif
 
-namespace eclipse {
+namespace terra {
 namespace {
 
 constexpr std::string_view kServiceType = "_nvstream._tcp.local";
@@ -722,4 +722,4 @@ MdnsDiscovery::~MdnsDiscovery() = default;
 void MdnsDiscovery::start() { impl_->start(); }
 void MdnsDiscovery::stop() { impl_->stop(); }
 
-}  // namespace eclipse
+}  // namespace terra

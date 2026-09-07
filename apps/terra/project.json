@@ -1,7 +1,7 @@
 {
   "name": "terra",
   "projectType": "application",
-  "implicitDependencies": ["design-system", "native-tooling"],
+  "implicitDependencies": ["design-system", "native-tooling", "frontend-tooling"],
   "targets": {
     "lint": { "command": "npm run lint --workspace apps/terra" },
     "typecheck": { "command": "npm run typecheck --workspace apps/terra" },

@@ -19,7 +19,7 @@
 #include <unistd.h>
 #endif
 
-namespace eclipse {
+namespace terra {
 namespace {
 
 int hexDigit(char value) noexcept {
@@ -154,4 +154,4 @@ void sendWakeOnLan(const MacAddress& address) {
     if (!sent) throw std::runtime_error("Wake-on-LAN broadcast failed.");
 }
 
-}  // namespace eclipse
+}  // namespace terra

@@ -14,6 +14,17 @@ describe('clientStore mode profiles', () => {
     })
   })
 
+  it('starts pairing with Sol instructions and preserves the PIN', () => {
+    useClientStore.getState().startPairing('host-1', '0427')
+    expect(useClientStore.getState().pairing).toEqual({
+      hostId: 'host-1',
+      pin: '0427',
+      state: 'pairing',
+      message: "Enter this PIN in Sol's web interface.",
+    })
+    useClientStore.getState().clearPairing()
+  })
+
   it('updates and resets only the active mode profile', () => {
     useClientStore.getState().updateSettings({ fps: 120 })
     useClientStore.getState().setAppMode('workstation')

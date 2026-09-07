@@ -7,8 +7,8 @@
       "apps/*/*.ts",
       "apps/terra/index.html",
       "apps/terra/src/**",
-      "apps/progenitor/src_assets/common/assets/web/*.html",
-      "apps/progenitor/src_assets/common/assets/web/src/**",
+      "apps/sol/src_assets/common/assets/web/*.html",
+      "apps/sol/src_assets/common/assets/web/src/**",
       "packages/**",
       "tooling/**",
       "!!**/node_modules",
@@ -26,7 +26,7 @@
       "!!**/.venv",
       "!!**/extensions",
       "!!**/package-lock.json",
-      "!!apps/progenitor/renovate.json"
+      "!!apps/sol/renovate.json"
     ]
   },
   "formatter": { "enabled": true, "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },

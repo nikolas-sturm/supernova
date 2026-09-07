@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace eclipse {
+namespace terra {
 
 struct MdnsService {
     std::string name;
@@ -37,4 +37,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace eclipse
+}  // namespace terra

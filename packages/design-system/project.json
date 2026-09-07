@@ -9,7 +9,7 @@
       "inputs": [
         "default",
         "{workspaceRoot}/apps/terra/src/**/*",
-        "{workspaceRoot}/apps/progenitor/src_assets/common/assets/web/src/**/*"
+        "{workspaceRoot}/apps/sol/src_assets/common/assets/web/src/**/*"
       ]
     }
   }
