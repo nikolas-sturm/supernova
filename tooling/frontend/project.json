@@ -3,7 +3,7 @@
   "projectType": "library",
   "targets": {
     "test": {
-      "command": "node --test tooling/frontend/config.test.mjs tooling/frontend/sol-auth.test.mjs tooling/dev.test.mjs",
+      "command": "node --test tooling/frontend/config.test.mjs tooling/frontend/sol-auth.test.mjs tooling/dev.test.mjs tooling/neutralino/restore.test.mjs",
       "cache": false
     }
   }

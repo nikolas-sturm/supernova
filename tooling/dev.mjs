@@ -46,7 +46,7 @@ export function developmentPlan(platform = process.platform, arch = process.arch
       [vite, 'Run npm ci from the repository root with the pinned Node/npm versions.'],
       [
         shell,
-        'Restore the Neutralino shell version pinned in apps/terra/neutralino.config.json (6.9.0); no automatic download is performed.',
+        'Neutralino shell version pinned in apps/terra/neutralino.config.json is missing. Run npm run setup:terra (also run automatically by root npm install/ci).',
       ],
     ],
     ports: [47984, 47989, 47990, 48010],

@@ -24,7 +24,7 @@
     "typecheck": "tsc -b",
     "test": "vitest run",
     "test:watch": "vitest",
-    "neutralino:update": "neu update --latest"
+    "neutralino:update": "node ../../tooling/neutralino/restore.mjs"
   },
   "dependencies": {
     "@supernova/design-system": "0.1.0",

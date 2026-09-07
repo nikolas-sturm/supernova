@@ -21,6 +21,12 @@ npm ci
 
 Do not use `git submodule update --remote` as setup: setup restores recorded pins,
 not the latest upstream revisions. Install npm dependencies once at the root.
+The root `postinstall` hook also downloads the Neutralino version pinned in
+`apps/terra/neutralino.config.json`; the npm CLI/client packages alone do not
+contain its desktop executable. Both `npm install` and `npm ci` perform this step.
+Close Terra before reinstalling. When using `--ignore-scripts`, or repairing an
+older checkout's missing runtime, run `npm run setup:terra`. Restore failures
+fail installation rather than leaving an apparently complete desktop setup.
 
 ## Frontend And Checks
 

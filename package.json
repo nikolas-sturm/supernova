@@ -14,6 +14,8 @@
   },
   "packageManager": "npm@12.0.2",
   "scripts": {
+    "postinstall": "node tooling/neutralino/restore.mjs",
+    "setup:terra": "node tooling/neutralino/restore.mjs",
     "dev": "node tooling/dev.mjs",
     "check": "nx run-many -t lint,typecheck,test",
     "build": "nx run-many -t build:web",
@@ -24,7 +26,7 @@
     "test": "nx run-many -t test",
     "graph": "nx graph",
     "format": "biome check --write .",
-    "test:tooling": "node --test tooling/native/build.test.mjs tooling/workspace.test.mjs tooling/frontend/config.test.mjs tooling/frontend/sol-auth.test.mjs tooling/dev.test.mjs",
+    "test:tooling": "node --test tooling/native/build.test.mjs tooling/workspace.test.mjs tooling/frontend/config.test.mjs tooling/frontend/sol-auth.test.mjs tooling/dev.test.mjs tooling/neutralino/restore.test.mjs",
     "check:workspace": "biome check . && npm run typecheck --workspaces --if-present && npm run test --workspaces --if-present && npm run test:tooling"
   },
   "devDependencies": {

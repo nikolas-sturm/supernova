@@ -36,8 +36,11 @@ npm ci
 ```
 
 Use the root lockfile and workspace installation, not separate app installs.
-Native toolchains and app dependencies are separate prerequisites; `npm ci` does
-not install them. See [Development](docs/development.md) before native builds.
+The root install hook restores Terra's pinned Neutralino desktop runtime as well
+as npm dependencies. This requires access to GitHub releases. If install scripts
+were disabled, run `npm run setup:terra` explicitly. Close Terra before reinstalling.
+Native compilers, SDKs, and OS development packages are still separate prerequisites;
+see [Development](docs/development.md) before native builds.
 
 ## Commands
 
