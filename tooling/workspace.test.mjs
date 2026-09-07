@@ -35,6 +35,16 @@ test('workspace uses one lockfile and one first-party language toolchain', () =>
   const setupNpm = `npm install --global ${manifest.packageManager}`
   assert.ok(workflow.includes(setupNpm), 'CI must install the pinned npm version')
   assert.ok(workflow.indexOf(setupNpm) < workflow.indexOf('npm ci'))
+  for (const file of [
+    'package.json',
+    'apps/sol/project.json',
+    'apps/sol/src_assets/common/assets/web/src/main.tsx',
+    'apps/terra/src/App.tsx',
+    'packages/design-system/src/themes.css',
+    'tooling/workspace.test.mjs',
+  ]) {
+    assert.equal(git('check-attr', 'eol', '--', file).trim(), `${file}: eol: lf`)
+  }
   assert.equal(manifest.scripts['dev:sol'], 'nx run sol:dev:web')
   assert.deepEqual(
     Object.keys(manifest.scripts)

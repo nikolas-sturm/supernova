@@ -1,0 +1,10 @@
+# Keep Biome-managed files consistent across Windows and Linux checkouts.
+/*.json text eol=lf
+/apps/*/*.json text eol=lf
+/apps/*/*.ts text eol=lf
+/apps/terra/index.html text eol=lf
+/apps/terra/src/** text=auto eol=lf
+/apps/sol/src_assets/common/assets/web/*.html text eol=lf
+/apps/sol/src_assets/common/assets/web/src/** text=auto eol=lf
+/packages/** text=auto eol=lf
+/tooling/** text=auto eol=lf
