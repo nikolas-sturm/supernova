@@ -5,7 +5,18 @@ import path from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createServer } from 'vite'
-import { nativeWatchIgnored } from './config.ts'
+import { designSystemSource, nativeWatchIgnored } from './config.ts'
+
+test('both apps resolve the design system without a workspace package link', () => {
+  assert.equal(readFileSync(path.join(designSystemSource, 'styles.css'), 'utf8').length > 0, true)
+  for (const app of ['sol', 'terra']) {
+    const config = readFileSync(
+      new URL(`../../apps/${app}/vite.config.ts`, import.meta.url),
+      'utf8',
+    )
+    assert.match(config, /['"]@supernova\/design-system['"]:\s*designSystemSource/)
+  }
+})
 
 test('both app configurations install the native-directory exclusion', () => {
   for (const app of ['sol', 'terra']) {

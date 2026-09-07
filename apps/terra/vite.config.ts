@@ -1,8 +1,16 @@
 import { defineConfig } from 'vite'
-import { browserTarget, nativeWatchIgnored, reactCompiler } from '../../tooling/frontend/config.ts'
+import {
+  browserTarget,
+  designSystemSource,
+  nativeWatchIgnored,
+  reactCompiler,
+} from '../../tooling/frontend/config.ts'
 
 export default defineConfig({
   plugins: [reactCompiler()],
+  resolve: {
+    alias: { '@supernova/design-system': designSystemSource },
+  },
   build: {
     outDir: 'build/web',
     emptyOutDir: true,

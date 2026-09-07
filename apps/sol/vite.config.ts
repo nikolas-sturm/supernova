@@ -3,7 +3,12 @@ import { resolve } from 'node:path'
 import process from 'node:process'
 import { codecovVitePlugin } from '@codecov/vite-plugin'
 import { defineConfig } from 'vite'
-import { browserTarget, nativeWatchIgnored, reactCompiler } from '../../tooling/frontend/config.ts'
+import {
+  browserTarget,
+  designSystemSource,
+  nativeWatchIgnored,
+  reactCompiler,
+} from '../../tooling/frontend/config.ts'
 import { solApiProxy, solHtmlRewrite } from './vite.auth.ts'
 
 /**
@@ -37,6 +42,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': resolve(assetsSrcPath, 'src'),
+      '@supernova/design-system': designSystemSource,
     },
   },
   base: './',
