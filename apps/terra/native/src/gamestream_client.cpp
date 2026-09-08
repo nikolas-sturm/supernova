@@ -36,6 +36,8 @@ constexpr std::uint16_t kDefaultHttpPort = 47989;
 constexpr std::uint16_t kDefaultHttpsPort = 47984;
 constexpr int kRequestTimeoutSeconds = 5;
 constexpr int kLaunchTimeoutSeconds = 120;
+/// Allows Sol's five-minute PIN session to return its final response.
+constexpr int kPairingPinTimeoutSeconds = 310;
 
 struct Endpoint {
     std::string host;
@@ -612,7 +614,7 @@ std::string GameStreamClient::pair(const std::string& address, std::uint16_t htt
             endpoint, endpoint.port, false, "pair",
             "devicename=roth&updateState=1&phrase=getservercert&salt=" + toHex(salt) +
                 "&clientcert=" + toHex(identity_.certificatePem()),
-            clientId, identity_, {}, 30);
+            clientId, identity_, {}, kPairingPinTimeoutSeconds);
         const auto certificateRoot = parseRoot(certificateDocument, certificateResponse);
         requirePaired(certificateRoot, "certificate stage");
         const auto certificateBytes = fromHex(childText(certificateRoot, "plaincert"));
