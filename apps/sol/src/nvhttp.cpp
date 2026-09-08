@@ -939,11 +939,11 @@ namespace nvhttp {
 
     auto &response = sess.async_insert_pin.response;
     if (response.has_left() && response.left()) {
-      response.left()->close_connection_after_response = true;
       response.left()->write(data.str());
+      response.left()->close_connection_after_response = true;
     } else if (response.has_right() && response.right()) {
-      response.right()->close_connection_after_response = true;
       response.right()->write(data.str());
+      response.right()->close_connection_after_response = true;
     } else {
       return false;
     }
