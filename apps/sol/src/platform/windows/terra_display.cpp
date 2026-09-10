@@ -187,8 +187,8 @@ namespace terra::windows::display {
         });
         const auto refresh = scale_rational(info.m_refresh_rate);
         if (refresh) {
-          const auto bit_depth = platform && platform->current_bit_depth ? *platform->current_bit_depth : 0U;
           const bool hdr = snapshot.hdr_enabled.value_or(false);
+          const auto bit_depth = platform && platform->current_bit_depth ? *platform->current_bit_depth : hdr ? 10U : 8U;
           snapshot.current_mode = Mode {stable_mode_id(physical, *refresh, bit_depth, hdr), physical, *refresh, bit_depth, hdr};
         }
       }

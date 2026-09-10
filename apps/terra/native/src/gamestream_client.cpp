@@ -345,43 +345,52 @@ RawApiResponse apiCall(const Endpoint& endpoint, std::uint16_t port,
         throw std::invalid_argument("Unsupported Eclipse API HTTP method.");
     }
 
-    ix::HttpClient client;
-    configureTls(client, identity, serverCertificate);
-    if (method == "DELETE" && body) client.setForceBody(true);
-    const auto arguments = client.createRequest();
-    arguments->connectTimeout = 5;
-    arguments->transferTimeout = 120;
-    arguments->followRedirects = false;
-    arguments->compress = false;
-    arguments->extraHeaders = ix::WebSocketHttpHeaders{headers.begin(), headers.end()};
-    if (!arguments->extraHeaders.contains("Accept")) {
-        arguments->extraHeaders["Accept"] = "application/json";
-    }
-    arguments->extraHeaders["Connection"] = "close";
-    if (body) arguments->extraHeaders["Content-Type"] = "application/json";
-
-    std::string responseBody;
-    bool tooLarge = false;
-    arguments->onChunkCallback = [&](const std::string& chunk) {
-        if (chunk.size() > kMaximumApiResponseBytes - responseBody.size()) {
-            tooLarge = true;
-            arguments->cancel.store(true);
-            return;
+    const int attempts = method == "GET" ? 2 : 1;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        ix::HttpClient client;
+        configureTls(client, identity, serverCertificate);
+        if (method == "DELETE" && body) client.setForceBody(true);
+        const auto arguments = client.createRequest();
+        arguments->connectTimeout = 5;
+        arguments->transferTimeout = 120;
+        arguments->followRedirects = false;
+        arguments->compress = false;
+        arguments->extraHeaders = ix::WebSocketHttpHeaders{headers.begin(), headers.end()};
+        if (!arguments->extraHeaders.contains("Accept")) {
+            arguments->extraHeaders["Accept"] = "application/json";
         }
-        responseBody += chunk;
-    };
-    const auto response =
-        client.request("https://" + urlHost(endpoint) + ":" +
-                           std::to_string(port == 0 ? kDefaultHttpsPort : port) + path,
-                       method, body.value_or(""), arguments);
-    if (tooLarge) throw std::runtime_error("Sol API response exceeds 8 MiB.");
-    if (!response || response->errorCode != ix::HttpErrorCode::Ok) {
-        throw std::runtime_error(response ? response->errorMsg : "No HTTP response.");
+        arguments->extraHeaders["Connection"] = "close";
+        if (body) arguments->extraHeaders["Content-Type"] = "application/json";
+
+        std::string responseBody;
+        bool tooLarge = false;
+        arguments->onChunkCallback = [&](const std::string& chunk) {
+            if (chunk.size() > kMaximumApiResponseBytes - responseBody.size()) {
+                tooLarge = true;
+                arguments->cancel.store(true);
+                return;
+            }
+            responseBody += chunk;
+        };
+        const auto response =
+            client.request("https://" + urlHost(endpoint) + ":" +
+                               std::to_string(port == 0 ? kDefaultHttpsPort : port) + path,
+                           method, body.value_or(""), arguments);
+        if (tooLarge) throw std::runtime_error("Sol API response exceeds 8 MiB.");
+        if (!response || response->errorCode != ix::HttpErrorCode::Ok) {
+            if (attempt + 1 < attempts && response &&
+                response->errorCode == ix::HttpErrorCode::CannotReadStatusLine) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+                continue;
+            }
+            throw std::runtime_error(response ? response->errorMsg : "No HTTP response.");
+        }
+        if (response->statusCode < 200 || response->statusCode >= 300) {
+            throwApiError(response->statusCode, responseBody);
+        }
+        return {response->statusCode, copyHeaders(response->headers), std::move(responseBody)};
     }
-    if (response->statusCode < 200 || response->statusCode >= 300) {
-        throwApiError(response->statusCode, responseBody);
-    }
-    return {response->statusCode, copyHeaders(response->headers), std::move(responseBody)};
+    throw std::runtime_error("No HTTP response.");
 }
 
 pugi::xml_node parseRoot(pugi::xml_document& document, const std::string& xml) {

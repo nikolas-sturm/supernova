@@ -79,7 +79,12 @@ namespace terra::windows::virtual_display {
       for (const auto &[id, mode] : state.modes) {
         modes[id] = mode_json(mode);
       }
-      const nlohmann::json document {{"version", 1}, {"topology", *state.topology}, {"primary", *state.primary}, {"modes", std::move(modes)}, {"hdr", state.hdr_states}};
+      bool hdr_serialized = false;
+      const auto hdr = display_device::toJson(state.hdr_states, display_device::JSON_COMPACT, &hdr_serialized);
+      if (!hdr_serialized) {
+        return false;
+      }
+      const nlohmann::json document {{"version", 1}, {"topology", *state.topology}, {"primary", *state.primary}, {"modes", std::move(modes)}, {"hdr", nlohmann::json::parse(hdr)}};
       return file_handler::write_file_atomic(state.path.string().c_str(), document.dump()) == 0;
     }
 
@@ -102,7 +107,9 @@ namespace terra::windows::virtual_display {
         for (const auto &[id, value] : document.at("modes").items()) {
           state.modes.emplace(id, parse_mode(value));
         }
-        state.hdr_states = document.at("hdr").get<display_device::HdrStateMap>();
+        if (!display_device::fromJson(document.at("hdr").dump(), state.hdr_states)) {
+          return false;
+        }
         return true;
       } catch (...) {
         return false;

@@ -112,6 +112,25 @@ TEST(TerraDisplayTest, TransformsDevicesWithoutGuessingKind) {
   EXPECT_FALSE(snapshots[1].current_mode);
 }
 
+TEST(TerraDisplayTest, UsesContractBitDepthWithoutDxgiMetadata) {
+  const display_device::EnumeratedDeviceList devices {{
+    .m_device_id = "indirect-display",
+    .m_display_name = R"(\\.\DISPLAY2)",
+    .m_info = display_device::EnumeratedDevice::Info {
+      .m_resolution = {1920, 1080},
+      .m_resolution_scale = display_device::Rational {1, 1},
+      .m_refresh_rate = display_device::Rational {60, 1},
+      .m_hdr_state = std::nullopt,
+    },
+  }};
+
+  const auto snapshots = make_snapshot("host", devices, {});
+  ASSERT_EQ(snapshots.size(), 1);
+  ASSERT_TRUE(snapshots.front().current_mode);
+  EXPECT_EQ(snapshots.front().current_mode->bit_depth, 8);
+  EXPECT_GT(to_json(snapshots.front()).at("currentMode").at("bitDepth"), 0);
+}
+
 TEST(TerraDisplayTest, SerializesExactContractWithoutInternalDeviceId) {
   const terra::windows::display::Snapshot snapshot {
     .resource_uuid = "aaaaaaaa-aaaa-8aaa-8aaa-aaaaaaaaaaaa",
