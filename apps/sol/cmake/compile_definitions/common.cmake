@@ -104,6 +104,7 @@ if(WIN32)
                 NVENC_NAMESPACE=nvenc_${sdk_version}
                 NVENC_SDK_VERSION=${sdk_version}
         )
+        target_link_libraries(${target_name} PRIVATE nlohmann_json::nlohmann_json)
         target_compile_options(${target_name} PRIVATE ${SOL_COMPILE_OPTIONS})
     endfunction()
 

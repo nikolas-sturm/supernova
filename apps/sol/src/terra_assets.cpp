@@ -19,6 +19,7 @@
 namespace terra_assets {
   namespace {
     constexpr std::array<std::uint8_t, 8> PNG_SIGNATURE {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+    constexpr std::uint64_t JSON_SAFE_INTEGER_MAX = (std::uint64_t {1} << 53U) - 1;  ///< Largest integer represented exactly by JSON consumers using IEEE-754 doubles.
 
     /**
      * @brief Read an unsigned big-endian 16-bit integer.
@@ -243,6 +244,7 @@ namespace terra_assets {
       for (std::size_t index = 0; index < sizeof(revision); ++index) {
         revision = (revision << 8U) | digest[index];
       }
+      revision &= JSON_SAFE_INTEGER_MAX;
       return revision == 0 ? 1 : revision;
     }
   }  // namespace

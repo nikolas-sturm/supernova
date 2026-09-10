@@ -1915,7 +1915,9 @@ namespace video {
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
-      stream::session::record_encoded_frame(*static_cast<stream::session_t *>(channel_data));
+      if (channel_data) {
+        stream::session::record_encoded_frame(*static_cast<stream::session_t *>(channel_data));
+      }
       packets->raise(std::move(packet));
     }
 
@@ -1947,7 +1949,9 @@ namespace video {
     packet->channel_data = channel_data;
     packet->after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
     packet->frame_timestamp = frame_timestamp;
-    stream::session::record_encoded_frame(*static_cast<stream::session_t *>(channel_data));
+    if (channel_data) {
+      stream::session::record_encoded_frame(*static_cast<stream::session_t *>(channel_data));
+    }
     packets->raise(std::move(packet));
 
     return 0;
