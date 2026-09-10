@@ -205,6 +205,17 @@ GameStreamApp catalogApp(const Json& value) {
         !value.contains("name") || !value.at("name").is_string()) {
         throw std::runtime_error("Sol returned an invalid Catalog V2 application.");
     }
+    std::vector<LaunchProfileSummary> launchProfiles;
+    for (const auto& profile : value.value("launchProfiles", Json::array())) {
+        if (!profile.is_object() || !profile.contains("id") || !profile.at("id").is_string() ||
+            !profile.contains("name") || !profile.at("name").is_string() ||
+            !profile.contains("default") || !profile.at("default").is_boolean()) {
+            throw std::runtime_error("Sol returned an invalid Catalog V2 launch profile.");
+        }
+        launchProfiles.push_back({profile.at("id").get<std::string>(),
+                                  profile.at("name").get<std::string>(),
+                                  profile.at("default").get<bool>()});
+    }
     GameStreamApp app{
         .id = value.at("legacyId").get<int>(),
         .name = value.at("name").get<std::string>(),
@@ -217,6 +228,7 @@ GameStreamApp catalogApp(const Json& value) {
         .publisher = value.value("publisher", ""),
         .tags = stringArray(value.value("tags", Json::array())),
         .inputRequirements = stringArray(value.value("inputRequirements", Json::array())),
+        .launchProfiles = std::move(launchProfiles),
         .installed = value.value("installed", true),
         .updateAvailable = value.value("updateAvailable", false),
         .assetId = {},
@@ -631,7 +643,8 @@ nlohmann::json ControlPlane::mutateApiResource(const std::string& hostId, const 
 }
 
 SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
-                                      const StreamSettings& settings) {
+                                      const StreamSettings& settings,
+                                      const std::string& launchProfileId) {
     std::scoped_lock sessionLock{sessionMutex_};
     HostRecord current;
     GameStreamApp selected;
@@ -666,6 +679,12 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
         }
         if (host->currentGameId != 0 && host->currentGameId != appId) {
             throw std::runtime_error("Another application is already running on this host.");
+        }
+        if (!launchProfileId.empty() &&
+            std::ranges::none_of(app->launchProfiles, [&](const auto& profile) {
+                return profile.id == launchProfileId;
+            })) {
+            throw std::invalid_argument("Launch profile is unavailable for this application.");
         }
         current = *host;
         selected = *app;
@@ -739,7 +758,8 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
         }
         launched = gameStream_->launch(current.address, current.httpsPort, clientId,
                                        current.serverCertificate, appId, resume, effectiveSettings,
-                                       &launchCancellationRequested_, selected.uuid);
+                                       &launchCancellationRequested_, selected.uuid,
+                                       launchProfileId);
     } catch (...) {
         const auto failure = std::current_exception();
         const bool cancelled = launchCancellationRequested_.load();

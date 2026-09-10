@@ -9,6 +9,7 @@ import {
   Gamepad2,
   Gauge,
   ImageOff,
+  Info,
   Keyboard,
   KeyRound,
   LayoutGrid,
@@ -23,6 +24,7 @@ import {
   RefreshCw,
   Search,
   Server,
+  ShieldCheck,
   SlidersHorizontal,
   Square,
   Trash2,
@@ -46,7 +48,15 @@ import {
   wakeCoreHost,
 } from './native/coreBridge'
 import { SettingsView } from './SettingsView'
+import { settingsSchema } from './settings'
 import { useClientStore } from './store/clientStore'
+import {
+  DisplayManager,
+  HardwareManager,
+  ProfileManager,
+  SandboxManager,
+  WorkspaceManager,
+} from './WorkstationResources'
 
 type GamingView =
   | 'game-library'
@@ -92,29 +102,6 @@ const viewTitles: Record<AppView, string> = {
   hardware: 'Hardware & peripherals',
 }
 
-const workstationScaffolds: Partial<
-  Record<AppView, { eyebrow: string; title: string; description: string }>
-> = {
-  'display-topology': {
-    eyebrow: 'SPATIAL ARRANGEMENT',
-    title: 'Display topology is coming online.',
-    description:
-      'Connected display modes are available today. Visual arrangement, virtual displays, and seamless cursor topology need native display-control support.',
-  },
-  'app-sandboxes': {
-    eyebrow: 'ISOLATED WORKLOADS',
-    title: 'App sandboxes need host support.',
-    description:
-      'This surface will manage isolated host applications and workspace policies once Sol exposes lifecycle and policy controls.',
-  },
-  hardware: {
-    eyebrow: 'DEVICE BRIDGE',
-    title: 'Peripheral inventory is not exposed yet.',
-    description:
-      'Keyboard, mouse, touch, pen, and controller forwarding already work during streams. Device discovery and USB routing require a native inventory protocol.',
-  },
-}
-
 function ModeSwitch({
   value,
   onChange,
@@ -149,6 +136,7 @@ export function App() {
   const session = useClientStore((state) => state.session)
   const logicalSessionsByHost = useClientStore((state) => state.logicalSessionsByHost)
   const telemetryByHost = useClientStore((state) => state.telemetryByHost)
+  const resourcesByHost = useClientStore((state) => state.resourcesByHost)
   const appMode = useClientStore((state) => state.appMode)
   const settings = useClientStore((state) => state.settingsByMode[state.appMode])
   const setAppMode = useClientStore((state) => state.setAppMode)
@@ -166,8 +154,12 @@ export function App() {
   const [showAddHost, setShowAddHost] = useState(false)
   const [selectedHostId, setSelectedHostId] = useState<string>()
   const [libraryQuery, setLibraryQuery] = useState('')
-  const [libraryFilter, setLibraryFilter] = useState<'all' | 'games' | 'apps'>('all')
-  const [librarySort, setLibrarySort] = useState<'host' | 'name'>('host')
+  const [libraryFilter, setLibraryFilter] = useState<
+    'all' | 'games' | 'apps' | 'installed' | 'updates'
+  >('all')
+  const [librarySort, setLibrarySort] = useState<'host' | 'name' | 'updates'>('host')
+  const [selectedAppId, setSelectedAppId] = useState<number>()
+  const [selectedLaunchProfileId, setSelectedLaunchProfileId] = useState('')
   const deferredLibraryQuery = useDeferredValue(libraryQuery)
   const [activeViews, setActiveViews] = useState<Record<'gaming' | 'workstation', AppView>>({
     gaming: 'game-library',
@@ -177,6 +169,16 @@ export function App() {
 
   function setActiveView(activeView: AppView) {
     setActiveViews((current) => ({ ...current, [appMode]: activeView }))
+  }
+
+  function openAppDetails(appId: number) {
+    setSelectedLaunchProfileId('')
+    setSelectedAppId(appId)
+  }
+
+  function closeAppDetails() {
+    setSelectedAppId(undefined)
+    setSelectedLaunchProfileId('')
   }
 
   useEffect(
@@ -244,7 +246,44 @@ export function App() {
         setHostError('Terra could not load Sol telemetry.')
       })
     }
+    if (host.apiScopes?.includes('catalog.read') && host.capabilities?.includes('profiles-v1')) {
+      void loadCoreResource(host.id, 'profiles').catch(() => {
+        setHostError('Terra could not load Sol launch profiles.')
+      })
+    }
   }, [bridge.state, hosts, selectedHostId, setHostError])
+
+  useEffect(() => {
+    if (appMode !== 'workstation') return
+    const host = hosts.find((candidate) => candidate.id === selectedHostId)
+    if (bridge.state !== 'ready' || host?.status !== 'online' || host.apiVersion !== 1) return
+    const resources: Array<Parameters<typeof loadCoreResource>[1]> = []
+    if (activeView === 'workspaces' && host.capabilities?.includes('workspaces-v1')) {
+      resources.push('workspaces')
+    }
+    if (activeView === 'display-topology' && host.capabilities?.includes('displays-v1')) {
+      resources.push('displays', 'display-topology')
+      if (host.capabilities.includes('virtual-displays-v1')) resources.push('virtual-displays')
+    }
+    if (activeView === 'app-sandboxes' && host.capabilities?.includes('sandboxes-v1')) {
+      resources.push('sandboxes')
+      if (host.capabilities.includes('profiles-v1')) resources.push('profiles')
+    }
+    if (activeView === 'workstation-settings' && host.capabilities?.includes('profiles-v1')) {
+      resources.push('profiles')
+    }
+    if (activeView === 'hardware' && host.capabilities?.includes('peripherals-v1')) {
+      resources.push('peripherals', 'peripheral-claims')
+      if (host.apiScopes?.includes('session.control')) resources.push('sessions')
+      if (host.capabilities.includes('workspaces-v1')) resources.push('workspaces')
+      if (host.capabilities.includes('sandboxes-v1')) resources.push('sandboxes')
+    }
+    for (const resource of resources) {
+      void loadCoreResource(host.id, resource).catch(() => {
+        setHostError(`Terra could not load Sol ${resource}.`)
+      })
+    }
+  }, [activeView, appMode, bridge.state, hosts, selectedHostId, setHostError])
 
   async function handleAddHost(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -288,10 +327,11 @@ export function App() {
 
   async function handleOpenLibrary(hostId: string) {
     setSelectedHostId(hostId)
+    setSelectedAppId(undefined)
     setHostError(undefined)
     try {
       await loadCoreApps(hostId)
-      if (activeView === 'paired-hosts') setActiveView('game-library')
+      if (appMode === 'gaming' && activeView !== 'game-library') setActiveView('game-library')
     } catch (error) {
       setHostError(
         error instanceof Error ? error.message : 'Native core did not accept app listing.',
@@ -308,10 +348,71 @@ export function App() {
     }
   }
 
-  async function handleLaunch(hostId: string, appId: number) {
+  async function handleLaunch(hostId: string, appId: number, launchProfileId = '') {
     setHostError(undefined)
     try {
-      await launchCoreApp(hostId, appId, settings)
+      const app =
+        library.hostId === hostId
+          ? library.apps.find((candidate) => candidate.id === appId)
+          : undefined
+      const host = hosts.find((candidate) => candidate.id === hostId)
+      const profileSnapshot = useClientStore.getState().resourcesByHost[hostId]?.profiles
+      if (
+        host?.capabilities?.includes('profiles-v1') &&
+        (app?.streamProfileId || app?.launchProfiles?.length) &&
+        !profileSnapshot
+      ) {
+        await loadCoreResource(hostId, 'profiles')
+        setHostError('Sol launch profiles are still loading. Retry when profile data is ready.')
+        return
+      }
+      const profiles = profileSnapshot?.profiles ?? []
+      const resolvedLaunchProfileId =
+        launchProfileId || app?.launchProfiles?.find((profile) => profile.default)?.id || ''
+      const launchProfile = profiles.find(
+        (profile) => profile.id === resolvedLaunchProfileId && profile.type === 'launch',
+      )
+      const launchStreamProfileId =
+        typeof launchProfile?.configuration.streamProfileId === 'string'
+          ? launchProfile.configuration.streamProfileId
+          : undefined
+      const streamProfile = profiles.find(
+        (profile) =>
+          profile.id === (launchStreamProfileId ?? app?.streamProfileId) &&
+          profile.type === 'stream',
+      )
+      const configuration = streamProfile?.configuration
+      const profiledSettings = configuration
+        ? settingsSchema.safeParse({
+            ...settings,
+            width: configuration.width,
+            height: configuration.height,
+            fps: configuration.fps,
+            bitrateKbps: configuration.bitrateKbps,
+            videoCodec: configuration.codec,
+            enableHdr: configuration.hdr,
+            enableYuv444: configuration.yuv444,
+            audioConfig: configuration.audioChannels,
+            muteHostAudio:
+              typeof configuration.hostAudio === 'boolean'
+                ? !configuration.hostAudio
+                : settings.muteHostAudio,
+            absoluteMouseMode:
+              configuration.inputMode === 'absolute'
+                ? true
+                : configuration.inputMode === 'relative'
+                  ? false
+                  : settings.absoluteMouseMode,
+            gameOptimizations: configuration.gameOptimizations,
+          })
+        : undefined
+      await launchCoreApp(
+        hostId,
+        appId,
+        profiledSettings?.success ? profiledSettings.data : settings,
+        resolvedLaunchProfileId,
+      )
+      closeAppDetails()
     } catch (error) {
       setHostError(error instanceof Error ? error.message : 'Native core did not accept launch.')
     }
@@ -347,6 +448,10 @@ export function App() {
   const pairingHost = pairing ? hosts.find((host) => host.id === pairing.hostId) : undefined
   const selectedHost = hosts.find((host) => host.id === selectedHostId)
   const selectedApps = library.hostId === selectedHostId ? library.apps : []
+  const selectedApp = selectedApps.find((app) => app.id === selectedAppId)
+  const selectedProfiles = selectedHostId
+    ? (resourcesByHost[selectedHostId]?.profiles?.profiles ?? [])
+    : []
   const logicalSessions = Object.entries(logicalSessionsByHost).flatMap(([hostId, sessions]) =>
     sessions
       .filter((logicalSession) => !['stopped', 'failed'].includes(logicalSession.state))
@@ -359,7 +464,6 @@ export function App() {
   const gamepadView = activeView === 'gamepad'
   const hostsView = activeView === 'paired-hosts'
   const sessionsView = activeView === 'active-sessions'
-  const placeholderView = ['display-topology', 'app-sandboxes', 'hardware'].includes(activeView)
   const profileCodec =
     settings.videoCodec === 'automatic' ? 'AUTO' : settings.videoCodec.toUpperCase()
   const runningApp = selectedApps.find((app) => app.id === selectedHost?.currentGameId)
@@ -371,9 +475,28 @@ export function App() {
     .filter((app) => {
       if (libraryFilter === 'games' && !app.appCollectorGame) return false
       if (libraryFilter === 'apps' && app.appCollectorGame) return false
-      return app.name.toLocaleLowerCase().includes(deferredLibraryQuery.trim().toLocaleLowerCase())
+      if (libraryFilter === 'installed' && app.installed === false) return false
+      if (libraryFilter === 'updates' && !app.updateAvailable) return false
+      const query = deferredLibraryQuery.trim().toLocaleLowerCase()
+      if (!query) return true
+      return [app.name, app.publisher, app.source, app.description, ...(app.tags ?? [])]
+        .filter(Boolean)
+        .join(' ')
+        .toLocaleLowerCase()
+        .includes(query)
     })
-    .sort((left, right) => (librarySort === 'name' ? left.name.localeCompare(right.name) : 0))
+    .sort((left, right) => {
+      if (librarySort === 'name') return left.name.localeCompare(right.name)
+      if (librarySort === 'updates') {
+        return Number(Boolean(right.updateAvailable)) - Number(Boolean(left.updateAvailable))
+      }
+      return 0
+    })
+  const workstationAccessMissing = Boolean(
+    selectedHost?.paired &&
+      appMode === 'workstation' &&
+      !selectedHost.apiScopes?.includes('host.control'),
+  )
   const activeHostBar = (
     <section className={styles.hostCommandBar} aria-label="Active host">
       <div className={styles.hostCommandIcon}>
@@ -400,6 +523,22 @@ export function App() {
         </div>
       )}
       <div className={styles.hostCommandActions}>
+        {hosts.length > 1 && (
+          <select
+            aria-label="Active computer"
+            value={selectedHostId}
+            onChange={(event) => {
+              setSelectedHostId(event.currentTarget.value)
+              setSelectedAppId(undefined)
+            }}
+          >
+            {hosts.map((host) => (
+              <option value={host.id} key={host.id}>
+                {host.serverName || host.name}
+              </option>
+            ))}
+          </select>
+        )}
         {selectedHost?.status === 'offline' && selectedHost.wakeable && (
           <button type="button" onClick={() => void handleWake(selectedHost.id)}>
             <Power size={14} /> Wake-on-LAN
@@ -410,6 +549,13 @@ export function App() {
             <RefreshCw size={14} /> Refresh
           </button>
         )}
+        {selectedHost?.status === 'online' &&
+          (!selectedHost.paired || workstationAccessMissing) && (
+            <button type="button" onClick={() => void handlePair(selectedHost.id)}>
+              <KeyRound size={14} />
+              {workstationAccessMissing ? 'Upgrade workstation access' : 'Pair computer'}
+            </button>
+          )}
         <button type="button" onClick={() => setShowAddHost(true)}>
           <Plus size={14} /> Add host
         </button>
@@ -450,6 +596,7 @@ export function App() {
             <button
               className={activeView === id ? styles.navActive : undefined}
               type="button"
+              aria-label={label}
               aria-current={activeView === id ? 'page' : undefined}
               key={id}
               onClick={() => setActiveView(id)}
@@ -457,6 +604,8 @@ export function App() {
               <Icon size={18} />
               {label}
               {id === 'game-library' && <span>{library.apps.length || hosts.length}</span>}
+              {id === 'active-sessions' && <span>{logicalSessions.length}</span>}
+              {id === 'paired-hosts' && <span>{onlineCount}</span>}
             </button>
           ))}
         </nav>
@@ -529,21 +678,38 @@ export function App() {
         </header>
 
         {settingsView || gamepadView ? (
-          <SettingsView section={gamepadView ? 'gamepad' : 'profile'} />
-        ) : placeholderView ? (
-          <section className={styles.scaffoldPage}>
-            <div className={styles.scaffoldGraphic} aria-hidden="true">
-              <span />
-              <span />
-              <span />
-            </div>
-            <div>
-              <p className={styles.panelLabel}>{workstationScaffolds[activeView]?.eyebrow}</p>
-              <h2>{workstationScaffolds[activeView]?.title}</h2>
-              <p>{workstationScaffolds[activeView]?.description}</p>
-              <span className={styles.scaffoldStatus}>NATIVE CAPABILITY PENDING</span>
-            </div>
-          </section>
+          <>
+            <SettingsView section={gamepadView ? 'gamepad' : 'profile'} />
+            {activeView === 'workstation-settings' && (
+              <ProfileManager
+                host={selectedHost}
+                apps={selectedApps}
+                settings={settings}
+                onError={setHostError}
+              />
+            )}
+          </>
+        ) : activeView === 'display-topology' ? (
+          <DisplayManager
+            host={selectedHost}
+            apps={selectedApps}
+            settings={settings}
+            onError={setHostError}
+          />
+        ) : activeView === 'app-sandboxes' ? (
+          <SandboxManager
+            host={selectedHost}
+            apps={selectedApps}
+            settings={settings}
+            onError={setHostError}
+          />
+        ) : activeView === 'hardware' ? (
+          <HardwareManager
+            host={selectedHost}
+            apps={selectedApps}
+            settings={settings}
+            onError={setHostError}
+          />
         ) : sessionsView ? (
           <section className={styles.sessionsPage}>
             <div className={styles.sectionHeading}>
@@ -605,8 +771,34 @@ export function App() {
                               : `${telemetry.encodeLatencyMs.toFixed(1)} ms`}
                           </dd>
                         </div>
+                        <div>
+                          <dt>Transmit</dt>
+                          <dd>
+                            {telemetry?.transmitFps == null
+                              ? '—'
+                              : `${telemetry.transmitFps.toFixed(1)} FPS`}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Frame drops</dt>
+                          <dd>{telemetry?.droppedFrames ?? '—'}</dd>
+                        </div>
                       </dl>
                       <footer>
+                        {logicalSession.state === 'disconnected' && (
+                          <button
+                            type="button"
+                            disabled={logicalSession.legacyAppId === 0}
+                            onClick={() =>
+                              library.hostId === hostId
+                                ? void handleLaunch(hostId, logicalSession.legacyAppId)
+                                : void handleOpenLibrary(hostId)
+                            }
+                          >
+                            <Play size={13} />
+                            {library.hostId === hostId ? 'Resume stream' : 'Open host library'}
+                          </button>
+                        )}
                         {logicalSession.state !== 'disconnected' && (
                           <button
                             type="button"
@@ -666,6 +858,7 @@ export function App() {
                 <span>{selectedTelemetry.host.healthy ? 'HOST HEALTHY' : 'HOST DEGRADED'}</span>
                 <strong>{selectedTelemetry.host.encoderCodec ?? 'Encoder idle'}</strong>
                 <code>
+                  Uptime {Math.floor(selectedTelemetry.host.uptimeMs / 3_600_000)}h /{' '}
                   {selectedTelemetry.host.captureFps == null
                     ? 'No active capture'
                     : `${selectedTelemetry.host.captureFps.toFixed(1)} FPS capture`}
@@ -704,6 +897,12 @@ export function App() {
               </section>
             ) : (
               <>
+                <WorkspaceManager
+                  host={selectedHost}
+                  apps={selectedApps}
+                  settings={settings}
+                  onError={setHostError}
+                />
                 {activeSession && activeSession.state !== 'stopped' && (
                   <div className={`${styles.sessionBanner} ${styles[activeSession.state]}`}>
                     <div>
@@ -762,7 +961,11 @@ export function App() {
                         <Play size={18} fill="currentColor" />
                         {sessionBusy ? 'Streaming' : runningApp ? 'Resume' : 'Launch'}
                       </button>
-                      <button type="button" aria-label="More game actions" disabled>
+                      <button
+                        type="button"
+                        aria-label={`View ${featuredApp.name} details`}
+                        onClick={() => openAppDetails(featuredApp.id)}
+                      >
                         <EllipsisVertical size={19} />
                       </button>
                     </div>
@@ -801,16 +1004,22 @@ export function App() {
                         />
                       </label>
                       <fieldset className={styles.libraryFilters} aria-label="Library type filters">
-                        {(['all', 'games', 'apps'] as const).map((filter) => (
-                          <button
-                            type="button"
-                            key={filter}
-                            aria-pressed={libraryFilter === filter}
-                            onClick={() => setLibraryFilter(filter)}
-                          >
-                            {filter === 'all' ? `All (${selectedApps.length})` : filter}
-                          </button>
-                        ))}
+                        {(['all', 'games', 'apps', 'installed', 'updates'] as const).map(
+                          (filter) => (
+                            <button
+                              type="button"
+                              key={filter}
+                              aria-pressed={libraryFilter === filter}
+                              onClick={() => setLibraryFilter(filter)}
+                            >
+                              {filter === 'all'
+                                ? `All (${selectedApps.length})`
+                                : filter === 'updates'
+                                  ? `Updates (${selectedApps.filter((app) => app.updateAvailable).length})`
+                                  : filter}
+                            </button>
+                          ),
+                        )}
                       </fieldset>
                       <label className={styles.librarySort}>
                         <span className={styles.visuallyHidden}>Sort library</span>
@@ -818,11 +1027,12 @@ export function App() {
                           aria-label="Sort library"
                           value={librarySort}
                           onChange={(event) =>
-                            setLibrarySort(event.currentTarget.value as 'host' | 'name')
+                            setLibrarySort(event.currentTarget.value as 'host' | 'name' | 'updates')
                           }
                         >
                           <option value="host">Host order</option>
                           <option value="name">A–Z</option>
+                          <option value="updates">Updates first</option>
                         </select>
                       </label>
                     </div>
@@ -879,14 +1089,23 @@ export function App() {
                                       {app.updateAvailable ? ' · UPDATE' : ''}
                                     </p>
                                   </div>
-                                  <button
-                                    type="button"
-                                    disabled={launching || blocked}
-                                    onClick={() => void handleLaunch(selectedHost.id, app.id)}
-                                    aria-label={`${running ? 'Resume' : 'Launch'} ${app.name}`}
-                                  >
-                                    <Play size={14} fill="currentColor" />
-                                  </button>
+                                  <span className={styles.gameCardActions}>
+                                    <button
+                                      type="button"
+                                      onClick={() => openAppDetails(app.id)}
+                                      aria-label={`View ${app.name} details`}
+                                    >
+                                      <Info size={14} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      disabled={launching || blocked || app.installed === false}
+                                      onClick={() => void handleLaunch(selectedHost.id, app.id)}
+                                      aria-label={`${running ? 'Resume' : 'Launch'} ${app.name}`}
+                                    >
+                                      <Play size={14} fill="currentColor" />
+                                    </button>
+                                  </span>
                                 </div>
                               </article>
                             )
@@ -916,6 +1135,16 @@ export function App() {
                   <span>
                     INPUT <strong>1000 Hz</strong>
                   </span>
+                  {selectedTelemetry && (
+                    <span>
+                      HOST{' '}
+                      <strong>
+                        {selectedTelemetry.host.healthy ? 'HEALTHY' : 'DEGRADED'} ·{' '}
+                        {selectedTelemetry.host.activeLogicalSessions} SESSION
+                        {selectedTelemetry.host.activeLogicalSessions === 1 ? '' : 'S'}
+                      </strong>
+                    </span>
+                  )}
                 </section>
               </>
             )}
@@ -1216,7 +1445,19 @@ export function App() {
             <h2 id="pairing-title">Pair {pairingHost?.name ?? 'computer'}</h2>
             {pairing.state === 'pairing' && (
               <>
-                <p>Open Sol web interface, select PIN, then enter this code now.</p>
+                <p>
+                  Open Sol web interface, review this {appMode} access request, then enter the PIN.
+                </p>
+                <div className={styles.pairingAccess}>
+                  <strong>
+                    {appMode === 'workstation' ? 'WORKSTATION CONTROL' : 'GAMING ACCESS'}
+                  </strong>
+                  <span>
+                    {appMode === 'workstation'
+                      ? 'Catalog, sessions, telemetry, displays, virtual displays, peripherals, sandboxes, and host control'
+                      : 'Catalog, stream launch, session control, and telemetry'}
+                  </span>
+                </div>
                 <output className={styles.pinCode} aria-label={`Pairing PIN ${pairing.pin}`}>
                   {(['thousands', 'hundreds', 'tens', 'ones'] as const).map((position, index) => (
                     <span key={position}>{pairing.pin.charAt(index)}</span>
@@ -1239,6 +1480,126 @@ export function App() {
                 <p>{pairing.message}</p>
               </div>
             )}
+          </section>
+        </div>
+      )}
+
+      {selectedApp && selectedHost && (
+        <div className={styles.dialogBackdrop} role="presentation">
+          <section
+            className={`${styles.dialog} ${styles.gameDetailDialog}`}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="game-detail-title"
+          >
+            <button
+              className={styles.dialogClose}
+              type="button"
+              aria-label="Close application details"
+              onClick={closeAppDetails}
+            >
+              <X size={20} />
+            </button>
+            <div className={styles.gameDetailLayout}>
+              <div className={styles.gameDetailArtwork}>
+                {selectedApp.artDataUrl ? (
+                  <img src={selectedApp.artDataUrl} alt="" />
+                ) : (
+                  <Library size={38} />
+                )}
+              </div>
+              <div className={styles.gameDetailCopy}>
+                <p className={styles.panelLabel}>
+                  {selectedApp.kind?.toUpperCase() || 'APPLICATION'} /{' '}
+                  {selectedHost.serverName || selectedHost.name}
+                </p>
+                <h2 id="game-detail-title">{selectedApp.name}</h2>
+                <p>
+                  {selectedApp.description ||
+                    'Sol did not publish a description for this application.'}
+                </p>
+                <dl className={styles.gameDetailFacts}>
+                  <div>
+                    <dt>Publisher</dt>
+                    <dd>{selectedApp.publisher || 'Unknown'}</dd>
+                  </div>
+                  <div>
+                    <dt>Source</dt>
+                    <dd>{selectedApp.source || 'Host catalog'}</dd>
+                  </div>
+                  <div>
+                    <dt>Availability</dt>
+                    <dd>{selectedApp.installed === false ? 'Not installed' : 'Installed'}</dd>
+                  </div>
+                  <div>
+                    <dt>Input</dt>
+                    <dd>{selectedApp.inputRequirements?.join(', ') || 'No special requirement'}</dd>
+                  </div>
+                </dl>
+                {selectedApp.tags && selectedApp.tags.length > 0 && (
+                  <div className={styles.gameDetailTags}>
+                    {selectedApp.tags.map((tag) => (
+                      <span key={tag}>{tag}</span>
+                    ))}
+                  </div>
+                )}
+                <div className={styles.gameProfileSummary}>
+                  <ShieldCheck size={18} />
+                  <div>
+                    <strong>
+                      {selectedApp.streamProfileId
+                        ? selectedProfiles.find(
+                            (profile) => profile.id === selectedApp.streamProfileId,
+                          )?.name || 'Sol stream profile'
+                        : 'Terra local stream profile'}
+                    </strong>
+                    <small>
+                      {selectedApp.streamProfileId
+                        ? 'Host profile synchronized with Terra transport at launch.'
+                        : `${settings.width}×${settings.height} / ${settings.fps} Hz / ${profileCodec}`}
+                    </small>
+                  </div>
+                </div>
+                {selectedApp.launchProfiles && selectedApp.launchProfiles.length > 0 && (
+                  <label className={styles.gameLaunchProfile}>
+                    Launch configuration
+                    <select
+                      value={selectedLaunchProfileId}
+                      onChange={(event) => setSelectedLaunchProfileId(event.currentTarget.value)}
+                    >
+                      <option value="">Sol default</option>
+                      {selectedApp.launchProfiles.map((profile) => (
+                        <option value={profile.id} key={profile.id}>
+                          {profile.name}
+                          {profile.default ? ' (default)' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                {selectedApp.updateAvailable && (
+                  <p className={styles.gameUpdateNotice}>Update available on host.</p>
+                )}
+                <footer className={styles.gameDetailActions}>
+                  <button type="button" onClick={closeAppDetails}>
+                    Back
+                  </button>
+                  <button
+                    className={styles.heroLaunch}
+                    type="button"
+                    disabled={sessionBusy || selectedApp.installed === false}
+                    onClick={() =>
+                      void handleLaunch(selectedHost.id, selectedApp.id, selectedLaunchProfileId)
+                    }
+                  >
+                    <Play size={16} fill="currentColor" />
+                    {selectedHost.currentGameId === selectedApp.id
+                      ? 'Resume stream'
+                      : 'Launch stream'}
+                  </button>
+                </footer>
+              </div>
+            </div>
           </section>
         </div>
       )}

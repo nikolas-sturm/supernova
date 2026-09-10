@@ -544,6 +544,16 @@
   color: var(--color-on-primary);
   background: var(--color-primary-hover);
 }
+.gameCardActions {
+  flex: none;
+  display: flex;
+  gap: 6px;
+}
+.gameCardActions button:first-child {
+  color: var(--color-text-muted);
+  background: var(--color-bg-subtle);
+  border-color: var(--color-border-strong);
+}
 .performanceStrip {
   display: flex;
   align-items: center;
@@ -947,6 +957,220 @@
   padding-top: 16px;
   border-top: 1px solid var(--color-border);
 }
+.resourcePage {
+  min-width: 0;
+  max-width: var(--content-max-width);
+}
+.resourceSection {
+  min-width: 0;
+  margin-bottom: 28px;
+  padding: 22px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+.resourceEmpty {
+  min-height: 260px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 30px;
+  border: 1px dashed var(--color-border-strong);
+  color: var(--color-accent);
+  background: var(--color-surface);
+}
+.resourceEmpty h2 {
+  margin: 0 0 8px;
+  color: var(--color-text-base);
+}
+.resourceEmpty p {
+  margin: 0;
+  color: var(--color-text-muted);
+}
+.resourceHeadingActions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.resourceHeadingActions > span {
+  color: var(--color-text-subtle);
+  font: 650 9px / 1 var(--font-mono);
+  letter-spacing: 0.1em;
+}
+.operationBanner {
+  display: grid;
+  grid-template-columns: auto minmax(120px, auto) minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 18px;
+  padding: 12px 14px;
+  border-left: 3px solid var(--color-accent);
+  background: var(--color-accent-light);
+  font-size: 11px;
+}
+.operationBanner.succeeded {
+  border-left-color: var(--color-primary);
+  background: var(--color-primary-light);
+}
+.operationBanner.failed {
+  border-left-color: var(--color-danger);
+  background: var(--color-danger-light);
+}
+.operationBanner span {
+  font: 650 9px / 1 var(--font-mono);
+  text-transform: uppercase;
+}
+.operationBanner code {
+  overflow: hidden;
+  color: var(--color-text-subtle);
+  font-size: 9px;
+  text-overflow: ellipsis;
+}
+.displayResourceGrid,
+.resourceCardGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+  gap: 16px;
+}
+.displayResourceCard,
+.resourceCard {
+  min-width: 0;
+  padding: 20px;
+  border: 1px solid var(--color-border);
+  border-top: 2px solid var(--color-primary);
+  background: var(--color-surface);
+}
+.displayResourceCard > header,
+.resourceCard > header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 22px;
+  color: var(--color-primary);
+  font: 650 9px / 1 var(--font-mono);
+}
+.displayResourceCard > svg {
+  color: var(--color-accent);
+}
+.displayResourceCard h3,
+.resourceCard h3,
+.resourceComposer h3,
+.resourceColumns > section > h3 {
+  margin: 12px 0 7px;
+  font: 650 20px / 1.2 var(--font-display);
+}
+.displayResourceCard p,
+.resourceCard p,
+.resourceComposer p,
+.inlineResourceForm p,
+.resourceFootnote {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+.displayResourceCard small,
+.resourceCard small {
+  display: block;
+  margin-top: 14px;
+  color: var(--color-text-subtle);
+  font: 650 9px / 1.4 var(--font-mono);
+}
+.displayResourceCard footer,
+.resourceCard footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border);
+}
+.displayResourceCard footer select {
+  flex: 1 1 100%;
+}
+.resourceComposer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 0.8fr);
+  align-items: end;
+  gap: 24px;
+  margin-top: 22px;
+  padding: 20px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-subtle);
+}
+.resourceComposer form,
+.inlineResourceForm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+}
+.resourceComposer label,
+.inlineResourceForm label {
+  min-width: 170px;
+  flex: 1;
+  display: grid;
+  gap: 8px;
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+.compactResourceList {
+  display: grid;
+  gap: 8px;
+  margin-top: 18px;
+}
+.compactResourceList article {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-subtle);
+}
+.compactResourceList article > svg {
+  color: var(--color-accent);
+}
+.compactResourceList strong,
+.compactResourceList small {
+  display: block;
+}
+.compactResourceList small {
+  margin-top: 5px;
+  color: var(--color-text-subtle);
+  font: 9px / 1.4 var(--font-mono);
+}
+.inlineResourceForm {
+  margin-top: 18px;
+  padding: 16px;
+  border: 1px dashed var(--color-border-strong);
+}
+.inlineResourceForm p {
+  flex: 1 1 190px;
+  margin: 0;
+}
+.resourceCard .resourceError {
+  color: var(--color-danger);
+}
+.resourceColumns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+.resourceColumns > section {
+  min-width: 0;
+  padding: 20px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+.resourceColumns > section > h3 {
+  margin-top: 0;
+}
+.resourceFootnote {
+  margin: 18px 0 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--color-border);
+}
 .telemetryPanel {
   margin-top: 20px;
   padding: 16px 18px;
@@ -1126,6 +1350,23 @@
 .pairingDialog {
   width: min(520px, 100%);
 }
+.pairingAccess {
+  display: grid;
+  gap: 7px;
+  padding: 14px;
+  border-left: 2px solid var(--color-primary);
+  background: var(--color-primary-light);
+}
+.pairingAccess strong {
+  color: var(--color-primary);
+  font: 650 9px / 1 var(--font-mono);
+  letter-spacing: 0.1em;
+}
+.pairingAccess span {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
 .pinCode {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1166,6 +1407,120 @@
 }
 .pairingFailure svg {
   color: var(--color-danger);
+}
+.gameDetailDialog {
+  width: min(920px, 100%);
+}
+.gameDetailLayout {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.7fr) minmax(0, 1.3fr);
+  gap: 28px;
+}
+.gameDetailArtwork {
+  min-height: 430px;
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  color: var(--color-accent);
+  background: var(--color-accent-light);
+}
+.gameDetailArtwork img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.gameDetailCopy {
+  min-width: 0;
+  padding: 12px 8px 4px 0;
+}
+.gameDetailCopy h2 {
+  overflow-wrap: anywhere;
+}
+.gameDetailCopy > p:not(.panelLabel, .gameUpdateNotice) {
+  margin: 16px 0 22px;
+  color: var(--color-text-muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+.gameDetailFacts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin: 0;
+}
+.gameDetailFacts div {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+}
+.gameDetailFacts dt {
+  color: var(--color-text-subtle);
+  font: 650 9px / 1 var(--font-mono);
+  text-transform: uppercase;
+}
+.gameDetailFacts dd {
+  margin: 7px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+}
+.gameDetailTags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 18px;
+}
+.gameDetailTags span {
+  padding: 6px 8px;
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  font: 650 9px / 1 var(--font-mono);
+}
+.gameProfileSummary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 18px;
+  padding: 14px;
+  border-left: 2px solid var(--color-primary);
+  background: var(--color-bg-subtle);
+}
+.gameProfileSummary > svg {
+  flex: none;
+  color: var(--color-primary);
+}
+.gameProfileSummary strong,
+.gameProfileSummary small {
+  display: block;
+}
+.gameProfileSummary small {
+  margin-top: 5px;
+  color: var(--color-text-muted);
+  font-size: 10px;
+}
+.gameLaunchProfile {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+.gameUpdateNotice {
+  margin: 16px 0 0;
+  color: var(--color-accent);
+  font: 650 10px / 1.4 var(--font-mono);
+}
+.gameDetailActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 24px;
+  padding-top: 18px;
+  border-top: 1px solid var(--color-border);
+}
+.gameDetailActions .heroLaunch {
+  color: var(--color-on-primary);
+  background: var(--color-primary);
+  border-color: var(--color-primary);
 }
 .scaffoldPage {
   display: grid;
@@ -1418,7 +1773,8 @@
 }
 @media (max-width: 1250px) {
   .workspaceLayout,
-  .settingsColumns {
+  .settingsColumns,
+  .resourceColumns {
     grid-template-columns: minmax(0, 1fr);
   }
   .workspaceApps {
@@ -1499,6 +1855,16 @@
   .gameHeroActions {
     margin-top: 24px;
   }
+  .gameDetailLayout {
+    grid-template-columns: 1fr;
+  }
+  .gameDetailArtwork {
+    min-height: 260px;
+    max-height: 360px;
+  }
+  .gameDetailCopy {
+    padding: 0;
+  }
   .librarySearch {
     flex-basis: 100%;
   }
@@ -1513,6 +1879,18 @@
   .telemetryPanel {
     align-items: flex-start;
     flex-direction: column;
+  }
+  .resourceComposer {
+    grid-template-columns: 1fr;
+  }
+  .operationBanner {
+    grid-template-columns: 1fr;
+  }
+  .compactResourceList article {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+  .compactResourceList article > button + button {
+    grid-column: 2 / -1;
   }
   .scaffoldPage {
     display: block;
@@ -1541,6 +1919,9 @@
     width: 100%;
   }
   .settingPair {
+    grid-template-columns: 1fr;
+  }
+  .gameDetailFacts {
     grid-template-columns: 1fr;
   }
   .hostCard {

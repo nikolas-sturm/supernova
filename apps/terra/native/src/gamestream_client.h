@@ -53,6 +53,13 @@ enum class PairingAccess {
     workstation,  ///< All stable Eclipse API scopes.
 };
 
+/** @brief Named Sol launch profile available for one Catalog V2 application. */
+struct LaunchProfileSummary {
+    std::string id;    ///< Stable launch-profile UUID.
+    std::string name;  ///< User-visible profile name.
+    bool isDefault = false;  ///< Whether Sol selects this profile when none is explicit.
+};
+
 struct GameStreamApp {
     int id = 0;
     std::string name;
@@ -65,6 +72,7 @@ struct GameStreamApp {
     std::string publisher;                       ///< Application publisher.
     std::vector<std::string> tags;               ///< Catalog tags.
     std::vector<std::string> inputRequirements;  ///< Required input classes.
+    std::vector<LaunchProfileSummary> launchProfiles;  ///< Selectable Sol launch profiles.
     bool installed = true;                       ///< Whether application is installed.
     bool updateAvailable = false;                ///< Whether host reports an update.
     std::string assetId;                         ///< Preferred poster or icon asset identifier.
@@ -161,14 +169,16 @@ public:
      * @param settings Stream settings.
      * @param cancellation Optional cancellation flag.
      * @param appUuid Optional stable Eclipse application UUID.
+     * @param launchProfileId Optional Eclipse launch-profile UUID.
      * @return Launch transport and logical-session details.
      */
     [[nodiscard]] LaunchResult launch(const std::string& address, std::uint16_t httpsPort,
                                       const std::string& clientId,
                                       const std::string& serverCertificate, int appId, bool resume,
-                                      const StreamSettings& settings,
-                                      const std::atomic_bool* cancellation = nullptr,
-                                      const std::string& appUuid = {}) const;
+                                       const StreamSettings& settings,
+                                       const std::atomic_bool* cancellation = nullptr,
+                                       const std::string& appUuid = {},
+                                       const std::string& launchProfileId = {}) const;
 
     /**
      * @brief Send a bounded JSON request to paired Sol's Eclipse API.

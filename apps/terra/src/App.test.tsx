@@ -20,6 +20,10 @@ describe('App', () => {
       pairing: undefined,
       library: { hostId: '', state: 'idle', apps: [], message: '' },
       session: undefined,
+      logicalSessionsByHost: {},
+      telemetryByHost: {},
+      resourcesByHost: {},
+      operationsByHost: {},
       appMode: 'gaming',
       settingsByMode: {
         gaming: { ...defaultSettings },
@@ -161,6 +165,7 @@ describe('App', () => {
 
   it('shows the active Sol pairing PIN', () => {
     useClientStore.setState({
+      appMode: 'workstation',
       hosts: [
         {
           id: 'host-1',
@@ -193,6 +198,7 @@ describe('App', () => {
 
     expect(screen.getByRole('dialog', { name: 'Pair Studio PC' })).toBeInTheDocument()
     expect(screen.getByLabelText('Pairing PIN 0427')).toHaveTextContent('0427')
+    expect(screen.getByText('WORKSTATION CONTROL')).toBeVisible()
     expect(screen.getByText("Enter this PIN in Sol's web interface.")).toBeVisible()
   })
 
@@ -258,6 +264,20 @@ describe('App', () => {
             name: 'Desktop',
             hdrSupported: true,
             appCollectorGame: false,
+            description: 'Full remote desktop session.',
+            publisher: 'Supernova',
+            source: 'host',
+            tags: ['desktop', 'productivity'],
+            inputRequirements: ['keyboard', 'mouse'],
+            launchProfiles: [
+              {
+                id: '11111111-1111-4111-8111-111111111111',
+                name: 'Couch mode',
+                default: false,
+              },
+            ],
+            installed: true,
+            updateAvailable: true,
           },
         ],
       },
@@ -274,12 +294,97 @@ describe('App', () => {
     expect(screen.getByText('No applications match this filter.')).toBeVisible()
     fireEvent.click(screen.getByRole('button', { name: 'apps' }))
     expect(screen.getByRole('button', { name: 'Launch Desktop' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Updates (1)' }))
+    expect(screen.getByRole('button', { name: 'Launch Desktop' })).toBeEnabled()
+
+    fireEvent.click(
+      screen.getAllByRole('button', { name: 'View Desktop details' })[0] as HTMLElement,
+    )
+    expect(screen.getByRole('dialog', { name: 'Desktop' })).toBeVisible()
+    expect(screen.getByText('Full remote desktop session.')).toBeVisible()
+    expect(screen.getByText('Supernova')).toBeVisible()
+    expect(screen.getByText('keyboard, mouse')).toBeVisible()
+    const launchConfiguration = screen.getByLabelText('Launch configuration')
+    fireEvent.change(launchConfiguration, {
+      target: { value: '11111111-1111-4111-8111-111111111111' },
+    })
+    expect(launchConfiguration).toHaveValue('11111111-1111-4111-8111-111111111111')
+    fireEvent.click(screen.getByRole('button', { name: 'Close application details' }))
 
     fireEvent.click(screen.getByRole('button', { name: 'Workstation' }))
 
     expect(await screen.findByText('SPATIAL ARRANGEMENT')).toBeVisible()
     expect(screen.getByText('Stream Canvas: 1920 × 1080 px')).toBeVisible()
     expect(screen.getByRole('button', { name: /Desktop OPEN REMOTELY/ })).toBeEnabled()
+  })
+
+  it('renders host-backed workstation display management instead of a placeholder', async () => {
+    useClientStore.setState({
+      appMode: 'workstation',
+      hosts: [
+        {
+          id: 'host-1',
+          name: 'Studio PC',
+          address: '192.168.1.40',
+          serverName: 'Rig',
+          serverUniqueId: 'server-1',
+          appVersion: '7.1.431.-1',
+          serverState: 'IDLE',
+          status: 'online',
+          error: '',
+          httpsPort: 47984,
+          currentGameId: 0,
+          serverCodecModeSupport: 1,
+          maxLumaPixelsHevc: 0,
+          displayModes: [],
+          lastSeenAt: 1,
+          paired: true,
+          apiVersion: 1,
+          apiPort: 47984,
+          capabilities: ['displays-v1', 'virtual-displays-v1'],
+          apiScopes: ['display.read', 'display.manage', 'virtual-display.manage'],
+        },
+      ],
+      resourcesByHost: {
+        'host-1': {
+          displays: {
+            revision: 3,
+            displays: [
+              {
+                id: '11111111-1111-4111-8111-111111111111',
+                name: 'Studio Display',
+                kind: 'physical',
+                enabled: true,
+                primary: true,
+                position: { x: 0, y: 0 },
+                currentMode: {
+                  id: '2560x1440@60',
+                  width: 2560,
+                  height: 1440,
+                  refreshNumerator: 60,
+                  refreshDenominator: 1,
+                  bitDepth: 10,
+                  hdr: true,
+                },
+                supportedModes: [],
+                hdr: { supported: true, enabled: true },
+                captureEligible: true,
+                revision: 3,
+              },
+            ],
+          },
+          'virtual-displays': { revision: 1, virtualDisplays: [] },
+        },
+      },
+    })
+
+    render(<App />)
+    fireEvent.click(screen.getByRole('button', { name: 'Display & Topology' }))
+
+    expect(await screen.findByRole('heading', { name: 'Connected displays' })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'Studio Display' })).toBeVisible()
+    expect(screen.getByText('2560 × 1440 / 60 Hz')).toBeVisible()
+    expect(screen.queryByText('Display topology is coming online.')).not.toBeInTheDocument()
   })
 
   it('reports native rendering and exposes session stop', async () => {

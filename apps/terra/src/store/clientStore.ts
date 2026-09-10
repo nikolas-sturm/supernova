@@ -72,6 +72,7 @@ export interface GameApp {
   publisher?: string
   tags?: string[]
   inputRequirements?: string[]
+  launchProfiles?: Array<{ id: string; name: string; default: boolean }>
   installed?: boolean
   updateAvailable?: boolean
   assetRevision?: number
@@ -125,6 +126,7 @@ export interface LogicalSession {
 export interface TelemetrySnapshot {
   timestamp: number
   host: {
+    uptimeMs: number
     healthy: boolean
     captureHealthy: boolean | null
     captureFps: number | null
@@ -134,6 +136,10 @@ export interface TelemetrySnapshot {
     audioCaptureHealthy: boolean | null
     activeLogicalSessions: number
     activeTransportSessions: number
+    healthyDisplayCount: number | null
+    healthyVirtualDisplayCount: number | null
+    runningSandboxCount: number | null
+    activePeripheralClaimCount: number | null
   }
   sessions: Array<{
     sessionId: string
@@ -143,14 +149,169 @@ export interface TelemetrySnapshot {
     encodeFps: number | null
     transmitFps: number | null
     encodeLatencyMs: number | null
+    captureLatencyMs: number | null
     bitrateKbps: number | null
     droppedFrames: number | null
+    videoBytes: number | null
+    audioBytes: number | null
+    inputBytes: number | null
+    queueDepth: number | null
+    queueDrops: number | null
   }>
 }
 
+export interface DisplayResource {
+  id: string
+  name: string
+  kind: 'physical' | 'virtual'
+  enabled: boolean
+  primary: boolean
+  position: { x: number; y: number }
+  currentMode: {
+    id: string
+    width: number
+    height: number
+    refreshNumerator: number
+    refreshDenominator: number
+    bitDepth: number
+    hdr: boolean
+  } | null
+  supportedModes: Array<{
+    id: string
+    width: number
+    height: number
+    refreshNumerator: number
+    refreshDenominator: number
+    bitDepth: number
+    hdr: boolean
+  }>
+  hdr: { supported: boolean | null; enabled: boolean | null }
+  captureEligible: boolean
+  revision: number
+}
+
+export interface VirtualDisplayResource {
+  id: string
+  name: string
+  state: string
+  actualMode: {
+    width: number
+    height: number
+    refreshNumerator: number
+    refreshDenominator: number
+  }
+  position: { x: number; y: number }
+  primary: boolean
+  hdr: boolean
+  persistent: boolean
+  workspaceId: string | null
+  sessionId: string | null
+  error: unknown
+  revision: number
+}
+
+export interface ProfileResource {
+  id: string
+  type: 'display' | 'stream' | 'launch' | 'sandbox'
+  name: string
+  shared: boolean
+  revision: number
+  configuration: Record<string, unknown>
+}
+
+export interface WorkspaceResource {
+  id: string
+  name: string
+  description: string
+  desktopAppUuid: string
+  state: string
+  persistent: boolean
+  sessionId: string | null
+  sandboxId: string | null
+  displayIds: string[]
+  peripheralClaimIds: string[]
+  error: unknown
+  revision: number
+}
+
+export interface SandboxResource {
+  id: string
+  name: string
+  profileId: string
+  workspaceId: string | null
+  appUuid: string | null
+  sessionId: string | null
+  persistent: boolean
+  state: string
+  displayIds: string[]
+  peripheralClaimIds: string[]
+  exitCode: number | null
+  error: { code: string; message: string } | null
+  revision: number
+}
+
+export interface PeripheralResource {
+  id: string
+  class: 'keyboard' | 'mouse'
+  platformId: string
+  name: string
+  vendorId: number
+  productId: number
+  capabilities: string[]
+  claimable: boolean
+  activeClaimId: string | null
+  revision: number
+}
+
+export interface PeripheralClaimResource {
+  id: string
+  deviceId: string
+  deviceClass: string
+  target: { type: 'session' | 'workspace' | 'sandbox'; id: string }
+  state: string
+  grantedCapabilities: string[]
+  exclusive: boolean
+  disconnectPolicy: string
+  revision: number
+}
+
+export interface OperationResource {
+  id: string
+  state: 'pending' | 'running' | 'succeeded' | 'failed'
+  resourceId: string | null
+  createdAt: number
+  updatedAt: number
+  revision: number
+  result: unknown
+  error: { code: string; message: string } | null
+}
+
+export interface SolResourceCollections {
+  sessions: { sessions: LogicalSession[] }
+  telemetry: TelemetrySnapshot
+  displays: { revision: number; displays: DisplayResource[] }
+  'display-topology': {
+    topology: { id: string; revision: number; displays: Array<Record<string, unknown>> }
+  }
+  'virtual-displays': { revision: number; virtualDisplays: VirtualDisplayResource[] }
+  profiles: { revision: number; profiles: ProfileResource[] }
+  workspaces: { revision: number; workspaces: WorkspaceResource[] }
+  sandboxes: { revision: number; sandboxes: SandboxResource[] }
+  peripherals: { revision: number; peripherals: PeripheralResource[] }
+  'peripheral-claims': { revision: number; claims: PeripheralClaimResource[] }
+}
+
+export type SolCollectionResource = keyof SolResourceCollections
+
 export type SolResourceUpdate =
-  | { hostId: string; resource: 'sessions'; payload: { sessions: LogicalSession[] } }
-  | { hostId: string; resource: 'telemetry'; payload: TelemetrySnapshot }
+  | {
+      [Resource in SolCollectionResource]: {
+        hostId: string
+        resource: Resource
+        payload: SolResourceCollections[Resource]
+      }
+    }[SolCollectionResource]
+  | { hostId: string; resource: 'operation'; payload: OperationResource }
   | {
       hostId: string
       resource: 'event'
@@ -195,6 +356,8 @@ interface ClientState {
   session: SessionUpdate | undefined
   logicalSessionsByHost: Record<string, LogicalSession[]>
   telemetryByHost: Record<string, TelemetrySnapshot | undefined>
+  resourcesByHost: Record<string, Partial<SolResourceCollections>>
+  operationsByHost: Record<string, OperationResource | undefined>
   appMode: AppMode
   settingsByMode: Record<AppMode, StreamSettings>
   setBridge: (bridge: BridgeStatus) => void
@@ -228,6 +391,8 @@ export const useClientStore = create<ClientState>()(
       session: undefined,
       logicalSessionsByHost: {},
       telemetryByHost: {},
+      resourcesByHost: {},
+      operationsByHost: {},
       appMode: 'gaming',
       settingsByMode: {
         gaming: { ...defaultSettingsByMode.gaming },
@@ -279,8 +444,23 @@ export const useClientStore = create<ClientState>()(
         })),
       setSolResource: (update) =>
         set((state) => {
+          if (update.resource === 'operation') {
+            return {
+              operationsByHost: {
+                ...state.operationsByHost,
+                [update.hostId]: update.payload,
+              },
+            }
+          }
           if (update.resource === 'sessions') {
             return {
+              resourcesByHost: {
+                ...state.resourcesByHost,
+                [update.hostId]: {
+                  ...state.resourcesByHost[update.hostId],
+                  sessions: update.payload,
+                },
+              },
               logicalSessionsByHost: {
                 ...state.logicalSessionsByHost,
                 [update.hostId]: update.payload.sessions,
@@ -289,13 +469,40 @@ export const useClientStore = create<ClientState>()(
           }
           if (update.resource === 'telemetry') {
             return {
+              resourcesByHost: {
+                ...state.resourcesByHost,
+                [update.hostId]: {
+                  ...state.resourcesByHost[update.hostId],
+                  telemetry: update.payload,
+                },
+              },
               telemetryByHost: {
                 ...state.telemetryByHost,
                 [update.hostId]: update.payload,
               },
             }
           }
+          if (update.resource !== 'event') {
+            return {
+              resourcesByHost: {
+                ...state.resourcesByHost,
+                [update.hostId]: {
+                  ...state.resourcesByHost[update.hostId],
+                  [update.resource]: update.payload,
+                },
+              },
+            }
+          }
           const event = update.payload
+          if (event.type === 'operation.updated') {
+            const operation = event.data as OperationResource
+            return {
+              operationsByHost: {
+                ...state.operationsByHost,
+                [update.hostId]: operation,
+              },
+            }
+          }
           if (event.type === 'telemetry.sample') {
             return {
               telemetryByHost: {

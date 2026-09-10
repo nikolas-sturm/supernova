@@ -135,6 +135,11 @@ Json hostJson(const terra::HostRecord& host) {
 }
 
 Json appJson(const terra::GameStreamApp& app) {
+    Json launchProfiles = Json::array();
+    for (const auto& profile : app.launchProfiles) {
+        launchProfiles.push_back(
+            {{"id", profile.id}, {"name", profile.name}, {"default", profile.isDefault}});
+    }
     return {
         {"id", app.id},
         {"name", app.name},
@@ -147,6 +152,7 @@ Json appJson(const terra::GameStreamApp& app) {
         {"publisher", app.publisher},
         {"tags", app.tags},
         {"inputRequirements", app.inputRequirements},
+        {"launchProfiles", std::move(launchProfiles)},
         {"installed", app.installed},
         {"updateAvailable", app.updateAvailable},
         {"assetRevision", app.assetRevision},
@@ -593,11 +599,13 @@ int main(int argc, char** argv) {
         });
 
         const auto launchApp = [&](const std::string& hostId, int appId,
-                                   const terra::StreamSettings& settings) {
+                                    const terra::StreamSettings& settings,
+                                    const std::string& launchProfileId) {
             std::scoped_lock lock{workerMutex};
-            workers.emplace_back([&, hostId, appId, settings] {
+            workers.emplace_back([&, hostId, appId, settings, launchProfileId] {
                 try {
-                    static_cast<void>(controlPlane.launchApp(hostId, appId, settings));
+                    static_cast<void>(
+                        controlPlane.launchApp(hostId, appId, settings, launchProfileId));
                     if (!closed) {
                         publishHosts();
                     }
@@ -754,7 +762,8 @@ int main(int argc, char** argv) {
                             const auto& data = payload.at("data");
                             launchApp(data.at("hostId").get<std::string>(),
                                       data.at("appId").get<int>(),
-                                      parseStreamSettings(data.at("settings")));
+                                      parseStreamSettings(data.at("settings")),
+                                      data.value("launchProfileId", ""));
                         } catch (const std::exception& exception) {
                             publishHostError(exception.what());
                         }

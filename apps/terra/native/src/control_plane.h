@@ -129,7 +129,8 @@ public:
                       nlohmann::json body, std::optional<std::uint64_t> revision = std::nullopt,
                       bool idempotent = false);
     [[nodiscard]] SessionRecord launchApp(const std::string& hostId, int appId,
-                                          const StreamSettings& settings);
+                                           const StreamSettings& settings,
+                                           const std::string& launchProfileId = {});
     void stopSession(const std::string& hostId, bool quitHost);
     void closeStreamOverlay(const std::string& hostId, std::uint64_t generation,
                             std::uint64_t revision);

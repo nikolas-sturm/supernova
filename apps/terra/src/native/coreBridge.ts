@@ -10,8 +10,10 @@ import type {
   BridgeStatus,
   Host,
   LogicalSession,
+  OperationResource,
   PairingUpdate,
   SessionUpdate,
+  SolCollectionResource,
   SolResourceUpdate,
   TelemetrySnapshot,
 } from '../store/clientStore'
@@ -115,6 +117,10 @@ const appSchema = z.object({
   publisher: z.string().optional().default(''),
   tags: z.array(z.string()).optional().default([]),
   inputRequirements: z.array(z.string()).optional().default([]),
+  launchProfiles: z
+    .array(z.object({ id: z.uuid(), name: z.string().min(1), default: z.boolean() }))
+    .optional()
+    .default([]),
   installed: z.boolean().optional().default(true),
   updateAvailable: z.boolean().optional().default(false),
   assetRevision: z.number().int().nonnegative().optional().default(0),
@@ -178,6 +184,7 @@ const nullableMetric = z.number().nullable()
 const telemetrySchema: z.ZodType<TelemetrySnapshot> = z.object({
   timestamp: z.number().int(),
   host: z.object({
+    uptimeMs: z.number().int().nonnegative(),
     healthy: z.boolean(),
     captureHealthy: z.boolean().nullable(),
     captureFps: nullableMetric,
@@ -187,6 +194,10 @@ const telemetrySchema: z.ZodType<TelemetrySnapshot> = z.object({
     audioCaptureHealthy: z.boolean().nullable(),
     activeLogicalSessions: z.number().int().nonnegative(),
     activeTransportSessions: z.number().int().nonnegative(),
+    healthyDisplayCount: z.number().int().nonnegative().nullable(),
+    healthyVirtualDisplayCount: z.number().int().nonnegative().nullable(),
+    runningSandboxCount: z.number().int().nonnegative().nullable(),
+    activePeripheralClaimCount: z.number().int().nonnegative().nullable(),
   }),
   sessions: z.array(
     z.object({
@@ -196,12 +207,161 @@ const telemetrySchema: z.ZodType<TelemetrySnapshot> = z.object({
       captureFps: nullableMetric,
       encodeFps: nullableMetric,
       transmitFps: nullableMetric,
+      captureLatencyMs: nullableMetric,
       encodeLatencyMs: nullableMetric,
       bitrateKbps: nullableMetric,
       droppedFrames: z.number().int().nonnegative().nullable(),
+      videoBytes: z.number().int().nonnegative().nullable(),
+      audioBytes: z.number().int().nonnegative().nullable(),
+      inputBytes: z.number().int().nonnegative().nullable(),
+      queueDepth: z.number().int().nonnegative().nullable(),
+      queueDrops: z.number().int().nonnegative().nullable(),
     }),
   ),
 })
+
+const resourceRevisionSchema = z.number().int().positive()
+const collectionRevisionSchema = z.number().int().nonnegative()
+const displayModeSchema = z.object({
+  id: z.string(),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+  refreshNumerator: z.number().int().positive(),
+  refreshDenominator: z.number().int().positive(),
+  bitDepth: z.number().int().positive(),
+  hdr: z.boolean(),
+})
+const displaySchema = z.object({
+  id: z.uuid(),
+  name: z.string(),
+  kind: z.enum(['physical', 'virtual']),
+  enabled: z.boolean(),
+  primary: z.boolean(),
+  position: z.object({ x: z.number().int(), y: z.number().int() }),
+  currentMode: displayModeSchema.nullable(),
+  supportedModes: z.array(displayModeSchema),
+  hdr: z.object({ supported: z.boolean().nullable(), enabled: z.boolean().nullable() }),
+  captureEligible: z.boolean(),
+  revision: resourceRevisionSchema,
+})
+const virtualDisplaySchema = z.object({
+  id: z.uuid(),
+  name: z.string(),
+  state: z.string(),
+  actualMode: z.object({
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
+    refreshNumerator: z.number().int().positive(),
+    refreshDenominator: z.number().int().positive(),
+  }),
+  position: z.object({ x: z.number().int(), y: z.number().int() }),
+  primary: z.boolean(),
+  hdr: z.boolean(),
+  persistent: z.boolean(),
+  workspaceId: z.uuid().nullable(),
+  sessionId: z.uuid().nullable(),
+  error: z.unknown(),
+  revision: resourceRevisionSchema,
+})
+const profileSchema = z.object({
+  id: z.uuid(),
+  type: z.enum(['display', 'stream', 'launch', 'sandbox']),
+  name: z.string(),
+  shared: z.boolean(),
+  revision: resourceRevisionSchema,
+  configuration: z.record(z.string(), z.unknown()),
+})
+const workspaceSchema = z.object({
+  id: z.uuid(),
+  name: z.string(),
+  description: z.string(),
+  desktopAppUuid: z.uuid(),
+  state: z.string(),
+  persistent: z.boolean(),
+  sessionId: z.uuid().nullable(),
+  sandboxId: z.uuid().nullable(),
+  displayIds: z.array(z.uuid()),
+  peripheralClaimIds: z.array(z.uuid()),
+  error: z.unknown(),
+  revision: resourceRevisionSchema,
+})
+const sandboxSchema = z.object({
+  id: z.uuid(),
+  name: z.string(),
+  profileId: z.uuid(),
+  workspaceId: z.uuid().nullable(),
+  appUuid: z.uuid().nullable(),
+  sessionId: z.uuid().nullable(),
+  persistent: z.boolean(),
+  state: z.string(),
+  displayIds: z.array(z.uuid()),
+  peripheralClaimIds: z.array(z.uuid()),
+  exitCode: z.number().int().nullable(),
+  error: z.object({ code: z.string(), message: z.string() }).nullable(),
+  revision: resourceRevisionSchema,
+})
+const peripheralSchema = z.object({
+  id: z.uuid(),
+  class: z.enum(['keyboard', 'mouse']),
+  platformId: z.string(),
+  name: z.string(),
+  vendorId: z.number().int().nonnegative(),
+  productId: z.number().int().nonnegative(),
+  capabilities: z.array(z.string()),
+  claimable: z.boolean(),
+  activeClaimId: z.uuid().nullable(),
+  revision: resourceRevisionSchema,
+})
+const peripheralClaimSchema = z.object({
+  id: z.uuid(),
+  deviceId: z.uuid(),
+  deviceClass: z.string(),
+  target: z.object({ type: z.enum(['session', 'workspace', 'sandbox']), id: z.uuid() }),
+  state: z.string(),
+  grantedCapabilities: z.array(z.string()),
+  exclusive: z.boolean(),
+  disconnectPolicy: z.string(),
+  revision: resourceRevisionSchema,
+})
+const operationSchema: z.ZodType<OperationResource> = z.object({
+  id: z.uuid(),
+  state: z.enum(['pending', 'running', 'succeeded', 'failed']),
+  resourceId: z.uuid().nullable(),
+  createdAt: z.number().int(),
+  updatedAt: z.number().int(),
+  revision: resourceRevisionSchema,
+  result: z.unknown(),
+  error: z.object({ code: z.string(), message: z.string() }).nullable(),
+})
+
+const collectionSchemas = {
+  displays: z.object({ revision: collectionRevisionSchema, displays: z.array(displaySchema) }),
+  'display-topology': z.object({
+    topology: z.object({
+      id: z.uuid(),
+      revision: resourceRevisionSchema,
+      displays: z.array(z.record(z.string(), z.unknown())),
+    }),
+  }),
+  'virtual-displays': z.object({
+    revision: collectionRevisionSchema,
+    virtualDisplays: z.array(virtualDisplaySchema),
+  }),
+  profiles: z.object({ revision: collectionRevisionSchema, profiles: z.array(profileSchema) }),
+  workspaces: z.object({
+    revision: collectionRevisionSchema,
+    workspaces: z.array(workspaceSchema),
+  }),
+  sandboxes: z.object({ revision: collectionRevisionSchema, sandboxes: z.array(sandboxSchema) }),
+  peripherals: z.object({
+    revision: collectionRevisionSchema,
+    peripherals: z.array(peripheralSchema),
+  }),
+  'peripheral-claims': z.object({
+    revision: collectionRevisionSchema,
+    claims: z.array(peripheralClaimSchema),
+  }),
+} as const
 
 const solEventTypeSchema = z.enum([
   'host.changed',
@@ -443,7 +603,39 @@ export function startCoreBridge({
       else onHostError('Sol returned invalid telemetry.')
       return
     }
-    if (resource !== 'event') return
+    if (resource === 'mutation') {
+      const result = z.object({ operation: operationSchema }).safeParse(payload)
+      if (result.success) {
+        onSolResource({ hostId, resource: 'operation', payload: result.data.operation })
+        return
+      }
+      const synchronous = z.record(z.string(), z.unknown()).safeParse(payload)
+      if (!synchronous.success) {
+        onHostError('Sol returned an invalid mutation response.')
+        return
+      }
+      if (
+        'display' in synchronous.data ||
+        'displays' in synchronous.data ||
+        'topology' in synchronous.data
+      ) {
+        void dispatchConnected('host.resource', { hostId, resource: 'displays' })
+        void dispatchConnected('host.resource', { hostId, resource: 'display-topology' })
+      }
+      return
+    }
+    if (resource !== 'event') {
+      const resourceName = resource as keyof typeof collectionSchemas
+      const schema = collectionSchemas[resourceName]
+      if (!schema) return
+      const result = schema.safeParse(payload)
+      if (result.success) {
+        onSolResource({ hostId, resource: resourceName, payload: result.data } as SolResourceUpdate)
+      } else {
+        onHostError(`Sol returned an invalid ${resource} collection.`)
+      }
+      return
+    }
     const result = z.object({ type: solEventTypeSchema, data: z.unknown() }).safeParse(payload)
     if (!result.success) {
       onHostError('Sol returned an invalid event.')
@@ -471,8 +663,39 @@ export function startCoreBridge({
       }
       return
     }
+    if (eventPayload.type === 'operation.updated') {
+      const data = operationSchema.safeParse(eventPayload.data)
+      if (data.success) onSolResource({ hostId, resource: 'operation', payload: data.data })
+      return
+    }
     onSolResource({ hostId, resource, payload: eventPayload } as SolResourceUpdate)
     if (eventPayload.type === 'catalog.changed') void dispatchConnected('host.apps', { id: hostId })
+    if (eventPayload.type === 'host.changed' || eventPayload.type === 'capabilities.changed') {
+      void dispatchConnected('host.refresh', { id: hostId })
+    }
+    const refreshCollections: Partial<
+      Record<(typeof solEventTypeSchema.options)[number], SolCollectionResource[]>
+    > = {
+      'displays.changed': ['displays', 'display-topology'],
+      'virtualDisplay.created': ['displays', 'display-topology', 'virtual-displays'],
+      'virtualDisplay.updated': ['displays', 'display-topology', 'virtual-displays'],
+      'virtualDisplay.removed': ['displays', 'display-topology', 'virtual-displays'],
+      'workspace.created': ['workspaces'],
+      'workspace.updated': ['workspaces'],
+      'workspace.removed': ['workspaces'],
+      'profile.created': ['profiles'],
+      'profile.updated': ['profiles'],
+      'profile.removed': ['profiles'],
+      'sandbox.created': ['sandboxes'],
+      'sandbox.updated': ['sandboxes'],
+      'sandbox.removed': ['sandboxes'],
+      'peripheral.added': ['peripherals'],
+      'peripheral.updated': ['peripherals', 'peripheral-claims'],
+      'peripheral.removed': ['peripherals', 'peripheral-claims'],
+    }
+    for (const collection of refreshCollections[eventPayload.type] ?? []) {
+      void dispatchConnected('host.resource', { hostId, resource: collection })
+    }
     if (eventPayload.type === 'resync.required') {
       const collections = z
         .object({ collections: z.array(z.string()) })
@@ -481,8 +704,22 @@ export function startCoreBridge({
         for (const collection of collections.data.collections) {
           if (collection === 'sessions' || collection === 'telemetry') {
             void dispatchConnected('host.resource', { hostId, resource: collection })
-          } else if (collection === 'apps') {
+          } else if (collection === 'catalog') {
             void dispatchConnected('host.apps', { id: hostId })
+          } else if (collection === 'host' || collection === 'capabilities') {
+            void dispatchConnected('host.refresh', { id: hostId })
+          } else {
+            const mapped: Record<string, SolCollectionResource[]> = {
+              displays: ['displays', 'display-topology'],
+              virtualDisplays: ['virtual-displays'],
+              workspaces: ['workspaces'],
+              profiles: ['profiles'],
+              sandboxes: ['sandboxes'],
+              peripherals: ['peripherals', 'peripheral-claims'],
+            }
+            for (const resource of mapped[collection] ?? []) {
+              void dispatchConnected('host.resource', { hostId, resource })
+            }
           }
         }
       }
@@ -559,9 +796,27 @@ export async function loadCoreApps(id: string) {
   await dispatchConnected('host.apps', { id })
 }
 
-export async function loadCoreResource(hostId: string, resource: 'sessions' | 'telemetry') {
+export async function loadCoreResource(hostId: string, resource: SolCollectionResource) {
   if (!hasNeutralinoRuntime()) return
   await dispatchConnected('host.resource', { hostId, resource })
+}
+
+export async function mutateCoreResource(
+  hostId: string,
+  method: 'POST' | 'PATCH' | 'PUT' | 'DELETE',
+  path: `/eclipse/v1/${string}`,
+  body: Record<string, unknown>,
+  revision?: number,
+) {
+  if (!hasNeutralinoRuntime()) return
+  await dispatchConnected('host.resource.mutate', {
+    hostId,
+    method,
+    path,
+    body,
+    revision,
+    idempotent: method !== 'PUT' || path !== '/eclipse/v1/display-topology',
+  })
 }
 
 export async function controlCoreLogicalSession(
@@ -579,9 +834,19 @@ export async function controlCoreLogicalSession(
   })
 }
 
-export async function launchCoreApp(hostId: string, appId: number, settings: StreamSettings) {
+export async function launchCoreApp(
+  hostId: string,
+  appId: number,
+  settings: StreamSettings,
+  launchProfileId = '',
+) {
   if (!hasNeutralinoRuntime()) return
-  await dispatchConnected('app.launch', { hostId, appId, settings: settingsSchema.parse(settings) })
+  await dispatchConnected('app.launch', {
+    hostId,
+    appId,
+    settings: settingsSchema.parse(settings),
+    launchProfileId: launchProfileId ? z.uuid().parse(launchProfileId) : '',
+  })
 }
 
 export async function applyUiDisplayMode(mode: StreamSettings['uiDisplayMode']) {

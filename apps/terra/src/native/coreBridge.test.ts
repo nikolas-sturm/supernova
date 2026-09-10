@@ -34,7 +34,8 @@ vi.mock('./overlayWindow', () => ({
   updateStreamOverlayStatistics: vi.fn(() => Promise.resolve()),
 }))
 
-import { pairCoreHost, startCoreBridge } from './coreBridge'
+import { defaultSettings } from '../settings'
+import { launchCoreApp, pairCoreHost, startCoreBridge } from './coreBridge'
 
 describe('coreBridge host protocol', () => {
   beforeEach(() => {
@@ -147,6 +148,129 @@ describe('coreBridge host protocol', () => {
     stop()
   })
 
+  it('validates Catalog V2 launch profiles', () => {
+    const onApps = vi.fn()
+    const stop = startCoreBridge({
+      onStatus: vi.fn(),
+      onHosts: vi.fn(),
+      onHostError: vi.fn(),
+      onPairing: vi.fn(),
+      onApps,
+      onArtwork: vi.fn(),
+      onSession: vi.fn(),
+      onSolResource: vi.fn(),
+    })
+    const launchProfile = {
+      id: '11111111-1111-4111-8111-111111111111',
+      name: 'Couch mode',
+      default: true,
+    }
+
+    neutralino.eventHandlers.get('terra.apps.changed')?.(
+      new CustomEvent('terra.apps.changed', {
+        detail: {
+          schemaVersion: 1,
+          hostId: 'host-1',
+          state: 'ready',
+          apps: [
+            {
+              id: 7,
+              name: 'Game',
+              hdrSupported: true,
+              appCollectorGame: true,
+              launchProfiles: [launchProfile],
+            },
+          ],
+          message: '',
+        },
+      }),
+    )
+
+    expect(onApps).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hostId: 'host-1',
+        apps: [expect.objectContaining({ id: 7, launchProfiles: [launchProfile] })],
+      }),
+    )
+    stop()
+  })
+
+  it('validates workstation collections and refreshes them after resource events', async () => {
+    const onSolResource = vi.fn()
+    const onHostError = vi.fn()
+    const stop = startCoreBridge({
+      onStatus: vi.fn(),
+      onHosts: vi.fn(),
+      onHostError,
+      onPairing: vi.fn(),
+      onApps: vi.fn(),
+      onArtwork: vi.fn(),
+      onSession: vi.fn(),
+      onSolResource,
+    })
+    const display = {
+      id: '11111111-1111-4111-8111-111111111111',
+      name: 'Studio Display',
+      kind: 'physical',
+      enabled: true,
+      primary: true,
+      position: { x: 0, y: 0 },
+      currentMode: {
+        id: '2560x1440@60',
+        width: 2560,
+        height: 1440,
+        refreshNumerator: 60,
+        refreshDenominator: 1,
+        bitDepth: 10,
+        hdr: true,
+      },
+      supportedModes: [],
+      hdr: { supported: true, enabled: true },
+      captureEligible: true,
+      revision: 3,
+    }
+
+    neutralino.eventHandlers.get('terra.sol.resource.changed')?.(
+      new CustomEvent('terra.sol.resource.changed', {
+        detail: {
+          schemaVersion: 1,
+          hostId: 'host-1',
+          resource: 'displays',
+          payload: { schemaVersion: 1, revision: 3, displays: [display] },
+        },
+      }),
+    )
+
+    expect(onSolResource).toHaveBeenCalledWith({
+      hostId: 'host-1',
+      resource: 'displays',
+      payload: { revision: 3, displays: [display] },
+    })
+    expect(onHostError).not.toHaveBeenCalled()
+
+    neutralino.eventHandlers.get('terra.sol.resource.changed')?.(
+      new CustomEvent('terra.sol.resource.changed', {
+        detail: {
+          schemaVersion: 1,
+          hostId: 'host-1',
+          resource: 'event',
+          payload: { type: 'displays.changed', data: { revision: 4 } },
+        },
+      }),
+    )
+    await vi.waitFor(() =>
+      expect(neutralino.dispatch).toHaveBeenCalledWith('dev.terra.core', 'host.resource', {
+        hostId: 'host-1',
+        resource: 'displays',
+      }),
+    )
+    expect(neutralino.dispatch).toHaveBeenCalledWith('dev.terra.core', 'host.resource', {
+      hostId: 'host-1',
+      resource: 'display-topology',
+    })
+    stop()
+  })
+
   it('requests workstation access while pairing', async () => {
     await pairCoreHost('host-1', '0427', 'workstation')
 
@@ -155,5 +279,19 @@ describe('coreBridge host protocol', () => {
       pin: '0427',
       access: 'workstation',
     })
+  })
+
+  it('passes an explicit Sol launch profile to native core', async () => {
+    await launchCoreApp('host-1', 7, defaultSettings, '11111111-1111-4111-8111-111111111111')
+
+    expect(neutralino.dispatch).toHaveBeenCalledWith(
+      'dev.terra.core',
+      'app.launch',
+      expect.objectContaining({
+        hostId: 'host-1',
+        appId: 7,
+        launchProfileId: '11111111-1111-4111-8111-111111111111',
+      }),
+    )
   })
 })

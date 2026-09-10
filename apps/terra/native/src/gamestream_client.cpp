@@ -677,6 +677,7 @@ std::vector<GameStreamApp> GameStreamClient::apps(const std::string& address,
             .publisher = {},
             .tags = {},
             .inputRequirements = {},
+            .launchProfiles = {},
             .installed = true,
             .updateAvailable = false,
             .assetId = {},
@@ -708,7 +709,8 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
                                       const std::string& serverCertificate, int appId, bool resume,
                                       const StreamSettings& settings,
                                       const std::atomic_bool* cancellation,
-                                      const std::string& appUuid) const {
+                                      const std::string& appUuid,
+                                      const std::string& launchProfileId) const {
     requireSecureRequest(serverCertificate, appId);
     if (appId == 0) {
         throw std::invalid_argument("Application ID is invalid.");
@@ -745,7 +747,10 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
         "&gcmap=" + std::to_string(gamepadMask) +
         "&gcpersist=" + std::to_string(settings.input.forceGamepad ? 1 : 0) +
         "&corever=1&eclipseApiVersion=1" +
-        (appUuid.empty() ? "" : "&eclipseAppUuid=" + urlEncode(appUuid));
+        (appUuid.empty() ? "" : "&eclipseAppUuid=" + urlEncode(appUuid)) +
+        (launchProfileId.empty()
+             ? ""
+             : "&eclipseLaunchProfileId=" + urlEncode(launchProfileId));
     const auto endpoint = parseEndpoint(address);
     const auto response =
         request(endpoint, httpsPort == 0 ? kDefaultHttpsPort : httpsPort, true,

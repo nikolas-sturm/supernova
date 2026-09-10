@@ -13,6 +13,8 @@ describe('clientStore mode profiles', () => {
       },
       logicalSessionsByHost: {},
       telemetryByHost: {},
+      resourcesByHost: {},
+      operationsByHost: {},
     })
   })
 
@@ -103,5 +105,32 @@ describe('clientStore mode profiles', () => {
       payload: { type: 'session.removed', data: { id: session.id } },
     })
     expect(useClientStore.getState().logicalSessionsByHost['host-1']).toEqual([])
+  })
+
+  it('stores workstation collections and latest durable operation per host', () => {
+    const snapshot = { revision: 2, profiles: [] }
+    useClientStore.getState().setSolResource({
+      hostId: 'host-1',
+      resource: 'profiles',
+      payload: snapshot,
+    })
+    expect(useClientStore.getState().resourcesByHost['host-1']?.profiles).toEqual(snapshot)
+
+    const operation = {
+      id: '11111111-1111-4111-8111-111111111111',
+      state: 'running' as const,
+      resourceId: null,
+      createdAt: 1,
+      updatedAt: 2,
+      revision: 1,
+      result: null,
+      error: null,
+    }
+    useClientStore.getState().setSolResource({
+      hostId: 'host-1',
+      resource: 'operation',
+      payload: operation,
+    })
+    expect(useClientStore.getState().operationsByHost['host-1']).toEqual(operation)
   })
 })
