@@ -52,6 +52,7 @@
 #include "platform/common.h"
 #include "process.h"
 #include "rtsp.h"
+#include "stream.h"
 #include "system_tray.h"
 #include "terra_assets.h"
 #include "terra_events.h"
@@ -463,6 +464,7 @@ namespace nvhttp {
   std::optional<std::string> terra_header(const req_https_t &request, std::string_view name);
   void send_terra_error(const resp_https_t &response, SimpleWeb::StatusCode status, std::string_view code, std::string_view message, nlohmann::json details = {});
   bool terra_require_canonical_uuid(const resp_https_t &response, std::string_view id, std::string_view resource_name);
+  std::optional<std::uint64_t> terra_require_if_match_value(const resp_https_t &response, const req_https_t &request, std::string_view resource_name);
   nlohmann::json terra_session_json(const rtsp_stream::session_info_t &session, const terra_session_tracking_t *tracking = nullptr);
   std::string terra_operational_capabilities_csv();
 
@@ -3922,7 +3924,7 @@ namespace nvhttp {
     const auto logical_sessions = std::ranges::count_if(snapshots, [](const auto &session) {
       return session.state == "starting" || session.state == "running" || session.state == "preparing" || session.state == "disconnected";
     });
-    const auto active_transport = snapshots | std::views::filter([](const auto &session) {
+    auto active_transport = snapshots | std::views::filter([](const auto &session) {
                                     return session.state == "starting" || session.state == "running";
                                   });
     const bool rates_sampled = transport_sessions > 0 && std::ranges::all_of(active_transport, &rtsp_stream::session_info_t::interval_sampled);
@@ -9717,7 +9719,7 @@ namespace nvhttp {
           });
           const auto working_directory = configuration.at("workingDirectory");
           const auto working_directory_supported = working_directory.is_null() || (working_directory.is_string() && fs::path(working_directory.get<std::string>()).is_absolute() && fs::is_directory(working_directory.get<std::string>()));
-          return std::ranges::all_of(configuration.at("arguments"), [&](const auto &argument) {
+          return std::ranges::all_of(configuration.at("arguments"), [&](const nlohmann::json &argument) {
                    return argument.is_string() && safe_token(argument.get<std::string>());
                  }) &&
                  environment_supported && working_directory_supported && configuration.at("preLaunchPolicy").empty() && configuration.at("postExitPolicy").empty() && configuration.at("cleanupPolicy") == "on-stop" && configuration.at("concurrentLaunchPolicy") == "deny";

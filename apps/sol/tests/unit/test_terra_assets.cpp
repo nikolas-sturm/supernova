@@ -137,6 +137,7 @@ TEST(TerraAssetsTest, InspectsPngMetadataAndStableRevision) {
   EXPECT_EQ(first->height, 1);
   EXPECT_EQ(first->size, png.size());
   EXPECT_EQ(first->revision, second->revision);
+  EXPECT_LE(first->revision, 9007199254740991ULL);
   EXPECT_EQ(first->etag, second->etag);
 }
 

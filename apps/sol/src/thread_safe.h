@@ -32,14 +32,16 @@ namespace safe {
      * @brief Notify waiters that a new event value is available.
      *
      * @param args Arguments forwarded to the callable or parser.
+     * @return Number of unread values replaced by the new value.
      */
     template<class... Args>
-    void raise(Args &&...args) {
+    std::size_t raise(Args &&...args) {
       std::lock_guard lg {_lock};
       if (!_continue) {
-        return;
+        return 0;
       }
 
+      const std::size_t dropped = _status ? 1 : 0;
       if constexpr (std::is_same_v<std::optional<T>, status_t>) {
         _status = std::make_optional<T>(std::forward<Args>(args)...);
       } else {
@@ -47,6 +49,13 @@ namespace safe {
       }
 
       _cv.notify_all();
+      return dropped;
+    }
+
+    /** @brief Return current unread value count. @return Zero or one unread value. */
+    std::size_t size() {
+      std::lock_guard lock {_lock};
+      return _status ? 1 : 0;
     }
 
     /**
