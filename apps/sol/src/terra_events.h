@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // lib includes
@@ -99,6 +100,16 @@ namespace terra_events {
    * @return UTF-8 SSE message containing id, event, and one JSON data line.
    */
   std::string to_sse(const record_t &record);
+
+  /**
+   * @brief Frame one payload for HTTP chunked transfer encoding.
+   *
+   * An empty payload produces the terminal chunk.
+   *
+   * @param payload Payload bytes.
+   * @return Complete HTTP chunk including delimiters.
+   */
+  std::string to_http_chunk(std::string_view payload);
 
   /**
    * @brief Thread-safe bounded per-client event replay hub.

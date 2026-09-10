@@ -11,6 +11,7 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -154,6 +155,12 @@ namespace terra_events {
 
   std::string to_sse(const record_t &record) {
     return "id: " + std::to_string(record.id) + "\nevent: " + record.event.type + "\ndata: " + to_json(record).dump() + "\n\n";
+  }
+
+  std::string to_http_chunk(const std::string_view payload) {
+    std::ostringstream chunk;
+    chunk << std::hex << payload.size() << "\r\n" << payload << "\r\n";
+    return std::move(chunk).str();
   }
 
   hub_t::hub_t(const std::size_t replay_capacity, clock_t clock):

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -243,6 +244,7 @@ public:
 
 private:
     Identity identity_;
+    mutable std::mutex apiMutex_;  ///< Serializes short-lived Eclipse API TLS connections.
 };
 
 }  // namespace terra

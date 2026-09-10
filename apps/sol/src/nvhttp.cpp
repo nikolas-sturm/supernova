@@ -2931,16 +2931,17 @@ namespace nvhttp {
     terra_event_streams.emplace_back(std::async(std::launch::async, [response = std::move(response), opened, hub]() mutable {
       response->close_connection_after_response = true;
       response->write(SimpleWeb::StatusCode::success_ok, {
-                                                           {"Content-Type", "text/event-stream; charset=utf-8"},
+                                                           {"Content-Type", "text/event-stream"},
                                                            {"Cache-Control", "no-store"},
                                                            {"Connection", "keep-alive"},
+                                                           {"Transfer-Encoding", "chunked"},
                                                          });
       if (!flush_terra_event_stream(response)) {
         hub->disconnect(opened.stream);
         return;
       }
       for (const auto &record : opened.replay) {
-        *response << terra_events::to_sse(record);
+        *response << terra_events::to_http_chunk(terra_events::to_sse(record));
         if (!flush_terra_event_stream(response)) {
           hub->disconnect(opened.stream);
           return;
@@ -2949,12 +2950,14 @@ namespace nvhttp {
       while (true) {
         const auto next = hub->wait(opened.stream);
         if (next.status == terra_events::wait_status_t::disconnected) {
+          *response << terra_events::to_http_chunk({});
+          static_cast<void>(flush_terra_event_stream(response));
           return;
         }
         if (next.status == terra_events::wait_status_t::idle) {
-          *response << ": keep-alive\n\n";
+          *response << terra_events::to_http_chunk(": keep-alive\n\n");
         } else {
-          *response << terra_events::to_sse(*next.record);
+          *response << terra_events::to_http_chunk(terra_events::to_sse(*next.record));
         }
         if (!flush_terra_event_stream(response)) {
           hub->disconnect(opened.stream);

@@ -231,6 +231,11 @@ TEST(TerraEventsTest, SerializesCompleteJsonAndSseEnvelope) {
   EXPECT_EQ(terra_events::to_sse(record), "id: 7\nevent: session.updated\ndata: " + json.dump() + "\n\n");
 }
 
+TEST(TerraEventsTest, FramesHttpChunksForStreaming) {
+  EXPECT_EQ(terra_events::to_http_chunk("event\n\n"), "7\r\nevent\n\n\r\n");
+  EXPECT_EQ(terra_events::to_http_chunk({}), "0\r\n\r\n");
+}
+
 TEST(TerraEventsTest, UsesInjectedClockAndOmitsInapplicableOptionalFields) {
   std::int64_t now = 4321;
   auto events = hub(now);

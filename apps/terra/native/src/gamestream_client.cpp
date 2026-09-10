@@ -383,7 +383,8 @@ RawApiResponse apiCall(const Endpoint& endpoint, std::uint16_t port,
                 std::this_thread::sleep_for(std::chrono::milliseconds{100});
                 continue;
             }
-            throw std::runtime_error(response ? response->errorMsg : "No HTTP response.");
+            throw std::runtime_error("Sol API " + method + " " + path + " failed: " +
+                                     (response ? response->errorMsg : "No HTTP response."));
         }
         if (response->statusCode < 200 || response->statusCode >= 300) {
             throwApiError(response->statusCode, responseBody);
@@ -784,8 +785,9 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
 ApiResponse GameStreamClient::apiRequest(const std::string& address, std::uint16_t apiPort,
                                          const std::string& serverCertificate,
                                          const std::string& method, const std::string& path,
-                                         const std::optional<nlohmann::json>& body,
-                                         const std::map<std::string, std::string>& headers) const {
+                                          const std::optional<nlohmann::json>& body,
+                                          const std::map<std::string, std::string>& headers) const {
+    std::scoped_lock lock{apiMutex_};
     const auto response =
         apiCall(parseEndpoint(address), apiPort, serverCertificate, identity_, method, path,
                 body ? std::optional<std::string>{body->dump()} : std::nullopt, headers);
@@ -805,8 +807,9 @@ ApiResponse GameStreamClient::apiRequest(const std::string& address, std::uint16
 
 std::string GameStreamClient::apiBytes(const std::string& address, std::uint16_t apiPort,
                                        const std::string& serverCertificate,
-                                       const std::string& path,
-                                       const std::map<std::string, std::string>& headers) const {
+                                        const std::string& path,
+                                        const std::map<std::string, std::string>& headers) const {
+    std::scoped_lock lock{apiMutex_};
     auto assetHeaders = headers;
     assetHeaders.try_emplace("Accept", "*/*");
     return apiCall(parseEndpoint(address), apiPort, serverCertificate, identity_, "GET", path,
