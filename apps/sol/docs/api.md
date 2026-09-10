@@ -22,9 +22,9 @@ Sol advertises only capabilities whose complete routes and runtime dependencies 
 operational: `client-permissions`, `session-ids`, `structured-errors`, `catalog-v2`, `events-v1`,
 `telemetry-v1`, and `peripherals-v1` on every supported platform, plus `discovery-v1` while local
 discovery is reachable. Windows additionally advertises `profiles-v1`, `workspaces-v1`,
-`sandboxes-v1`, `virtual-displays-v1`, and `displays-v1` while their complete persistence and
-provider dependencies stay healthy. Incomplete and unhealthy provider-backed domains remain listed
-as unavailable under `features`.
+`multi-display-streaming-v1`, `sandboxes-v1`, `virtual-displays-v1`, and `displays-v1` while their
+complete persistence and provider dependencies stay healthy. Incomplete and unhealthy
+provider-backed domains remain listed as unavailable under `features`.
 
 `discovery-v1` uses DNS-SD service type `_nvstream._tcp.local`. Its SRV port is Sol's mapped
 unauthenticated GameStream HTTP port, where clients verify advertisements through `/serverinfo`
@@ -79,6 +79,16 @@ Pairing requests must provide both `eclipseScopes` and `eclipseInput` to activat
 Supplying only one field or any unknown value rejects pairing. Omitting both fields preserves legacy
 Moonlight permissions; explicitly empty fields grant no Terra scopes or input classes.
 
+### GameStream launch extensions
+
+Terra clients pass `eclipseApiVersion=1`, `eclipseAppUuid`, and optional
+`eclipseWorkspaceId` and `eclipseDisplayId` query parameters to paired `/launch` and `/resume`.
+Workspace launches require one attached, capture-ready virtual display ID per child transport.
+`/launch` starts the application and primary child; subsequent displays use `/resume`. Successful
+responses include stable `EclipseSessionId` and unique `EclipseStreamId` fields. One logical session
+supports at most four child streams. Terra virtual-display streams and legacy Moonlight streams are
+mutually exclusive while either topology is active.
+
 ### GET /eclipse/v1/capabilities
 
 Returns API capabilities, paired-client UUID, granted scopes, application allowlist, expiry, host
@@ -118,9 +128,11 @@ terminal sessions. Clients with `host.control` can see every session. The respon
 monotonic collection `revision` and supports `since=<revision>`. Session resources carry
 `stateReason`, `updatedAt`, `revision`, resolved `displayProfileId`, `streamProfileId`,
 `launchProfileId`, and `sandboxProfileId` references, plus `workspaceId`, `sandboxId`, and
-`peripheralClaimIds` associations. Terminal sessions remain queryable for at least 60 seconds and
-are then removed with a `session.removed` event. Transitions emit `session.created`,
-`session.updated`, and `session.removed`.
+`peripheralClaimIds` associations. `displayId` remains the primary-display compatibility field;
+`displayIds` lists every attached display and `streams` reports each child transport's unique ID,
+display binding, primary role, state, negotiated mode, frame rate, and HDR state. Terminal sessions
+remain queryable for at least 60 seconds and are then removed with a `session.removed` event.
+Transitions emit `session.created`, `session.updated`, and `session.removed`.
 
 ### GET /eclipse/v1/sessions/{id}
 

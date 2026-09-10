@@ -31,6 +31,8 @@ struct StreamSessionConfig {
     int videoFormat = VIDEO_FORMAT_H264;
     StreamSettings settings;
     LaunchResult launch;
+    bool audioEnabled = true;  ///< Whether this child may open audio output.
+    bool controllerEnabled = true;  ///< Whether this child may send controller state.
 };
 
 struct StreamSessionEvent {

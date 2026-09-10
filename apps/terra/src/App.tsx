@@ -348,7 +348,12 @@ export function App() {
     }
   }
 
-  async function handleLaunch(hostId: string, appId: number, launchProfileId = '') {
+  async function handleLaunch(
+    hostId: string,
+    appId: number,
+    launchProfileId = '',
+    workspaceId = '',
+  ) {
     setHostError(undefined)
     try {
       const app =
@@ -411,6 +416,7 @@ export function App() {
         appId,
         profiledSettings?.success ? profiledSettings.data : settings,
         resolvedLaunchProfileId,
+        workspaceId,
       )
       closeAppDetails()
     } catch (error) {
@@ -902,6 +908,14 @@ export function App() {
                   apps={selectedApps}
                   settings={settings}
                   onError={setHostError}
+                  onLaunch={(workspaceId, appUuid) => {
+                    const app = selectedApps.find((candidate) => candidate.uuid === appUuid)
+                    if (!app) {
+                      setHostError('Workspace application is unavailable in current library.')
+                      return
+                    }
+                    void handleLaunch(selectedHost.id, app.id, '', workspaceId)
+                  }}
                 />
                 {activeSession && activeSession.state !== 'stopped' && (
                   <div className={`${styles.sessionBanner} ${styles[activeSession.state]}`}>

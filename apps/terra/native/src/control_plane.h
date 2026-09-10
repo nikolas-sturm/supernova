@@ -130,7 +130,8 @@ public:
                       bool idempotent = false);
     [[nodiscard]] SessionRecord launchApp(const std::string& hostId, int appId,
                                            const StreamSettings& settings,
-                                           const std::string& launchProfileId = {});
+                                           const std::string& launchProfileId = {},
+                                           const std::string& workspaceId = {});
     void stopSession(const std::string& hostId, bool quitHost);
     void closeStreamOverlay(const std::string& hostId, std::uint64_t generation,
                             std::uint64_t revision);
@@ -169,6 +170,7 @@ private:
     std::filesystem::path statePath_;
     std::unique_ptr<GameStreamClient> gameStream_;
     std::shared_ptr<class StreamSession> transport_;
+    std::vector<std::shared_ptr<class StreamWorkerProcess>> streamWorkers_;
     std::string clientId_;
     std::mutex sessionMutex_;
     std::condition_variable disconnectCondition_;

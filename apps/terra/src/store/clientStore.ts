@@ -120,6 +120,18 @@ export interface LogicalSession {
   height: number
   refreshRate: number
   hdr: boolean
+  displayId: string | null
+  displayIds: string[]
+  streams: Array<{
+    id: string
+    displayId: string | null
+    primary: boolean
+    state: string
+    width: number
+    height: number
+    fps: number
+    hdr: boolean
+  }>
   revision: number
 }
 

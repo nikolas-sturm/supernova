@@ -169,6 +169,46 @@ TEST(TerraVirtualDisplayTest, PreservesBaselineAndCreatesStableResource) {
   EXPECT_FALSE(manager.list(listed.revision).changed);
 }
 
+TEST(TerraVirtualDisplayTest, CreatesWorkspaceLayoutInOneProviderTransaction) {
+  fake_t fake;
+  manager_t manager {fake.callbacks()};
+  auto primary = specification();
+  primary.primary = true;
+  primary.position = {0, 0};
+  auto secondary = specification();
+  secondary.position = {1920, 0};
+
+  const auto result = manager.create_batch(OWNER, {primary, secondary});
+
+  ASSERT_EQ(result.status, status_t::success);
+  ASSERT_EQ(result.resources.size(), 2);
+  EXPECT_EQ(result.resources[0].id, RESOURCE);
+  EXPECT_EQ(result.resources[1].id, RESOURCE_2);
+  EXPECT_EQ(fake.count, 4);
+  EXPECT_EQ(fake.set_calls, 1);
+  EXPECT_EQ(fake.apply_calls, 1);
+  EXPECT_EQ(fake.changes.size(), 2);
+}
+
+TEST(TerraVirtualDisplayTest, RejectsInvalidOrPartialWorkspaceLayouts) {
+  fake_t fake;
+  manager_t manager {fake.callbacks()};
+  auto primary = specification();
+  primary.primary = true;
+  primary.position = {0, 0};
+  auto overlapping = specification();
+  overlapping.position = {100, 0};
+  EXPECT_EQ(manager.create_batch(OWNER, {primary, overlapping}).status, status_t::invalid);
+  EXPECT_EQ(fake.set_calls, 0);
+
+  auto secondary = specification();
+  secondary.position = {1920, 0};
+  fake.save_succeeds = false;
+  EXPECT_EQ(manager.create_batch(OWNER, {primary, secondary}).status, status_t::persistence_error);
+  EXPECT_EQ(fake.count, 2);
+  EXPECT_TRUE(manager.list().resources.empty());
+}
+
 TEST(TerraVirtualDisplayTest, AvailabilityTracksLiveProviderHealth) {
   fake_t fake;
   manager_t manager {fake.callbacks()};

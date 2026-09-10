@@ -103,6 +103,45 @@ namespace terra_virtual_display {
     }
 
     /**
+     * @brief Validate workspace layout invariants before provider mutation.
+     *
+     * @param values Requested display specifications.
+     * @return True for one to four non-overlapping displays with one origin primary.
+     */
+    bool valid_batch(const std::vector<specification_t> &values) {
+      if (values.empty() || values.size() > 4 || std::ranges::count(values, true, &specification_t::primary) != 1) {
+        return false;
+      }
+      const auto primary = std::ranges::find(values, true, &specification_t::primary);
+      if (primary->position.x != 0 || primary->position.y != 0) {
+        return false;
+      }
+      for (auto left = values.begin(); left != values.end(); ++left) {
+        if (!valid_specification(*left) || left->hdr != left->mode.hdr) {
+          return false;
+        }
+        const std::int64_t left_width = left->rotation % 180 == 0 ? left->mode.width : left->mode.height;
+        const std::int64_t left_height = left->rotation % 180 == 0 ? left->mode.height : left->mode.width;
+        for (auto right = std::next(left); right != values.end(); ++right) {
+          const std::int64_t right_width = right->rotation % 180 == 0 ? right->mode.width : right->mode.height;
+          const std::int64_t right_height = right->rotation % 180 == 0 ? right->mode.height : right->mode.width;
+          const bool overlap = std::int64_t {left->position.x} < std::int64_t {right->position.x} + right_width && std::int64_t {right->position.x} < std::int64_t {left->position.x} + left_width && std::int64_t {left->position.y} < std::int64_t {right->position.y} + right_height && std::int64_t {right->position.y} < std::int64_t {left->position.y} + left_height;
+          if (overlap) {
+            return false;
+          }
+        }
+      }
+      return true;
+    }
+
+    /**
+     * @brief Compare provider-confirmed mode with requested mode exactly.
+     */
+    bool mode_matches(const mode_t &requested, const actual_mode_t &actual) {
+      return requested.width == actual.width && requested.height == actual.height && requested.refresh_numerator == actual.refresh_numerator && requested.refresh_denominator == actual.refresh_denominator && requested.bit_depth == actual.bit_depth && requested.hdr == actual.hdr;
+    }
+
+    /**
      * @brief Serialize mode-like fields.
      *
      * @tparam T Requested or actual mode type.
@@ -598,6 +637,88 @@ namespace terra_virtual_display {
     impl_->collection_revision = revision;
     impl_->notify(previous, impl_->resources);
     return {status_t::success, impl_->resources.at(resource.id)};
+  }
+
+  batch_result_t manager_t::create_batch(const std::string &owner, const std::vector<specification_t> &specifications) {
+    std::scoped_lock lock {impl_->mutex};
+    if (!impl_->usable || !impl_->healthy()) {
+      return {status_t::unavailable, {}};
+    }
+    if (!valid_uuid(owner) || !valid_batch(specifications)) {
+      return {status_t::invalid, {}};
+    }
+    std::vector<std::string> resource_ids;
+    try {
+      for (std::size_t index = 0; index < specifications.size(); ++index) {
+        auto id = impl_->callbacks.uuid ? impl_->callbacks.uuid() : std::string {};
+        std::ranges::transform(id, id.begin(), [](const unsigned char character) {
+          return static_cast<char>(std::tolower(character));
+        });
+        if (!valid_uuid(id) || impl_->resources.contains(id) || std::ranges::contains(resource_ids, id)) {
+          return {status_t::invalid, {}};
+        }
+        resource_ids.push_back(std::move(id));
+      }
+    } catch (...) {
+      return {status_t::invalid, {}};
+    }
+    const auto before = impl_->provider_state();
+    const auto expected = static_cast<std::uint32_t>(impl_->baseline_count + impl_->resources.size());
+    if (!before || before->first != expected) {
+      return {status_t::provider_error, {}};
+    }
+    if (specifications.size() > impl_->callbacks.max_count - std::min(expected, impl_->callbacks.max_count)) {
+      return {status_t::limit_reached, {}};
+    }
+    if (!impl_->capture_configuration()) {
+      return {status_t::provider_error, {}};
+    }
+    try {
+      if (!impl_->callbacks.set_count || !impl_->callbacks.set_count(expected + static_cast<std::uint32_t>(specifications.size()))) {
+        impl_->rollback_or_disable(expected);
+        return {status_t::provider_error, {}};
+      }
+    } catch (...) {
+      impl_->rollback_or_disable(expected);
+      return {status_t::provider_error, {}};
+    }
+    const auto after = impl_->provider_state();
+    std::vector<std::string> added;
+    if (after) {
+      std::set_difference(after->second.begin(), after->second.end(), before->second.begin(), before->second.end(), std::back_inserter(added));
+    }
+    if (!after || after->first != expected + specifications.size() || added.size() != specifications.size()) {
+      impl_->rollback_or_disable(expected);
+      return {status_t::provider_error, {}};
+    }
+    const auto previous = impl_->resources;
+    auto candidate = impl_->resources;
+    std::vector<resource_t> resources;
+    resources.reserve(specifications.size());
+    for (std::size_t index = 0; index < specifications.size(); ++index) {
+      const auto &spec = specifications[index];
+      resource_t resource {resource_ids[index], spec.name, owner, spec.workspace_id ? state_t::attached : state_t::ready, spec.mode, {}, spec.position, spec.scale, spec.rotation, spec.primary, spec.hdr, spec.persistent, spec.workspace_id, std::nullopt, nullptr, 1, added[index]};
+      candidate.emplace(resource.id, resource);
+      resources.push_back(std::move(resource));
+    }
+    if (!impl_->apply(candidate) || std::ranges::any_of(resources, [&](const auto &resource) {
+          return !mode_matches(resource.requested_mode, candidate.at(resource.id).actual_mode);
+        })) {
+      impl_->rollback_or_disable(expected);
+      return {status_t::provider_error, {}};
+    }
+    const auto revision = impl_->collection_revision + 1;
+    if (!impl_->save(candidate, revision)) {
+      impl_->rollback_or_disable(expected);
+      return {status_t::persistence_error, {}};
+    }
+    impl_->resources = std::move(candidate);
+    impl_->collection_revision = revision;
+    for (auto &resource : resources) {
+      resource = impl_->resources.at(resource.id);
+    }
+    impl_->notify(previous, impl_->resources);
+    return {status_t::success, std::move(resources)};
   }
 
   std::optional<resource_t> manager_t::get(const std::string &id) const {

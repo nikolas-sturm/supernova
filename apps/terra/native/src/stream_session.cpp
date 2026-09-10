@@ -462,6 +462,7 @@ void StreamSession::setHdrMode(bool enabled) {
 void StreamSession::rumble(unsigned short controllerNumber, unsigned short lowFrequency,
                            unsigned short highFrequency) {
     if (auto session = active(); session) {
+        if (!session->config_.controllerEnabled) return;
         std::scoped_lock lock{session->videoMutex_};
         if (!session->terminated_.load() && session->video_) {
             session->video_->setGamepadRumble(controllerNumber, lowFrequency, highFrequency);
@@ -472,6 +473,7 @@ void StreamSession::rumble(unsigned short controllerNumber, unsigned short lowFr
 void StreamSession::rumbleTriggers(std::uint16_t controllerNumber, std::uint16_t leftTrigger,
                                    std::uint16_t rightTrigger) {
     if (auto session = active(); session) {
+        if (!session->config_.controllerEnabled) return;
         std::scoped_lock lock{session->videoMutex_};
         if (!session->terminated_.load() && session->video_) {
             session->video_->setGamepadTriggerRumble(controllerNumber, leftTrigger, rightTrigger);
@@ -482,6 +484,7 @@ void StreamSession::rumbleTriggers(std::uint16_t controllerNumber, std::uint16_t
 void StreamSession::setMotionEventState(std::uint16_t controllerNumber, std::uint8_t motionType,
                                         std::uint16_t reportRateHz) {
     if (auto session = active(); session) {
+        if (!session->config_.controllerEnabled) return;
         std::scoped_lock lock{session->videoMutex_};
         if (!session->terminated_.load() && session->video_) {
             session->video_->setGamepadMotionEventState(controllerNumber, motionType,
@@ -493,6 +496,7 @@ void StreamSession::setMotionEventState(std::uint16_t controllerNumber, std::uin
 void StreamSession::setControllerLed(std::uint16_t controllerNumber, std::uint8_t red,
                                      std::uint8_t green, std::uint8_t blue) {
     if (auto session = active(); session) {
+        if (!session->config_.controllerEnabled) return;
         std::scoped_lock lock{session->videoMutex_};
         if (!session->terminated_.load() && session->video_) {
             session->video_->setGamepadLed(controllerNumber, red, green, blue);
@@ -513,6 +517,7 @@ void StreamSession::connectionStatusUpdate(int status) {
 
 void StreamSession::createVideoRendererLocked() {
     auto settings = config_.settings;
+    settings.input.controllersEnabled = config_.controllerEnabled;
     if (videoDisplayOverride_) settings.displayIndex = *videoDisplayOverride_;
     StreamOverlayState overlayState;
     {
@@ -738,6 +743,7 @@ int StreamSession::audioInit(int, const POPUS_MULTISTREAM_CONFIGURATION config, 
     auto lease = active();
     if (lease) {
         auto* session = lease.get();
+        if (!session->config_.audioEnabled) return 0;
         std::string message;
         {
             std::scoped_lock lock{session->audioMutex_};
@@ -772,6 +778,7 @@ void StreamSession::receiveAudio(char* data, int length) {
     auto lease = active();
     if (lease) {
         auto* session = lease.get();
+        if (!session->config_.audioEnabled) return;
         std::string message;
         {
             std::scoped_lock lock{session->audioMutex_};

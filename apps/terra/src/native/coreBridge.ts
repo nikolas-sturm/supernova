@@ -177,6 +177,20 @@ const logicalSessionSchema: z.ZodType<LogicalSession> = z.object({
   height: z.number().int().positive(),
   refreshRate: z.number().int().positive(),
   hdr: z.boolean(),
+  displayId: z.uuid().nullable(),
+  displayIds: z.array(z.uuid()),
+  streams: z.array(
+    z.object({
+      id: z.uuid(),
+      displayId: z.uuid().nullable(),
+      primary: z.boolean(),
+      state: z.string(),
+      width: z.number().int().positive(),
+      height: z.number().int().positive(),
+      fps: z.number().int().positive(),
+      hdr: z.boolean(),
+    }),
+  ),
   revision: z.number().int().positive(),
 })
 
@@ -839,6 +853,7 @@ export async function launchCoreApp(
   appId: number,
   settings: StreamSettings,
   launchProfileId = '',
+  workspaceId = '',
 ) {
   if (!hasNeutralinoRuntime()) return
   await dispatchConnected('app.launch', {
@@ -846,6 +861,7 @@ export async function launchCoreApp(
     appId,
     settings: settingsSchema.parse(settings),
     launchProfileId: launchProfileId ? z.uuid().parse(launchProfileId) : '',
+    workspaceId: workspaceId ? z.uuid().parse(workspaceId) : '',
   })
 }
 

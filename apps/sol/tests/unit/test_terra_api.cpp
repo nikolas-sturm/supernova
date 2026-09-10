@@ -365,6 +365,7 @@ TEST(TerraApiTest, BuildsCompleteCapabilityDocument) {
   EXPECT_TRUE(document["features"]["events-v1"]["available"]);
   EXPECT_TRUE(document["features"]["profiles-v1"]["available"]);
   EXPECT_TRUE(document["features"]["workspaces-v1"]["available"]);
+  EXPECT_EQ(document["features"]["multi-display-streaming-v1"]["available"], document["features"]["workspaces-v1"]["available"]);
   EXPECT_TRUE(document["features"]["telemetry-v1"]["available"]);
   EXPECT_FALSE(document["features"]["discovery-v1"]["available"]);
   EXPECT_EQ(document["features"]["discovery-v1"]["reasonCode"], "server_unavailable");
@@ -398,6 +399,7 @@ TEST(TerraApiTest, BuildsCompleteCapabilityDocument) {
   EXPECT_FALSE(document["features"]["sandboxes-v1"]["reasonCode"].get<std::string>().empty());
 #endif
   EXPECT_EQ(document["limits"]["sessions"]["maxActive"], 1);
+  EXPECT_EQ(document["limits"]["streaming"]["maxDisplays"], 4);
   EXPECT_EQ(document["limits"]["displays"]["maxManaged"], 0);
   EXPECT_EQ(document["limits"]["virtualDisplays"]["maxActive"], 0);
   EXPECT_EQ(document["limits"]["workspaces"]["maxActive"], document["features"]["workspaces-v1"]["available"].get<bool>() ? 1 : 0);

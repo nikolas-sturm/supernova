@@ -356,7 +356,7 @@ namespace terra_workspaces {
 
     /** @brief Validate definition using injected policies. @param value Definition. @return True when valid. */
     bool validate(const definition_t &value) const {
-      if (value.name.empty() || !valid_uuid(value.desktop_app_uuid) || !valid_uuids(value.permitted_app_uuids) || !valid_uuids(value.peripheral_policy.required_device_ids) || (value.peripheral_policy.disconnect_policy != "release" && value.peripheral_policy.disconnect_policy != "suspend")) {
+      if (value.name.empty() || value.virtual_displays.size() > 4 || !valid_uuid(value.desktop_app_uuid) || !valid_uuids(value.permitted_app_uuids) || !valid_uuids(value.peripheral_policy.required_device_ids) || (value.peripheral_policy.disconnect_policy != "release" && value.peripheral_policy.disconnect_policy != "suspend")) {
         return false;
       }
       if (!callbacks.validate_app || !callbacks.validate_app(value.desktop_app_uuid) || std::any_of(value.permitted_app_uuids.begin(), value.permitted_app_uuids.end(), [&](const auto &id) {

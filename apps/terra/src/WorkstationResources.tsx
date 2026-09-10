@@ -11,7 +11,7 @@ import {
   Square,
   Trash2,
 } from 'lucide-react'
-import type { FormEvent, ReactNode } from 'react'
+import { type FormEvent, type ReactNode, useState } from 'react'
 import styles from './App.module.css'
 import { loadCoreResource, mutateCoreResource } from './native/coreBridge'
 import type { StreamSettings } from './settings'
@@ -30,6 +30,8 @@ interface CommonProps {
   settings: StreamSettings
   onError: (message?: string) => void
 }
+
+const workspaceDisplaySlots = ['primary', 'secondary', 'tertiary', 'quaternary'] as const
 
 function featureReason(host: Host, capability: string) {
   const feature = host.features?.[capability]
@@ -339,10 +341,18 @@ export function DisplayManager({ host, settings, onError }: CommonProps) {
   )
 }
 
-export function WorkspaceManager({ host, apps, onError }: CommonProps) {
+export function WorkspaceManager({
+  host,
+  apps,
+  settings,
+  onError,
+  onLaunch,
+}: CommonProps & { onLaunch?: (workspaceId: string, appUuid: string) => void }) {
   const resources = useClientStore((state) => (host ? state.resourcesByHost[host.id] : undefined))
   const operation = useClientStore((state) => (host ? state.operationsByHost[host.id] : undefined))
   const workspaces = resources?.workspaces?.workspaces ?? []
+  const [displayCount, setDisplayCount] = useState(1)
+  const [primaryDisplay, setPrimaryDisplay] = useState(0)
 
   async function createWorkspace(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -351,6 +361,9 @@ export function WorkspaceManager({ host, apps, onError }: CommonProps) {
     const appUuid = String(data.get('appUuid') ?? '')
     const name = String(data.get('name') ?? '').trim()
     if (!appUuid || !name) return
+    const primaryIndex = Number(data.get('primaryDisplay') ?? 0)
+    const primaryX = Number(data.get(`displayX-${primaryIndex}`) ?? 0)
+    const primaryY = Number(data.get(`displayY-${primaryIndex}`) ?? 0)
     await runMutation(onError, () =>
       mutateCoreResource(host.id, 'POST', '/eclipse/v1/workspaces', {
         name,
@@ -362,7 +375,29 @@ export function WorkspaceManager({ host, apps, onError }: CommonProps) {
         streamProfileId: null,
         launchProfileId: null,
         sandboxProfileId: null,
-        virtualDisplays: [],
+        virtualDisplays: Array.from({ length: displayCount }, (_, index) => {
+          const hdr = Boolean(data.get(`displayHdr-${index}`))
+          return {
+            name: String(data.get(`displayName-${index}`) ?? `Display ${index + 1}`).trim(),
+            mode: {
+              width: Number(data.get(`displayWidth-${index}`) ?? settings.width),
+              height: Number(data.get(`displayHeight-${index}`) ?? settings.height),
+              refreshNumerator: Number(data.get(`displayFps-${index}`) ?? settings.fps),
+              refreshDenominator: 1,
+              bitDepth: hdr ? 10 : 8,
+              hdr,
+            },
+            position: {
+              x: Number(data.get(`displayX-${index}`) ?? index * settings.width) - primaryX,
+              y: Number(data.get(`displayY-${index}`) ?? 0) - primaryY,
+            },
+            scale: 1,
+            rotation: 0,
+            primary: index === primaryIndex,
+            hdr,
+            persistent: true,
+          }
+        }),
         peripheralPolicy: {
           requiredDeviceIds: [],
           requiredClasses: [],
@@ -407,6 +442,14 @@ export function WorkspaceManager({ host, apps, onError }: CommonProps) {
                       peripherals
                     </small>
                     <footer>
+                      {workspace.state === 'ready' && onLaunch && (
+                        <button
+                          type="button"
+                          onClick={() => onLaunch(workspace.id, workspace.desktopAppUuid)}
+                        >
+                          <Play size={13} /> Launch
+                        </button>
+                      )}
                       {active ? (
                         <button
                           type="button"
@@ -488,6 +531,108 @@ export function WorkspaceManager({ host, apps, onError }: CommonProps) {
                   ))}
               </select>
             </label>
+            {workspaceDisplaySlots.slice(0, displayCount).map((slot, index) => (
+              <fieldset key={slot}>
+                <legend>{`Display ${index + 1}`}</legend>
+                <label>
+                  <input
+                    name="primaryDisplay"
+                    type="radio"
+                    value={index}
+                    checked={primaryDisplay === index}
+                    onChange={() => setPrimaryDisplay(index)}
+                  />{' '}
+                  Primary
+                </label>
+                <label>
+                  Name
+                  <input
+                    name={`displayName-${index}`}
+                    defaultValue={`Display ${index + 1}`}
+                    required
+                  />
+                </label>
+                <label>
+                  Width
+                  <input
+                    name={`displayWidth-${index}`}
+                    type="number"
+                    min="640"
+                    max="16384"
+                    defaultValue={settings.width}
+                    required
+                  />
+                </label>
+                <label>
+                  Height
+                  <input
+                    name={`displayHeight-${index}`}
+                    type="number"
+                    min="480"
+                    max="16384"
+                    defaultValue={settings.height}
+                    required
+                  />
+                </label>
+                <label>
+                  FPS
+                  <input
+                    name={`displayFps-${index}`}
+                    type="number"
+                    min="1"
+                    max="480"
+                    defaultValue={settings.fps}
+                    required
+                  />
+                </label>
+                <label>
+                  X
+                  <input
+                    name={`displayX-${index}`}
+                    type="number"
+                    defaultValue={index * settings.width}
+                    readOnly={index === 0}
+                    required
+                  />
+                </label>
+                <label>
+                  Y
+                  <input
+                    name={`displayY-${index}`}
+                    type="number"
+                    defaultValue={0}
+                    readOnly={index === 0}
+                    required
+                  />
+                </label>
+                <label>
+                  <input
+                    name={`displayHdr-${index}`}
+                    type="checkbox"
+                    defaultChecked={settings.enableHdr}
+                  />{' '}
+                  HDR
+                </label>
+              </fieldset>
+            ))}
+            <button
+              type="button"
+              disabled={displayCount >= 4}
+              onClick={() => setDisplayCount((count) => Math.min(4, count + 1))}
+            >
+              <Plus size={14} /> Virtual display
+            </button>
+            {displayCount > 1 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setDisplayCount((count) => count - 1)
+                  setPrimaryDisplay((index) => Math.min(index, displayCount - 2))
+                }}
+              >
+                Remove display
+              </button>
+            )}
             <button type="submit" disabled={!apps.some((app) => app.uuid)}>
               <Plus size={14} /> Create workspace
             </button>

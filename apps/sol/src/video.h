@@ -685,9 +685,6 @@ namespace video {
   extern bool last_encoder_probe_supported_ref_frames_invalidation;
   extern std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
 
-  /** @brief Return platform identifier of display currently selected for capture. */
-  std::string capture_display_name();
-
   /**
    * @brief Resolve a client-requested dynamic range against probed encoder capabilities.
    *

@@ -217,6 +217,9 @@ TEST(TerraWorkspacesTest, ValidatesCanonicalIdsPoliciesAndCallbacks) {
   invalid = definition();
   invalid.peripheral_policy.disconnect_policy = "drop";
   EXPECT_EQ(manager.create(OWNER, invalid).status, status_t::invalid);
+  invalid = definition();
+  invalid.virtual_displays.resize(5, invalid.virtual_displays.front());
+  EXPECT_EQ(manager.create(OWNER, invalid).status, status_t::invalid);
   fake.validation_succeeds = false;
   EXPECT_EQ(manager.create(OWNER, definition()).status, status_t::invalid);
 }

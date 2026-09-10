@@ -120,6 +120,20 @@ describe('coreBridge host protocol', () => {
       height: 1440,
       refreshRate: 120,
       hdr: true,
+      displayId: '33333333-3333-4333-8333-333333333333',
+      displayIds: ['33333333-3333-4333-8333-333333333333'],
+      streams: [
+        {
+          id: '44444444-4444-4444-8444-444444444444',
+          displayId: '33333333-3333-4333-8333-333333333333',
+          primary: true,
+          state: 'running',
+          width: 2560,
+          height: 1440,
+          fps: 120,
+          hdr: true,
+        },
+      ],
       revision: 3,
     }
 
@@ -292,6 +306,16 @@ describe('coreBridge host protocol', () => {
         appId: 7,
         launchProfileId: '11111111-1111-4111-8111-111111111111',
       }),
+    )
+  })
+
+  it('passes a workspace to native core', async () => {
+    await launchCoreApp('host-1', 7, defaultSettings, '', '55555555-5555-4555-8555-555555555555')
+
+    expect(neutralino.dispatch).toHaveBeenCalledWith(
+      'dev.terra.core',
+      'app.launch',
+      expect.objectContaining({ workspaceId: '55555555-5555-4555-8555-555555555555' }),
     )
   })
 })

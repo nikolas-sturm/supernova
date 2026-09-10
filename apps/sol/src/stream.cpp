@@ -30,6 +30,9 @@ extern "C" {
 #include "logging.h"
 #include "network.h"
 #include "platform/common.h"
+#ifdef _WIN32
+  #include "platform/windows/terra_virtual_display_provider.h"
+#endif
 #include "process.h"
 #include "stream.h"
 #include "sync.h"
@@ -552,6 +555,9 @@ namespace stream {
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
     std::string session_id;  ///< Stable logical Terra session UUID.
+    std::string stream_id;  ///< Unique Terra child-stream UUID.
+    std::string display_id;  ///< Bound display resource UUID, empty when no resource is bound.
+    bool terra {};  ///< Whether this transport belongs to a Terra API session.
     std::string client_uuid;  ///< Persistent UUID of the paired client owning this stream.
     std::string app_uuid;  ///< Stable UUID of the streamed application.
     int legacy_app_id;  ///< Legacy numeric GameStream application ID.
@@ -560,6 +566,7 @@ namespace stream {
     int height;  ///< Negotiated capture height.
     int fps;  ///< Negotiated refresh rate.
     bool hdr;  ///< Whether HDR was requested.
+    bool primary_stream {true};  ///< Whether this transport owns audio and controller roles.
     terra_api::input_permissions_t input_permissions;  ///< Input classes permitted for this stream.
     input::mouse_mode_e profile_mouse_mode {input::mouse_mode_e::any};  ///< Stream-profile mouse-coordinate mode.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
@@ -2249,6 +2256,11 @@ namespace stream {
       return;
     }
 
+    if (!session->primary_stream) {
+      session->shutdown_event->view();
+      return;
+    }
+
     // Enable local prioritization and QoS tagging on audio traffic if requested by the client
     auto address = session->audio.peer.address();
     session->audio.qos = platf::enable_socket_qos(ref->audio_sock.native_handle(), address, session->audio.peer.port(), platf::qos_data_type_e::audio, session->config.audioQosType != 0);
@@ -2371,6 +2383,10 @@ namespace stream {
       std::lock_guard telemetry_lock {session.telemetry_mutex};
       return {
         .id = session.session_id,
+        .stream_id = session.stream_id,
+        .display_id = session.display_id,
+        .terra = session.terra,
+        .primary = session.primary_stream,
         .client_uuid = session.client_uuid,
         .app_uuid = session.app_uuid,
         .legacy_app_id = session.legacy_app_id,
@@ -2476,6 +2492,12 @@ namespace stream {
           display_device::revert_configuration();
         }
 
+#ifdef _WIN32
+        if (!terra::windows::virtual_display::restore_exclusive()) {
+          BOOST_LOG(error) << "Terra MttVDD: failed to restore physical display topology after final stream";
+        }
+#endif
+
         platf::streaming_will_stop();
       }
 
@@ -2552,6 +2574,9 @@ namespace stream {
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
       session->session_id = launch_session.session_id;
+      session->stream_id = launch_session.stream_id;
+      session->display_id = launch_session.display_id;
+      session->terra = launch_session.terra;
       session->client_uuid = launch_session.client_uuid;
       session->app_uuid = launch_session.app_uuid;
       session->legacy_app_id = launch_session.appid;
@@ -2560,6 +2585,7 @@ namespace stream {
       session->height = config.monitor.height;
       session->fps = config.monitor.framerate;
       session->hdr = config.monitor.dynamicRange != 0;
+      session->primary_stream = launch_session.primary_stream;
       session->input_permissions = launch_session.input_permissions;
       session->profile_mouse_mode = launch_session.profile_mouse_mode;
       session->client_cert = launch_session.client_cert;

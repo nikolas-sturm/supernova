@@ -308,6 +308,7 @@ namespace nvhttp {
     std::optional<rtsp_stream::session_info_t> retained_snapshot;  ///< Last complete resource fields used during terminal retention.
     std::optional<std::string> display_id;  ///< Last display resource associated with session runtime.
     std::vector<std::string> peripheral_claim_ids;  ///< Sorted non-terminal claims associated with session runtime.
+    std::string stream_fingerprint;  ///< Last published child-stream membership and state fingerprint.
     bool announced = false;  ///< Whether session.created has been published.
   };
 
@@ -1124,6 +1125,8 @@ namespace nvhttp {
 
     launch_session->id = ++session_id_counter;
     launch_session->session_id = session_id.empty() ? uuid_util::uuid_t::generate().string() : std::move(session_id);
+    launch_session->stream_id = uuid_util::uuid_t::generate().string();
+    launch_session->display_id = get_arg(args, "eclipseDisplayId", "");
     launch_session->client_uuid = client.uuid;
     launch_session->client_cert = client.cert;
     launch_session->client_name = client.name;
@@ -2031,6 +2034,7 @@ namespace nvhttp {
 
     pt::ptree tree;
     bool revert_display_configuration {false};
+    bool restore_exclusive_topology {false};
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -2045,6 +2049,11 @@ namespace nvhttp {
       if (revert_display_configuration) {
         display_device::revert_configuration();
       }
+#ifdef _WIN32
+      if (restore_exclusive_topology) {
+        static_cast<void>(terra::windows::virtual_display::restore_exclusive());
+      }
+#endif
     });
 
     auto args = request->parse_query_string();
@@ -2121,6 +2130,20 @@ namespace nvhttp {
     }
 #endif
 
+    const auto active_transports = rtsp_stream::transport_sessions();
+    const bool terra_transport_active = std::ranges::any_of(active_transports, [](const auto &session) {
+      return session.terra;
+    });
+    const bool legacy_transport_active = std::ranges::any_of(active_transports, [](const auto &session) {
+      return !session.terra;
+    });
+    if ((terra_v1 && legacy_transport_active) || (!terra_v1 && terra_transport_active)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Terra and legacy streams cannot share one host display topology");
+      return;
+    }
+
     bool application_prelaunched = false;
 #ifdef _WIN32
     application_prelaunched = terra_workspace && terra_workspace->sandbox_id.has_value();
@@ -2136,6 +2159,7 @@ namespace nvhttp {
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args, *client);
+    launch_session->terra = terra_v1;
 
     terra_session_binding_t binding;
     if (terra_v1) {
@@ -2185,6 +2209,30 @@ namespace nvhttp {
       // change the active displays.
 #ifdef _WIN32
       std::string display_error;
+      if (terra_v1 && terra_workspace) {
+        std::vector<terra_virtual_display::resource_t> workspace_displays;
+        for (const auto &display_id : terra_workspace->display_ids) {
+          const auto display = terra_virtual_display_manager ? terra_virtual_display_manager->get(display_id) : std::nullopt;
+          if (!display) {
+            workspace_displays.clear();
+            break;
+          }
+          workspace_displays.push_back(*display);
+        }
+        if (workspace_displays.size() != terra_workspace->display_ids.size() || !terra::windows::virtual_display::activate_exclusive(workspace_displays)) {
+          tree.put("root.<xmlattr>.status_code", 503);
+          tree.put("root.<xmlattr>.status_message", "Exclusive virtual display topology could not be activated");
+          tree.put("root.gamesession", 0);
+          terra_destroy_session_sandbox(binding);
+          return;
+        }
+        restore_exclusive_topology = true;
+        launch_session->timeout_cleanup = []() {
+          if (!terra::windows::virtual_display::restore_exclusive()) {
+            BOOST_LOG(error) << "Terra MttVDD: failed to restore physical topology after RTSP launch timeout";
+          }
+        };
+      }
       if (terra_v1 && !terra_apply_launch_display_profile(*client, binding, *launch_session, display_error)) {
         tree.put("root.<xmlattr>.status_code", 422);
         tree.put("root.<xmlattr>.status_message", display_error);
@@ -2192,7 +2240,7 @@ namespace nvhttp {
         terra_destroy_session_sandbox(binding);
         return;
       }
-      if (!terra_v1 || (binding.display_profile_id.empty() && !binding.display_configuration)) {
+      if (!terra_v1 || (!terra_workspace && binding.display_profile_id.empty() && !binding.display_configuration)) {
         display_device::configure_display(config::video, *launch_session);
       }
 #else
@@ -2367,10 +2415,12 @@ namespace nvhttp {
     tree.put("root.gamesession", 1);
     if (terra_v1) {
       tree.put("root.EclipseSessionId", launch_session->session_id);
+      tree.put("root.EclipseStreamId", launch_session->stream_id);
     }
 
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
+    restore_exclusive_topology = false;
   }
 
   /**
@@ -2419,6 +2469,19 @@ namespace nvhttp {
 
     auto args = request->parse_query_string();
     const bool terra_v1 = terra_api::api_v1_requested(get_arg(args, "eclipseApiVersion", ""));
+    const auto active_transports = rtsp_stream::transport_sessions();
+    const bool terra_transport_active = std::ranges::any_of(active_transports, [](const auto &session) {
+      return session.terra;
+    });
+    const bool legacy_transport_active = std::ranges::any_of(active_transports, [](const auto &session) {
+      return !session.terra;
+    });
+    if ((terra_v1 && legacy_transport_active) || (!terra_v1 && terra_transport_active)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Terra and legacy streams cannot share one host display topology");
+      return;
+    }
     if (
       args.find("rikey"s) == std::end(args) ||
       args.find("rikeyid"s) == std::end(args)
@@ -2461,6 +2524,16 @@ namespace nvhttp {
       return;
     }
     const auto tracking = logical_session_id.empty() ? std::nullopt : terra_session_tracking_for(logical_session_id);
+    if (terra_v1) {
+      const auto workspace_id = get_arg(args, "eclipseWorkspaceId", "");
+      const auto display_id = get_arg(args, "eclipseDisplayId", "");
+      if ((!workspace_id.empty() && (!tracking || workspace_id != tracking->binding.workspace_id)) || (!display_id.empty() && !tracking)) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 404);
+        tree.put("root.<xmlattr>.status_message", "Resume workspace or display does not belong to this session");
+        return;
+      }
+    }
     if (tracking && !tracking->binding.launch_profile_id.empty()) {
       const auto profile = terra_profile_manager ? terra_profile_manager->get(terra_profile_actor(*client), tracking->binding.launch_profile_id).profile : std::nullopt;
       if (!profile || profile->configuration.at("resumePolicy") == "deny") {
@@ -2471,6 +2544,7 @@ namespace nvhttp {
       }
     }
     const auto launch_session = make_launch_session(host_audio, args, *client, std::move(logical_session_id));
+    launch_session->terra = terra_v1;
     if (!logical_app_uuid.empty()) {
       launch_session->app_uuid = std::move(logical_app_uuid);
     }
@@ -2579,6 +2653,7 @@ namespace nvhttp {
     tree.put("root.resume", 1);
     if (terra_v1) {
       tree.put("root.EclipseSessionId", launch_session->session_id);
+      tree.put("root.EclipseStreamId", launch_session->stream_id);
     }
   }
 
@@ -2941,6 +3016,7 @@ namespace nvhttp {
     }
     if (terra_workspace_unavailable_reason().empty()) {
       capabilities.emplace_back("workspaces-v1");
+      capabilities.emplace_back("multi-display-streaming-v1");
     }
     if (terra_operation_store && terra_operation_store->available() && terra_sandbox_manager && terra_sandbox_manager->available() && terra::windows::sandbox::health().available) {
       capabilities.emplace_back("sandboxes-v1");
@@ -3120,6 +3196,7 @@ namespace nvhttp {
       {"features", std::move(features)},
       {"limits", {
                    {"sessions", {{"maxActive", 1}}},
+                   {"streaming", {{"maxDisplays", 4}}},
                    {"displays", {{"maxManaged", display_limit}}},
                    {"virtualDisplays", {{"maxActive", virtual_display_limit}}},
                    {"workspaces", {{"maxActive", workspaces_operational ? 1 : 0}}},
@@ -3359,6 +3436,9 @@ namespace nvhttp {
    * @return Direct virtual, workspace, or sandbox display UUID when available.
    */
   std::optional<std::string> terra_session_display_id(const rtsp_stream::session_info_t &session, const terra_session_tracking_t *tracking) {
+    if (!session.display_id.empty()) {
+      return session.display_id;
+    }
     if (tracking && (tracking->state == "stopped" || tracking->state == "failed")) {
       return tracking->display_id;
     }
@@ -3384,14 +3464,6 @@ namespace nvhttp {
         return sandbox->display_ids.front();
       }
     }
-    const auto capture_display = video::capture_display_name();
-    if (!capture_display.empty()) {
-      for (const auto &display : terra::windows::display::enumerate_snapshot(http::unique_id, display_device::enumerate_devices())) {
-        if (display.device_id == capture_display || display.platform_id == capture_display || display.name == capture_display) {
-          return display.resource_uuid;
-        }
-      }
-    }
 #endif
     return tracking ? tracking->display_id : std::nullopt;
   }
@@ -3409,7 +3481,44 @@ namespace nvhttp {
       return value.empty() ? nlohmann::json(nullptr) : nlohmann::json(value);
     };
     const auto updated_at = tracking && tracking->updated_at > 0 ? tracking->updated_at : started_at;
-    const auto display_id = terra_session_display_id(session, tracking);
+    auto display_id = terra_session_display_id(session, tracking);
+    std::vector<std::string> display_ids;
+#ifdef _WIN32
+    if (tracking && !tracking->binding.workspace_id.empty() && terra_workspace_manager) {
+      if (const auto workspace = terra_workspace_manager->get(tracking->binding.workspace_id)) {
+        display_ids = workspace->display_ids;
+      }
+    }
+#endif
+    if (display_ids.empty() && display_id) {
+      display_ids.push_back(*display_id);
+    }
+    if (!display_ids.empty()) {
+      display_id = display_ids.front();
+    }
+    nlohmann::json streams = nlohmann::json::array();
+    auto transports = rtsp_stream::transport_sessions();
+    std::erase_if(transports, [&](const auto &transport) {
+      return transport.id != session.id;
+    });
+    if (transports.empty() && !session.stream_id.empty()) {
+      transports.push_back(session);
+    }
+    const auto primary_transport = std::ranges::find(transports, true, &rtsp_stream::session_info_t::primary);
+    const auto &primary = primary_transport == transports.end() ? session : *primary_transport;
+    for (const auto &transport : transports) {
+      const auto transport_display_id = terra_session_display_id(transport, tracking);
+      streams.push_back({
+        {"id", transport.stream_id},
+        {"displayId", transport_display_id ? nlohmann::json(*transport_display_id) : nlohmann::json(nullptr)},
+        {"primary", transport.primary},
+        {"state", transport.state},
+        {"width", transport.width},
+        {"height", transport.height},
+        {"fps", transport.fps},
+        {"hdr", transport.hdr},
+      });
+    }
     const auto peripheral_claim_ids = tracking && (tracking->state == "stopped" || tracking->state == "failed") ? tracking->peripheral_claim_ids : terra_session_peripheral_claim_ids(session, tracking);
     return {
       {"id", session.id},
@@ -3421,11 +3530,13 @@ namespace nvhttp {
       {"stateReason", std::string {terra_session_reason(session.state)}},
       {"startedAt", started_at},
       {"updatedAt", updated_at},
-      {"width", session.width},
-      {"height", session.height},
-      {"refreshRate", session.fps},
-      {"hdr", session.hdr},
+      {"width", primary.width},
+      {"height", primary.height},
+      {"refreshRate", primary.fps},
+      {"hdr", primary.hdr},
       {"displayId", display_id ? nlohmann::json(*display_id) : nlohmann::json(nullptr)},
+      {"displayIds", display_ids},
+      {"streams", std::move(streams)},
       {"displayProfileId", uuid_or_null(tracking ? tracking->binding.display_profile_id : std::string {})},
       {"streamProfileId", uuid_or_null(tracking ? tracking->binding.stream_profile_id : std::string {})},
       {"launchProfileId", uuid_or_null(tracking ? tracking->binding.launch_profile_id : std::string {})},
@@ -3704,10 +3815,25 @@ namespace nvhttp {
         error_message = "Workspace became unavailable before launch";
         return false;
       }
+      if (!session.display_id.empty() && (!uuid_util::is_valid(session.display_id) || !std::ranges::contains(workspace->display_ids, session.display_id))) {
+        error_message = "Requested display is not attached to this workspace";
+        return false;
+      }
+      const auto selected_display_id = session.display_id.empty() && !workspace->display_ids.empty() ? workspace->display_ids.front() : session.display_id;
+      for (const auto &active : rtsp_stream::transport_sessions()) {
+        if (!selected_display_id.empty() && active.id == session.session_id && active.display_id == selected_display_id) {
+          error_message = "Requested display already has an active child stream";
+          return false;
+        }
+      }
       for (const auto &display_id : workspace->display_ids) {
-        const auto display = terra_virtual_display_manager ? terra_virtual_display_manager->get(display_id) : std::nullopt;
-        if (!display) {
+        if (display_id != selected_display_id) {
           continue;
+        }
+        const auto display = terra_virtual_display_manager ? terra_virtual_display_manager->get(display_id) : std::nullopt;
+        if (!display || display->workspace_id != workspace->id || display->state != terra_virtual_display::state_t::attached) {
+          error_message = "Requested workspace display is not attached or capture-ready";
+          return false;
         }
         const auto device_id = terra::windows::virtual_display::resolve_device_id(display->platform_id);
         if (!device_id) {
@@ -3715,6 +3841,12 @@ namespace nvhttp {
           return false;
         }
         session.capture_output_name = *device_id;
+        session.display_id = display_id;
+        session.primary_stream = display_id == workspace->display_ids.front();
+        session.width = display->actual_mode.width;
+        session.height = display->actual_mode.height;
+        session.fps = static_cast<int>((display->actual_mode.refresh_numerator + display->actual_mode.refresh_denominator / 2) / display->actual_mode.refresh_denominator);
+        session.enable_hdr = display->actual_mode.hdr;
         break;
       }
       if (!workspace->definition.virtual_displays.empty() && session.capture_output_name.empty()) {
@@ -3925,8 +4057,8 @@ namespace nvhttp {
       return session.state == "starting" || session.state == "running" || session.state == "preparing" || session.state == "disconnected";
     });
     auto active_transport = snapshots | std::views::filter([](const auto &session) {
-                                    return session.state == "starting" || session.state == "running";
-                                  });
+                              return session.state == "starting" || session.state == "running";
+                            });
     const bool rates_sampled = transport_sessions > 0 && std::ranges::all_of(active_transport, &rtsp_stream::session_info_t::interval_sampled);
     const std::optional<bool> capture_healthy = !rates_sampled ? std::nullopt : std::optional<bool> {std::ranges::all_of(active_transport, [](const auto &session) {
       return session.state == "running" && session.capture_active;
@@ -9808,6 +9940,7 @@ namespace nvhttp {
       },
       [](const terra_workspaces::preparation_t &request, const std::function<bool(const terra_workspaces::prepared_t &)> &persist) -> std::optional<terra_workspaces::prepared_t> {
         terra_workspaces::prepared_t runtime {true};
+        std::vector<terra_virtual_display::specification_t> display_specifications;
         for (const auto &value : request.definition.virtual_displays) {
           auto specification = terra_virtual_specification(value);
           if (!specification || !terra_virtual_display_manager) {
@@ -9815,16 +9948,16 @@ namespace nvhttp {
             return runtime;
           }
           specification->workspace_id = request.workspace_id;
-          const auto created = terra_virtual_display_manager->create(request.owner_client_uuid, *specification);
-          if (created.status != terra_virtual_display::status_t::success || !created.resource) {
+          display_specifications.push_back(std::move(*specification));
+        }
+        if (!display_specifications.empty()) {
+          const auto created = terra_virtual_display_manager->create_batch(request.owner_client_uuid, display_specifications);
+          if (created.status != terra_virtual_display::status_t::success) {
             runtime.success = false;
             return runtime;
           }
-          runtime.display_ids.push_back(created.resource->id);
-          const auto attached = terra_virtual_display_manager->attach(created.resource->id, created.resource->revision, {.workspace_id = request.workspace_id});
-          if (attached.status != terra_virtual_display::status_t::success) {
-            runtime.success = false;
-            return runtime;
+          for (const auto &display : created.resources) {
+            runtime.display_ids.push_back(display.id);
           }
           if (!persist(runtime)) {
             runtime.success = false;
@@ -10703,6 +10836,14 @@ namespace nvhttp {
         {
           std::lock_guard event_order_lock {terra_session_event_mutex};
           const auto snapshots = terra_session_snapshots(false);
+          std::map<std::string, std::vector<std::string>, std::less<>> transport_states;
+          for (const auto &transport : rtsp_stream::transport_sessions()) {
+            transport_states[transport.id].push_back(transport.stream_id + '\0' + transport.display_id + '\0' + transport.state);
+          }
+          for (auto &[id, states] : transport_states) {
+            (void) id;
+            std::ranges::sort(states);
+          }
           const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
           std::string logical_session_id;
           {
@@ -10730,6 +10871,7 @@ namespace nvhttp {
                 entry->second.updated_at = now_ms;
                 entry->second.display_id = terra_session_display_id(session, &entry->second);
                 entry->second.peripheral_claim_ids = terra_session_peripheral_claim_ids(session, &entry->second);
+                entry->second.stream_fingerprint = nlohmann::json(transport_states[session.id]).dump();
                 entry->second.announced = true;
                 ++terra_session_collection_revision;
                 pending_events.emplace_back(
@@ -10752,6 +10894,11 @@ namespace nvhttp {
               const auto peripheral_claim_ids = terra_session_peripheral_claim_ids(session, &entry->second);
               if (entry->second.peripheral_claim_ids != peripheral_claim_ids) {
                 entry->second.peripheral_claim_ids = peripheral_claim_ids;
+                session_changed = true;
+              }
+              const auto stream_fingerprint = nlohmann::json(transport_states[session.id]).dump();
+              if (entry->second.stream_fingerprint != stream_fingerprint) {
+                entry->second.stream_fingerprint = stream_fingerprint;
                 session_changed = true;
               }
               if (session_changed) {
@@ -10915,6 +11062,11 @@ namespace nvhttp {
     terra_close_all_peripheral_channels();
     terra_operation_pool.stop();
     terra_operation_pool.join();
+#ifdef _WIN32
+    if (!terra::windows::virtual_display::restore_exclusive()) {
+      BOOST_LOG(error) << "Terra MttVDD: failed to restore physical display topology during shutdown";
+    }
+#endif
     {
       std::lock_guard stream_lock {terra_event_stream_mutex};
       terra_event_streams.clear();

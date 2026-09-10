@@ -9,6 +9,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // local includes
 #include "src/terra_virtual_display.h"
@@ -28,6 +29,21 @@ namespace terra::windows::virtual_display {
    * @return `true` when provider, inventory, and every connector mapping are usable.
    */
   [[nodiscard]] bool available();
+
+  /**
+   * @brief Activate only requested managed virtual displays and durably retain host topology.
+   *
+   * @param displays Managed displays and exact requested configurations to keep active.
+   * @return True after exact virtual-only topology is verified.
+   */
+  [[nodiscard]] bool activate_exclusive(const std::vector<terra_virtual_display::resource_t> &displays);
+
+  /**
+   * @brief Restore exact topology retained before exclusive Terra streaming.
+   *
+   * @return True when restoration completed or no rollback journal exists.
+   */
+  [[nodiscard]] bool restore_exclusive();
 
   /**
    * @brief Build production MttVDD and libdisplaydevice callbacks.

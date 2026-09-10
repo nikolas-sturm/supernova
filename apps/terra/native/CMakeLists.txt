@@ -221,6 +221,8 @@ add_executable(
   src/network_route.cpp
   src/stream_statistics.cpp
   src/stream_session.cpp
+  src/stream_worker_protocol.cpp
+  src/stream_worker_process.cpp
   src/video_renderer.cpp
   src/wake_on_lan.cpp
 )
@@ -336,6 +338,7 @@ if(BUILD_TESTING)
     src/network_route.cpp
     src/stream_session.cpp
     src/stream_statistics.cpp
+    src/stream_worker_protocol.cpp
   )
   target_include_directories(
     terra-stream-session-test
@@ -343,7 +346,7 @@ if(BUILD_TESTING)
       src
       "${MOONLIGHT_COMMON_ROOT}/src"
   )
-  target_link_libraries(terra-stream-session-test PRIVATE Threads::Threads)
+  target_link_libraries(terra-stream-session-test PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
   if(MSVC)
     target_compile_options(terra-stream-session-test PRIVATE /W4 /permissive- /EHsc)
   else()

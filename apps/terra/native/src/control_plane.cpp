@@ -23,6 +23,7 @@
 #include "input_forwarder.h"
 #include "sse_decoder.h"
 #include "stream_session.h"
+#include "stream_worker_process.h"
 #include "video_renderer.h"
 #include "wake_on_lan.h"
 
@@ -270,6 +271,7 @@ ControlPlane::~ControlPlane() {
     if (disconnectThread_.joinable()) disconnectThread_.join();
 
     std::shared_ptr<StreamSession> transport;
+    std::vector<std::shared_ptr<StreamWorkerProcess>> streamWorkers;
     std::unordered_map<std::string, std::jthread> apiEventThreads;
     {
         std::scoped_lock lock{mutex_};
@@ -281,10 +283,12 @@ ControlPlane::~ControlPlane() {
         streamStatisticsListener_ = {};
         apiResourceListener_ = {};
         transport = std::exchange(transport_, {});
+        streamWorkers = std::exchange(streamWorkers_, {});
         session_.reset();
     }
     apiEventThreads.clear();
     if (transport) transport->stop();
+    for (const auto& worker : streamWorkers) worker->stop();
 }
 
 std::vector<HostRecord> ControlPlane::hosts() const {
@@ -643,8 +647,9 @@ nlohmann::json ControlPlane::mutateApiResource(const std::string& hostId, const 
 }
 
 SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
-                                      const StreamSettings& settings,
-                                      const std::string& launchProfileId) {
+                                       const StreamSettings& settings,
+                                       const std::string& launchProfileId,
+                                       const std::string& workspaceId) {
     std::scoped_lock sessionLock{sessionMutex_};
     HostRecord current;
     GameStreamApp selected;
@@ -654,7 +659,7 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
     std::function<void(const SessionUpdate&)> listener;
     {
         std::scoped_lock lock{mutex_};
-        if (transport_ || session_) {
+        if (transport_ || !streamWorkers_.empty() || session_) {
             throw std::runtime_error("Terra already has an active stream. Stop it "
                                      "before launching again.");
         }
@@ -720,8 +725,61 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
     }
     int videoFormat = VIDEO_FORMAT_H264;
     LaunchResult launched;
+    std::vector<std::string> displayIds;
+    std::vector<StreamSettings> displaySettings;
     auto effectiveSettings = settings;
+    const auto selectChildVideoFormat = [&](const StreamSettings& childSettings) {
+        auto codecModeSupport = current.serverCodecModeSupport;
+        if (current.maxLumaPixelsHevc == 0) {
+            codecModeSupport &=
+                ~(SCM_HEVC | SCM_HEVC_MAIN10 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444);
+        }
+        const auto format =
+            selectVideoFormat(childSettings.videoCodec, codecModeSupport, childSettings.enableHdr,
+                              childSettings.enableYuv444);
+        const auto requestedPixels = static_cast<std::uint64_t>(childSettings.width) *
+                                     static_cast<std::uint64_t>(childSettings.height);
+        if ((format & VIDEO_FORMAT_MASK_H265) != 0 &&
+            requestedPixels > current.maxLumaPixelsHevc) {
+            throw std::runtime_error("Requested resolution exceeds this host's "
+                                     "reported HEVC encoder limit.");
+        }
+        return format;
+    };
     try {
+        if (!workspaceId.empty()) {
+            if (current.apiVersion != 1 ||
+                !std::ranges::contains(current.capabilities, "multi-display-streaming-v1")) {
+                throw std::runtime_error("Host does not support multi-display workspace streaming.");
+            }
+            const auto response = gameStream_->apiRequest(
+                current.address, current.apiPort, current.serverCertificate, "GET",
+                "/eclipse/v1/workspaces/" + workspaceId);
+            const auto& workspace = response.body.at("workspace");
+            displayIds = workspace.at("displayIds").get<std::vector<std::string>>();
+            const auto& virtualDisplays = workspace.at("virtualDisplays");
+            if (displayIds.empty() || displayIds.size() > 4 || !virtualDisplays.is_array() ||
+                virtualDisplays.size() != displayIds.size() ||
+                (workspace.at("state") != "ready" && workspace.at("state") != "active")) {
+                throw std::runtime_error("Workspace is not ready with one to four displays.");
+            }
+            for (const auto& display : virtualDisplays) {
+                const auto& mode = display.at("mode");
+                const auto refreshNumerator = mode.at("refreshNumerator").get<int>();
+                const auto refreshDenominator = mode.at("refreshDenominator").get<int>();
+                if (refreshNumerator <= 0 || refreshDenominator <= 0) {
+                    throw std::runtime_error("Workspace display refresh rate is invalid.");
+                }
+                auto childSettings = settings;
+                childSettings.width = mode.at("width").get<int>();
+                childSettings.height = mode.at("height").get<int>();
+                childSettings.fps =
+                    (refreshNumerator + refreshDenominator / 2) / refreshDenominator;
+                childSettings.enableHdr = display.at("hdr").get<bool>();
+                displaySettings.push_back(std::move(childSettings));
+            }
+            effectiveSettings = displaySettings.front();
+        }
         if (effectiveSettings.audioConfig != AudioConfig::stereo &&
             !AudioRenderer::supportsOutputChannels(
                 audioChannelCount(effectiveSettings.audioConfig))) {
@@ -741,25 +799,12 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                 }
             }
         }
-        auto codecModeSupport = current.serverCodecModeSupport;
-        if (current.maxLumaPixelsHevc == 0) {
-            codecModeSupport &=
-                ~(SCM_HEVC | SCM_HEVC_MAIN10 | SCM_HEVC_REXT8_444 | SCM_HEVC_REXT10_444);
-        }
-        videoFormat =
-            selectVideoFormat(effectiveSettings.videoCodec, codecModeSupport,
-                              effectiveSettings.enableHdr, effectiveSettings.enableYuv444);
-        const auto requestedPixels = static_cast<std::uint64_t>(effectiveSettings.width) *
-                                     static_cast<std::uint64_t>(effectiveSettings.height);
-        if ((videoFormat & VIDEO_FORMAT_MASK_H265) != 0 &&
-            requestedPixels > current.maxLumaPixelsHevc) {
-            throw std::runtime_error("Requested resolution exceeds this host's "
-                                     "reported HEVC encoder limit.");
-        }
+        videoFormat = selectChildVideoFormat(effectiveSettings);
         launched = gameStream_->launch(current.address, current.httpsPort, clientId,
-                                       current.serverCertificate, appId, resume, effectiveSettings,
-                                       &launchCancellationRequested_, selected.uuid,
-                                       launchProfileId);
+                                        current.serverCertificate, appId, resume, effectiveSettings,
+                                        &launchCancellationRequested_, selected.uuid,
+                                        launchProfileId, workspaceId,
+                                        displayIds.empty() ? std::string{} : displayIds.front(), true);
     } catch (...) {
         const auto failure = std::current_exception();
         const bool cancelled = launchCancellationRequested_.load();
@@ -809,6 +854,96 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
             saveLocked();
         }
         session_ = session;
+    }
+
+    if (!workspaceId.empty()) {
+        std::vector<std::shared_ptr<StreamWorkerProcess>> workers;
+        try {
+            for (std::size_t index = 0; index < displayIds.size(); ++index) {
+                auto childSettings = index == 0 ? effectiveSettings : displaySettings[index];
+                if (index != 0) {
+                    childSettings.audioConfig = effectiveSettings.audioConfig;
+                    childSettings.input.forceGamepad = false;
+                    childSettings.input.backgroundGamepad = false;
+                }
+                const auto childVideoFormat = selectChildVideoFormat(childSettings);
+                auto childLaunch =
+                    index == 0
+                        ? launched
+                        : gameStream_->launch(
+                              current.address, current.httpsPort, clientId,
+                              current.serverCertificate, appId, true, childSettings,
+                              &launchCancellationRequested_, selected.uuid, launchProfileId,
+                              workspaceId, displayIds[index], false);
+                auto worker = std::make_shared<StreamWorkerProcess>(
+                    [this, generation, hostId, appId, appName = selected.name,
+                     resumed = childLaunch.resumed,
+                     quitAppAfter = settings.quitAppAfter](const nlohmann::json& event) {
+                        const auto type = event.value("type", "");
+                        if (type == "status") {
+                            std::function<void(const SessionUpdate&)> listener;
+                            {
+                                std::scoped_lock lock{mutex_};
+                                if (sessionGeneration_ != generation || !session_) return;
+                                listener = sessionListener_;
+                            }
+                            if (listener) {
+                                listener({.hostId = hostId,
+                                          .appId = appId,
+                                          .appName = appName,
+                                          .state = event.value("state", "connected"),
+                                          .message = event.value("message", ""),
+                                          .resumed = resumed});
+                            }
+                        } else if (type == "disconnected" || type == "error") {
+                            requestSessionDisconnect(
+                                generation, hostId, appId, appName, resumed,
+                                {type == "error" ? "error" : event.value("state", "stopped"),
+                                 event.value("message", "Stream worker stopped.")},
+                                event.value("hostEnded", false), quitAppAfter);
+                        }
+                    });
+                worker->start({.hostId = hostId,
+                               .appId = appId,
+                               .appName = selected.name,
+                               .address = GameStreamClient::streamHost(current.address),
+                               .appVersion = current.appVersion,
+                               .gfeVersion = current.gfeVersion,
+                               .serverCodecModeSupport = current.serverCodecModeSupport,
+                               .videoFormat = childVideoFormat,
+                               .settings = childSettings,
+                               .launch = std::move(childLaunch),
+                               .audioEnabled = index == 0,
+                               .controllerEnabled = index == 0});
+                if (!worker->waitConnected(std::chrono::seconds{30})) {
+                    throw std::runtime_error("Stream worker failed to connect.");
+                }
+                workers.push_back(std::move(worker));
+            }
+            {
+                std::scoped_lock lock{mutex_};
+                if (sessionGeneration_ != generation || !session_) {
+                    throw std::runtime_error("Multi-display launch was cancelled.");
+                }
+                streamWorkers_ = workers;
+            }
+        } catch (...) {
+            for (const auto& worker : workers) worker->stop();
+            try {
+                gameStream_->cancel(current.address, current.httpsPort, clientId,
+                                    current.serverCertificate);
+            } catch (...) {
+            }
+            {
+                std::scoped_lock lock{mutex_};
+                streamWorkers_.clear();
+                session_.reset();
+                sessionStopRequested_ = false;
+                ++sessionGeneration_;
+            }
+            throw;
+        }
+        return session;
     }
 
     auto transport = std::make_shared<StreamSession>(
@@ -947,6 +1082,7 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
     HostRecord current;
     std::string clientId;
     std::shared_ptr<StreamSession> transport;
+    std::vector<std::shared_ptr<StreamWorkerProcess>> streamWorkers;
     std::uint64_t generation = 0;
     bool ownsSession = false;
     {
@@ -967,11 +1103,14 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
             sessionStopRequested_ = true;
             launchCancellationRequested_.store(true);
             transport = transport_;
+            streamWorkers = streamWorkers_;
         }
     }
 
     if (transport) {
         transport->requestStop();
+    } else if (!streamWorkers.empty()) {
+        for (const auto& worker : streamWorkers) worker->stop();
     } else if (ownsSession) {
         LiInterruptConnection();
     }
@@ -986,6 +1125,7 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
         std::scoped_lock lock{mutex_};
         if (ownsSession && sessionGeneration_ == generation) {
             if (!transport || transport_ == transport) transport_.reset();
+            streamWorkers_.clear();
             session_.reset();
             sessionStopRequested_ = false;
             ++sessionGeneration_;
@@ -1079,6 +1219,7 @@ void ControlPlane::cleanupSessions() {
 void ControlPlane::finishSessionDisconnect(const DisconnectRequest& request) {
     std::scoped_lock sessionLock{sessionMutex_};
     std::shared_ptr<StreamSession> transport;
+    std::vector<std::shared_ptr<StreamWorkerProcess>> streamWorkers;
     SessionRecord endingSession;
     HostRecord current;
     std::string clientId;
@@ -1087,6 +1228,7 @@ void ControlPlane::finishSessionDisconnect(const DisconnectRequest& request) {
         std::scoped_lock lock{mutex_};
         if (sessionGeneration_ != request.generation) return;
         transport = transport_;
+        streamWorkers = streamWorkers_;
         endingSession = session_.value_or(SessionRecord{
             .hostId = request.hostId,
             .appId = request.appId,
@@ -1107,6 +1249,7 @@ void ControlPlane::finishSessionDisconnect(const DisconnectRequest& request) {
         clientId = clientId_;
     }
     if (transport) transport->stop();
+    for (const auto& worker : streamWorkers) worker->stop();
 
     bool hostEnded = request.hostEnded;
     std::string state = request.state;
@@ -1130,6 +1273,7 @@ void ControlPlane::finishSessionDisconnect(const DisconnectRequest& request) {
         std::scoped_lock lock{mutex_};
         if (sessionGeneration_ != request.generation) return;
         if (!transport || transport_ == transport) transport_.reset();
+        streamWorkers_.clear();
         session_.reset();
         sessionStopRequested_ = false;
         ++sessionGeneration_;

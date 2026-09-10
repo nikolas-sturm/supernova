@@ -21,6 +21,7 @@
 
 #include "control_plane.h"
 #include "mdns_discovery.h"
+#include "stream_worker_protocol.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -298,6 +299,9 @@ void broadcast(ix::WebSocket& socket, const ExtensionContext& context, const std
 
 int main(int argc, char** argv) {
     try {
+        if (argc > 1 && std::string_view{argv[1]} == "--stream-worker") {
+            return terra::runStreamWorker();
+        }
         configureDpiAwareness();
         const std::string input{std::istreambuf_iterator<char>{std::cin},
                                 std::istreambuf_iterator<char>{}};
@@ -599,13 +603,14 @@ int main(int argc, char** argv) {
         });
 
         const auto launchApp = [&](const std::string& hostId, int appId,
-                                    const terra::StreamSettings& settings,
-                                    const std::string& launchProfileId) {
+                                     const terra::StreamSettings& settings,
+                                     const std::string& launchProfileId,
+                                     const std::string& workspaceId) {
             std::scoped_lock lock{workerMutex};
-            workers.emplace_back([&, hostId, appId, settings, launchProfileId] {
+            workers.emplace_back([&, hostId, appId, settings, launchProfileId, workspaceId] {
                 try {
-                    static_cast<void>(
-                        controlPlane.launchApp(hostId, appId, settings, launchProfileId));
+                    static_cast<void>(controlPlane.launchApp(hostId, appId, settings,
+                                                             launchProfileId, workspaceId));
                     if (!closed) {
                         publishHosts();
                     }
@@ -761,9 +766,10 @@ int main(int argc, char** argv) {
                         try {
                             const auto& data = payload.at("data");
                             launchApp(data.at("hostId").get<std::string>(),
-                                      data.at("appId").get<int>(),
-                                      parseStreamSettings(data.at("settings")),
-                                      data.value("launchProfileId", ""));
+                                       data.at("appId").get<int>(),
+                                       parseStreamSettings(data.at("settings")),
+                                       data.value("launchProfileId", ""),
+                                       data.value("workspaceId", ""));
                         } catch (const std::exception& exception) {
                             publishHostError(exception.what());
                         }

@@ -608,6 +608,9 @@ namespace rtsp_stream {
           auto discarded = launch_event.pop(0s);
           if (discarded) {
             BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+            if (discarded->timeout_cleanup) {
+              discarded->timeout_cleanup();
+            }
           }
         }
       });
@@ -651,13 +654,42 @@ namespace rtsp_stream {
       std::map<std::string, session_info_t, std::less<>> snapshots;
       for (const auto &slot : *_session_slots) {
         auto snapshot = stream::session::snapshot(*slot);
-        snapshots.insert_or_assign(snapshot.id, std::move(snapshot));
+        const auto found = snapshots.find(snapshot.id);
+        if (found == snapshots.end()) {
+          snapshots.emplace(snapshot.id, std::move(snapshot));
+          continue;
+        }
+        const auto state_rank = [](const std::string_view state) {
+          return state == "stopping" ? 3 : state == "starting" ? 2 :
+                                         state == "running"    ? 1 :
+                                                                 0;
+        };
+        const auto state = state_rank(snapshot.state) > state_rank(found->second.state) ? snapshot.state : found->second.state;
+        if (snapshot.primary) {
+          found->second = std::move(snapshot);
+        }
+        found->second.state = state;
       }
       std::vector<session_info_t> result;
       result.reserve(snapshots.size());
       for (auto &[id, snapshot] : snapshots) {
         static_cast<void>(id);
         result.emplace_back(std::move(snapshot));
+      }
+      return result;
+    }
+
+    /**
+     * @brief Return immutable snapshots for every active transport.
+     *
+     * @return One snapshot per stream slot.
+     */
+    std::vector<session_info_t> transport_sessions() {
+      auto lg = _session_slots.lock();
+      std::vector<session_info_t> result;
+      result.reserve(_session_slots->size());
+      for (const auto &slot : *_session_slots) {
+        result.emplace_back(stream::session::snapshot(*slot));
       }
       return result;
     }
@@ -815,6 +847,10 @@ namespace rtsp_stream {
   std::vector<session_info_t> sessions() {
     server.clear(false);
     return server.sessions();
+  }
+
+  std::vector<session_info_t> transport_sessions() {
+    return server.transport_sessions();
   }
 
   void sample_telemetry() {

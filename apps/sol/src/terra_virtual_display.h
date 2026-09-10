@@ -175,6 +175,14 @@ namespace terra_virtual_display {
   };
 
   /**
+   * @brief Atomic multi-display mutation output.
+   */
+  struct batch_result_t {
+    status_t status;  ///< Mutation result.
+    std::vector<resource_t> resources;  ///< Created resources in specification order.
+  };
+
+  /**
    * @brief Collection listing output.
    */
   struct list_t {
@@ -221,6 +229,14 @@ namespace terra_virtual_display {
      * @return Mutation result.
      */
     result_t create(const std::string &owner_client_uuid, const specification_t &specification);
+    /**
+     * @brief Create one complete workspace display layout atomically.
+     *
+     * @param owner_client_uuid Canonical owner UUID.
+     * @param specifications One to four desired displays.
+     * @return Batch mutation result with no resources on failure.
+     */
+    batch_result_t create_batch(const std::string &owner_client_uuid, const std::vector<specification_t> &specifications);
     /**
      * @brief Find resource.
      *

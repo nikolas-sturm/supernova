@@ -679,6 +679,7 @@ namespace video {
    */
   struct capture_thread_sync_ctx_t {
     encode_session_ctx_queue_t encode_session_ctx_queue {30};  ///< Encode session ctx queue.
+    std::jthread capture_thread;  ///< Output-specific synchronous capture thread.
   };
 
   /**
@@ -708,9 +709,67 @@ namespace video {
    */
   void end_capture_async(capture_thread_async_ctx_t &ctx);
 
-  // Keep a reference counter to ensure the capture thread only runs when other threads have a reference to the capture thread
-  auto capture_thread_async = safe::make_shared<capture_thread_async_ctx_t>(start_capture_async, end_capture_async);  ///< Capture thread async.
-  auto capture_thread_sync = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync, end_capture_sync);  ///< Capture thread sync.
+  std::recursive_mutex capture_pipeline_mutex;  ///< Serializes output-keyed pipeline startup and teardown.
+  std::map<std::string, std::weak_ptr<capture_thread_async_ctx_t>, std::less<>> capture_async_pipelines;  ///< Shared asynchronous pipelines by output.
+  std::map<std::string, std::weak_ptr<capture_thread_sync_ctx_t>, std::less<>> capture_sync_pipelines;  ///< Shared synchronous pipelines by output.
+
+  /**
+   * @brief Acquire a shared asynchronous capture pipeline for one explicit output.
+   *
+   * @param output_name Requested platform output name.
+   * @return Running pipeline, or no value on startup failure.
+   */
+  std::shared_ptr<capture_thread_async_ctx_t> async_pipeline(const std::string &output_name) {
+    const auto requested_output = output_name.empty() ? config::video.output_name : output_name;
+    auto key = display_device::map_output_name(requested_output);
+    if (key.empty()) {
+      key = requested_output;
+    }
+    std::lock_guard lock {capture_pipeline_mutex};
+    if (auto existing = capture_async_pipelines[key].lock()) {
+      return existing;
+    }
+    auto pipeline = std::shared_ptr<capture_thread_async_ctx_t>(new capture_thread_async_ctx_t, [key](auto *context) {
+      std::lock_guard lock {capture_pipeline_mutex};
+      end_capture_async(*context);
+      capture_async_pipelines.erase(key);
+      delete context;
+    });
+    if (start_capture_async(*pipeline)) {
+      return {};
+    }
+    capture_async_pipelines[key] = pipeline;
+    return pipeline;
+  }
+
+  /**
+   * @brief Acquire a shared synchronous capture pipeline for one explicit output.
+   *
+   * @param output_name Requested platform output name.
+   * @return Running pipeline, or no value on startup failure.
+   */
+  std::shared_ptr<capture_thread_sync_ctx_t> sync_pipeline(const std::string &output_name) {
+    const auto requested_output = output_name.empty() ? config::video.output_name : output_name;
+    auto key = display_device::map_output_name(requested_output);
+    if (key.empty()) {
+      key = requested_output;
+    }
+    std::lock_guard lock {capture_pipeline_mutex};
+    if (auto existing = capture_sync_pipelines[key].lock()) {
+      return existing;
+    }
+    auto pipeline = std::shared_ptr<capture_thread_sync_ctx_t>(new capture_thread_sync_ctx_t, [key](auto *context) {
+      std::lock_guard lock {capture_pipeline_mutex};
+      end_capture_sync(*context);
+      capture_sync_pipelines.erase(key);
+      delete context;
+    });
+    if (start_capture_sync(*pipeline)) {
+      return {};
+    }
+    capture_sync_pipelines[key] = pipeline;
+    return pipeline;
+  }
 
 #ifdef _WIN32
   /**
@@ -1448,13 +1507,6 @@ namespace video {
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
-  std::mutex capture_display_mutex;  ///< Protects selected capture display identity.
-  std::string selected_capture_display;  ///< Platform display selected by active capture pipeline.
-
-  std::string capture_display_name() {
-    std::lock_guard lock {capture_display_mutex};
-    return selected_capture_display;
-  }
 
   /**
    * @brief Recreate a display capture object after a capture failure.
@@ -1470,8 +1522,6 @@ namespace video {
       disp.reset();
       disp = platf::display(type, display_name, config);
       if (disp) {
-        std::lock_guard lock {capture_display_mutex};
-        selected_capture_display = display_name;
         break;
       }
 
@@ -1588,10 +1638,6 @@ namespace video {
       return;
     }
     auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
-    if (disp) {
-      std::lock_guard lock {capture_display_mutex};
-      selected_capture_display = display_names[display_p];
-    }
     if (!disp) {
       return;
     }
@@ -1733,18 +1779,10 @@ namespace video {
             artificial_reinit = true;
             return false;
           }
-          std::vector<std::string> requested_displays;
-          int requested_display = -1;
-          refresh_displays(encoder.platform_formats->dev_type, requested_displays, requested_display, capture_ctx.config.output_name);
-          if (requested_display < 0 || requested_display >= static_cast<int>(requested_displays.size()) || requested_displays[requested_display] != display_names[display_p]) {
-            BOOST_LOG(error) << "Concurrent streams requesting different displays are unsupported"sv;
-            capture_ctx.images->stop();
-          } else {
-            capture_ctxs.emplace_back(std::move(capture_ctx));
-          }
+          capture_ctxs.emplace_back(std::move(capture_ctx));
         }
 
-        if (switch_display_event->peek()) {
+        if (capture_ctxs.front().config.output_name.empty() && switch_display_event->peek()) {
           artificial_reinit = true;
           return false;
         }
@@ -1806,7 +1844,7 @@ namespace video {
               }
 
               // Process any pending display switch with the new list of displays
-              if (switch_display_event->peek()) {
+              if (capture_ctxs.front().config.output_name.empty() && switch_display_event->peek()) {
                 display_p = std::clamp(*switch_display_event->pop(), 0, static_cast<int>(display_names.size()) - 1);
               }
 
@@ -2749,7 +2787,7 @@ namespace video {
       }
 
       // Process any pending display switch with the new list of displays
-      if (switch_display_event->peek()) {
+      if (synced_session_ctxs.front()->config.output_name.empty() && switch_display_event->peek()) {
         display_p = std::clamp(*switch_display_event->pop(), 0, static_cast<int>(display_names.size()) - 1);
       }
 
@@ -2786,16 +2824,6 @@ namespace video {
           auto encode_session_ctx = encode_session_ctx_queue.pop();
           if (!encode_session_ctx) {
             return false;
-          }
-
-          std::vector<std::string> requested_displays;
-          int requested_display = -1;
-          refresh_displays(encoder.platform_formats->dev_type, requested_displays, requested_display, encode_session_ctx->config.output_name);
-          if (requested_display < 0 || requested_display >= static_cast<int>(requested_displays.size()) || requested_displays[requested_display] != display_names[display_p]) {
-            BOOST_LOG(error) << "Concurrent streams requesting different displays are unsupported"sv;
-            encode_session_ctx->shutdown_event->raise(true);
-            encode_session_ctx->join_event->raise(true);
-            continue;
           }
 
           synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*encode_session_ctx)));
@@ -2867,7 +2895,7 @@ namespace video {
           ++pos;
         })
 
-        if (switch_display_event->peek()) {
+        if (synced_session_ctxs.front()->config.output_name.empty() && switch_display_event->peek()) {
           ec = platf::capture_e::reinit;
           return false;
         }
@@ -2898,12 +2926,10 @@ namespace video {
   /**
    * @brief Run synchronous capture and encode work on the capture thread.
    */
-  void captureThreadSync() {
-    auto ref = capture_thread_sync.ref();
-
+  void captureThreadSync(capture_thread_sync_ctx_t &pipeline) {
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;
 
-    auto &ctx = ref->encode_session_ctx_queue;
+    auto &ctx = pipeline.encode_session_ctx_queue;
     auto lg = util::fail_guard([&]() {
       ctx.stop();
 
@@ -2947,14 +2973,14 @@ namespace video {
       shutdown_event->raise(true);
     });
 
-    auto ref = capture_thread_async.ref();
-    if (!ref) {
+    auto pipeline = async_pipeline(config.output_name);
+    if (!pipeline) {
       return;
     }
 
-    ref->capture_ctx_queue->raise(capture_ctx_t {images, config, stream::session::capture_telemetry(*static_cast<stream::session_t *>(channel_data))});
+    pipeline->capture_ctx_queue->raise(capture_ctx_t {images, config, stream::session::capture_telemetry(*static_cast<stream::session_t *>(channel_data))});
 
-    if (!ref->capture_ctx_queue->running()) {
+    if (!pipeline->capture_ctx_queue->running()) {
       return;
     }
 
@@ -2968,19 +2994,19 @@ namespace video {
 
     while (!shutdown_event->peek() && images->running()) {
       // Wait for the main capture event when the display is being reinitialized
-      if (ref->reinit_event.peek()) {
+      if (pipeline->reinit_event.peek()) {
         std::this_thread::sleep_for(20ms);
         continue;
       }
       // Wait for the display to be ready
       std::shared_ptr<platf::display_t> display;
       {
-        auto lg = ref->display_wp.lock();
-        if (ref->display_wp->expired()) {
+        auto lg = pipeline->display_wp.lock();
+        if (pipeline->display_wp->expired()) {
           continue;
         }
 
-        display = ref->display_wp->lock();
+        display = pipeline->display_wp->lock();
       }
 
       auto &encoder = *chosen_encoder;
@@ -3011,8 +3037,8 @@ namespace video {
         config,
         display,
         std::move(encode_device),
-        ref->reinit_event,
-        *ref->encoder_p,
+        pipeline->reinit_event,
+        *pipeline->encoder_p,
         channel_data
       );
     }
@@ -3039,8 +3065,11 @@ namespace video {
       capture_async(std::move(mail), config, channel_data);
     } else {
       safe::signal_t join_event;
-      auto ref = capture_thread_sync.ref();
-      ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
+      auto pipeline = sync_pipeline(config.output_name);
+      if (!pipeline) {
+        return;
+      }
+      pipeline->encode_session_ctx_queue.raise(sync_session_ctx_t {
         &join_event,
         mail->event<bool>(mail::shutdown),
         mail::man->queue<packet_t>(mail::video_packets),
@@ -3742,7 +3771,7 @@ namespace video {
    * @brief Start capture sync.
    */
   int start_capture_sync(capture_thread_sync_ctx_t &ctx) {
-    std::jthread {&captureThreadSync}.detach();
+    ctx.capture_thread = std::jthread {captureThreadSync, std::ref(ctx)};
     return 0;
   }
 
@@ -3750,6 +3779,8 @@ namespace video {
    * @brief Stop capture sync processing.
    */
   void end_capture_sync(capture_thread_sync_ctx_t &ctx) {
+    ctx.encode_session_ctx_queue.stop();
+    ctx.capture_thread.join();
   }
 
   /**

@@ -21,8 +21,10 @@
 #include <windows.h>
 
 // lib includes
+#include <display_device/windows/json.h>
 #include <display_device/windows/win_api_layer.h>
 #include <display_device/windows/win_display_device.h>
+#include <nlohmann/json.hpp>
 
 // local includes
 #include "mttvdd.h"
@@ -41,11 +43,176 @@ namespace terra::windows::virtual_display {
     /** @brief Exact Windows display state retained for failed mutation rollback. */
     struct rollback_state_t {
       std::mutex mutex;  ///< Protects captured state.
+      std::filesystem::path path;  ///< Durable crash-recovery journal path.
       std::optional<display_device::ActiveTopology> topology;  ///< Active topology before mutation.
       std::optional<std::string> primary;  ///< Primary display device ID before mutation.
       std::map<std::string, DEVMODEA, std::less<>> modes;  ///< Exact active display modes and positions by stable device ID.
       display_device::HdrStateMap hdr_states;  ///< HDR state by stable device ID.
+      bool recovery_failed {};  ///< Whether stale topology recovery must succeed before new activation.
     };
+
+    std::shared_ptr<rollback_state_t> exclusive_rollback;  ///< Process-wide Terra exclusive-topology state.
+
+    /** @brief Serialize one retained Win32 mode. */
+    nlohmann::json mode_json(const DEVMODEA &mode) {
+      return {{"x", mode.dmPosition.x}, {"y", mode.dmPosition.y}, {"width", mode.dmPelsWidth}, {"height", mode.dmPelsHeight}, {"bitsPerPel", mode.dmBitsPerPel}, {"frequency", mode.dmDisplayFrequency}, {"orientation", mode.dmDisplayOrientation}, {"flags", mode.dmDisplayFlags}, {"fields", mode.dmFields}};
+    }
+
+    /** @brief Deserialize one retained Win32 mode. */
+    DEVMODEA parse_mode(const nlohmann::json &value) {
+      DEVMODEA mode {.dmSize = sizeof(DEVMODEA)};
+      mode.dmPosition.x = value.at("x").get<LONG>();
+      mode.dmPosition.y = value.at("y").get<LONG>();
+      mode.dmPelsWidth = value.at("width").get<DWORD>();
+      mode.dmPelsHeight = value.at("height").get<DWORD>();
+      mode.dmBitsPerPel = value.at("bitsPerPel").get<DWORD>();
+      mode.dmDisplayFrequency = value.at("frequency").get<DWORD>();
+      mode.dmDisplayOrientation = value.at("orientation").get<DWORD>();
+      mode.dmDisplayFlags = value.at("flags").get<DWORD>();
+      mode.dmFields = value.at("fields").get<DWORD>();
+      return mode;
+    }
+
+    /** @brief Persist captured topology before destructive activation. */
+    bool save_rollback(const rollback_state_t &state) {
+      nlohmann::json modes = nlohmann::json::object();
+      for (const auto &[id, mode] : state.modes) {
+        modes[id] = mode_json(mode);
+      }
+      const nlohmann::json document {{"version", 1}, {"topology", *state.topology}, {"primary", *state.primary}, {"modes", std::move(modes)}, {"hdr", state.hdr_states}};
+      return file_handler::write_file_atomic(state.path.string().c_str(), document.dump()) == 0;
+    }
+
+    /** @brief Load durable topology after process restart. */
+    bool load_rollback(rollback_state_t &state) {
+      if (state.topology && state.primary) {
+        return true;
+      }
+      if (state.path.empty() || !std::filesystem::exists(state.path)) {
+        return false;
+      }
+      try {
+        const auto document = nlohmann::json::parse(file_handler::read_file(state.path.string().c_str()));
+        if (document.at("version") != 1) {
+          return false;
+        }
+        state.topology = document.at("topology").get<display_device::ActiveTopology>();
+        state.primary = document.at("primary").get<std::string>();
+        state.modes.clear();
+        for (const auto &[id, value] : document.at("modes").items()) {
+          state.modes.emplace(id, parse_mode(value));
+        }
+        state.hdr_states = document.at("hdr").get<display_device::HdrStateMap>();
+        return true;
+      } catch (...) {
+        return false;
+      }
+    }
+
+    /** @brief Capture exact current active topology into memory and durable journal. */
+    bool capture_rollback(rollback_state_t &rollback) {
+      auto api_layer = std::make_shared<display_device::WinApiLayer>();
+      display_device::WinDisplayDevice display_api {api_layer};
+      if (!display_api.isApiAccessAvailable()) {
+        return false;
+      }
+      const auto topology = display_api.getCurrentTopology();
+      const auto devices = display_api.enumAvailableDevices();
+      const auto primary = std::ranges::find_if(devices, [](const auto &device) {
+        return device.m_info && device.m_info->m_primary;
+      });
+      if (!display_api.isTopologyValid(topology) || primary == devices.end()) {
+        return false;
+      }
+      display_device::StringSet active_ids;
+      for (const auto &group : topology) {
+        active_ids.insert(group.begin(), group.end());
+      }
+      std::map<std::string, DEVMODEA, std::less<>> modes;
+      for (const auto &device : devices) {
+        if (!active_ids.contains(device.m_device_id) || device.m_display_name.empty()) {
+          continue;
+        }
+        DEVMODEA mode {.dmSize = sizeof(DEVMODEA)};
+        if (!EnumDisplaySettingsExA(device.m_display_name.c_str(), ENUM_CURRENT_SETTINGS, &mode, 0)) {
+          return false;
+        }
+        modes.emplace(device.m_device_id, mode);
+      }
+      const auto hdr_states = display_api.getCurrentHdrStates(active_ids);
+      if (modes.size() != active_ids.size() || hdr_states.size() != active_ids.size()) {
+        return false;
+      }
+      rollback.topology = topology;
+      rollback.primary = primary->m_device_id;
+      rollback.modes = std::move(modes);
+      rollback.hdr_states = hdr_states;
+      return save_rollback(rollback);
+    }
+
+    /** @brief Restore retained topology and clear journal only after complete success. */
+    bool restore_rollback(rollback_state_t &rollback) {
+      if (!load_rollback(rollback)) {
+        return rollback.path.empty() || !std::filesystem::exists(rollback.path);
+      }
+      auto api_layer = std::make_shared<display_device::WinApiLayer>();
+      display_device::WinDisplayDevice display_api {api_layer};
+      if (!display_api.isApiAccessAvailable() || !display_api.setTopology(*rollback.topology) || !display_api.setAsPrimary(*rollback.primary)) {
+        return false;
+      }
+      const auto devices = display_api.enumAvailableDevices();
+      for (auto &[id, mode] : rollback.modes) {
+        const auto device = std::ranges::find(devices, id, &display_device::EnumeratedDevice::m_device_id);
+        if (device == devices.end() || device->m_display_name.empty() || ChangeDisplaySettingsExA(device->m_display_name.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr) != DISP_CHANGE_SUCCESSFUL) {
+          return false;
+        }
+      }
+      if (ChangeDisplaySettingsExA(nullptr, nullptr, nullptr, 0, nullptr) != DISP_CHANGE_SUCCESSFUL || (!rollback.hdr_states.empty() && !display_api.setHdrStates(rollback.hdr_states))) {
+        return false;
+      }
+      const auto normalize_topology = [](auto topology) {
+        for (auto &group : topology) {
+          std::ranges::sort(group);
+        }
+        std::ranges::sort(topology);
+        return topology;
+      };
+      if (normalize_topology(display_api.getCurrentTopology()) != normalize_topology(*rollback.topology)) {
+        return false;
+      }
+      const auto restored_devices = display_api.enumAvailableDevices();
+      const auto restored_primary = std::ranges::find_if(restored_devices, [](const auto &device) {
+        return device.m_info && device.m_info->m_primary;
+      });
+      if (restored_primary == restored_devices.end() || restored_primary->m_device_id != *rollback.primary) {
+        return false;
+      }
+      for (const auto &[id, expected] : rollback.modes) {
+        const auto device = std::ranges::find(restored_devices, id, &display_device::EnumeratedDevice::m_device_id);
+        DEVMODEA actual {.dmSize = sizeof(DEVMODEA)};
+        if (device == restored_devices.end() || device->m_display_name.empty() || !EnumDisplaySettingsExA(device->m_display_name.c_str(), ENUM_CURRENT_SETTINGS, &actual, 0) || actual.dmPosition.x != expected.dmPosition.x || actual.dmPosition.y != expected.dmPosition.y || actual.dmPelsWidth != expected.dmPelsWidth || actual.dmPelsHeight != expected.dmPelsHeight || actual.dmBitsPerPel != expected.dmBitsPerPel || actual.dmDisplayFrequency != expected.dmDisplayFrequency || actual.dmDisplayOrientation != expected.dmDisplayOrientation || actual.dmDisplayFlags != expected.dmDisplayFlags) {
+          return false;
+        }
+      }
+      display_device::StringSet active_ids;
+      for (const auto &[id, mode] : rollback.modes) {
+        (void) mode;
+        active_ids.emplace(id);
+      }
+      if (display_api.getCurrentHdrStates(active_ids) != rollback.hdr_states) {
+        return false;
+      }
+      std::error_code error;
+      std::filesystem::remove(rollback.path, error);
+      if (error) {
+        return false;
+      }
+      rollback.topology.reset();
+      rollback.primary.reset();
+      rollback.modes.clear();
+      rollback.hdr_states.clear();
+      return true;
+    }
 
     /**
      * @brief Find libdisplaydevice ID for one MttVDD PnP instance.
@@ -249,8 +416,83 @@ namespace terra::windows::virtual_display {
            });
   }
 
+  bool activate_exclusive(const std::vector<terra_virtual_display::resource_t> &displays) {
+    if (!exclusive_rollback || displays.empty() || displays.size() > 4) {
+      return false;
+    }
+    std::lock_guard lock {exclusive_rollback->mutex};
+    if (exclusive_rollback->recovery_failed) {
+      if (!restore_rollback(*exclusive_rollback)) {
+        return false;
+      }
+      exclusive_rollback->recovery_failed = false;
+    }
+    if (!exclusive_rollback->topology && !capture_rollback(*exclusive_rollback)) {
+      return false;
+    }
+    auto api_layer = std::make_shared<display_device::WinApiLayer>();
+    display_device::WinDisplayDevice display_api {api_layer};
+    display_device::ActiveTopology topology;
+    display_device::StringSet expected;
+    std::vector<configuration_t> configurations;
+    configurations.reserve(displays.size());
+    for (const auto &display : displays) {
+      const auto id = wait_device_id(*api_layer, display.platform_id);
+      if (!id || !expected.emplace(*id).second) {
+        static_cast<void>(restore_rollback(*exclusive_rollback));
+        return false;
+      }
+      topology.push_back({*id});
+      configurations.push_back({
+        display.platform_id,
+        {
+          display.name,
+          display.requested_mode,
+          display.position,
+          display.scale,
+          display.rotation,
+          display.primary,
+          display.hdr,
+          display.persistent,
+          display.workspace_id,
+        },
+        display.actual_mode,
+      });
+    }
+    if (!display_api.isApiAccessAvailable() || !display_api.isTopologyValid(topology) || !display_api.setTopology(topology) || !apply(configurations)) {
+      static_cast<void>(restore_rollback(*exclusive_rollback));
+      return false;
+    }
+    display_device::StringSet active;
+    for (const auto &group : display_api.getCurrentTopology()) {
+      active.insert(group.begin(), group.end());
+    }
+    if (active != expected) {
+      static_cast<void>(restore_rollback(*exclusive_rollback));
+      return false;
+    }
+    return true;
+  }
+
+  bool restore_exclusive() {
+    if (!exclusive_rollback) {
+      return true;
+    }
+    std::lock_guard lock {exclusive_rollback->mutex};
+    const bool restored = restore_rollback(*exclusive_rollback);
+    exclusive_rollback->recovery_failed = !restored;
+    return restored;
+  }
+
   terra_virtual_display::callbacks_t make_callbacks(const std::filesystem::path &persistence_path) {
     const auto rollback = std::make_shared<rollback_state_t>();
+    const auto exclusive = std::make_shared<rollback_state_t>();
+    exclusive->path = persistence_path.parent_path() / "eclipse_display_topology_rollback.json";
+    exclusive_rollback = exclusive;
+    if (std::filesystem::exists(exclusive->path) && !restore_exclusive()) {
+      exclusive->recovery_failed = true;
+      BOOST_LOG(error) << "Terra MttVDD: stale exclusive display topology could not be restored";
+    }
     return {
       [persistence_path]() -> std::optional<std::string> {
         if (!std::filesystem::exists(persistence_path)) {
@@ -294,7 +536,7 @@ namespace terra::windows::virtual_display {
           active_ids.insert(group.begin(), group.end());
         }
         for (const auto &device : devices) {
-          if (!device.m_info || device.m_display_name.empty()) {
+          if (!active_ids.contains(device.m_device_id) || device.m_display_name.empty()) {
             continue;
           }
           DEVMODEA mode {.dmSize = sizeof(DEVMODEA)};
@@ -335,6 +577,7 @@ namespace terra::windows::virtual_display {
           return false;
         }
         const bool topology_restored = display_api.setTopology(*topology);
+        const bool primary_restored = topology_restored && display_api.setAsPrimary(*primary);
         const auto devices = display_api.enumAvailableDevices();
         bool staged = true;
         for (auto &[device_id, mode] : modes) {
@@ -345,7 +588,6 @@ namespace terra::windows::virtual_display {
         }
         const bool committed = ChangeDisplaySettingsExA(nullptr, nullptr, nullptr, 0, nullptr) == DISP_CHANGE_SUCCESSFUL;
         const bool hdr_restored = hdr_states.empty() || display_api.setHdrStates(hdr_states);
-        const bool primary_restored = display_api.setAsPrimary(*primary);
         return topology_restored && staged && committed && hdr_restored && primary_restored;
       },
     };

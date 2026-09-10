@@ -707,10 +707,12 @@ std::string GameStreamClient::boxArt(const std::string& address, std::uint16_t h
 LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t httpsPort,
                                       const std::string& clientId,
                                       const std::string& serverCertificate, int appId, bool resume,
-                                      const StreamSettings& settings,
-                                      const std::atomic_bool* cancellation,
-                                      const std::string& appUuid,
-                                      const std::string& launchProfileId) const {
+                                       const StreamSettings& settings,
+                                       const std::atomic_bool* cancellation,
+                                       const std::string& appUuid,
+                                       const std::string& launchProfileId,
+                                       const std::string& workspaceId,
+                                       const std::string& displayId, const bool primary) const {
     requireSecureRequest(serverCertificate, appId);
     if (appId == 0) {
         throw std::invalid_argument("Application ID is invalid.");
@@ -730,6 +732,7 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
 
     auto gamepadMask = connectedGamepadMask();
     if (settings.input.forceGamepad && gamepadTransportAvailable()) gamepadMask |= 1;
+    if (!primary) gamepadMask = 0;
     const std::string hdrArguments = settings.enableHdr
                                          ? "&hdrMode=1&clientHdrCapVersion=0"
                                            "&clientHdrCapSupportedFlagsInUint32=0"
@@ -750,7 +753,9 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
         (appUuid.empty() ? "" : "&eclipseAppUuid=" + urlEncode(appUuid)) +
         (launchProfileId.empty()
              ? ""
-             : "&eclipseLaunchProfileId=" + urlEncode(launchProfileId));
+             : "&eclipseLaunchProfileId=" + urlEncode(launchProfileId)) +
+        (workspaceId.empty() ? "" : "&eclipseWorkspaceId=" + urlEncode(workspaceId)) +
+        (displayId.empty() ? "" : "&eclipseDisplayId=" + urlEncode(displayId));
     const auto endpoint = parseEndpoint(address);
     const auto response =
         request(endpoint, httpsPort == 0 ? kDefaultHttpsPort : httpsPort, true,
@@ -760,6 +765,7 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
     const auto root = parseRoot(document, response);
     result.sessionUrl = childText(root, "sessionUrl0");
     result.logicalSessionId = childText(root, "EclipseSessionId");
+    result.childStreamId = childText(root, "EclipseStreamId");
     if (result.sessionUrl.empty()) {
         throw std::runtime_error("Sol launch response is missing session URL.");
     }

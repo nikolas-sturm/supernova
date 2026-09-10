@@ -589,6 +589,28 @@ int main() {
     expect(clipboardText == "hello\nworld", "Clipboard shortcut did not send normalized text.");
 
     input.stop();
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+    const int arrivalsBeforeDisabledControllers = arrivals;
+    const int controllerEventsBeforeDisabledControllers = controllerEvents;
+    const int rumbleEventsBeforeDisabledControllers = rumbleEvents;
+    settings.controllersEnabled = false;
+    input.start(window, settings, 1920, 1080, 60);
+    input.setEnabled(true);
+    event = {};
+    event.type = SDL_CONTROLLERBUTTONDOWN;
+    event.cbutton.which = instanceIds[0];
+    event.cbutton.state = SDL_PRESSED;
+    event.cbutton.button = SDL_CONTROLLER_BUTTON_A;
+    input.handleEvent(event);
+    input.updateGamepads();
+    input.setGamepadRumble(0, 100, 200);
+    expect(arrivals == arrivalsBeforeDisabledControllers &&
+               controllerEvents == controllerEventsBeforeDisabledControllers &&
+               rumbleEvents == rumbleEventsBeforeDisabledControllers,
+           "Disabled controller role still emitted controller traffic.");
+    input.stop();
+    settings.controllersEnabled = true;
+#endif
     settings.touchscreenTrackpad = false;
     input.start(window, settings, 1920, 1080, 60);
     input.setEnabled(true);

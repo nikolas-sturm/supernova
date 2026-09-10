@@ -90,6 +90,9 @@ describe('clientStore mode profiles', () => {
       height: 1080,
       refreshRate: 60,
       hdr: false,
+      displayId: null,
+      displayIds: [],
+      streams: [],
       revision: 1,
     }
     useClientStore.getState().setSolResource({

@@ -91,6 +91,7 @@ struct LaunchResult {
     std::array<unsigned char, 16> remoteInputIv{};
     std::string logicalSessionId;  ///< Stable Eclipse session identifier when
                                    ///< supplied by Sol.
+    std::string childStreamId;  ///< Unique Eclipse child-stream identifier.
 };
 
 /** @brief Parsed response from an Eclipse JSON API request. */
@@ -170,15 +171,21 @@ public:
      * @param cancellation Optional cancellation flag.
      * @param appUuid Optional stable Eclipse application UUID.
      * @param launchProfileId Optional Eclipse launch-profile UUID.
+     * @param workspaceId Optional Eclipse workspace UUID.
+     * @param displayId Optional Eclipse virtual-display UUID.
+     * @param primary Whether this child owns controller transport.
      * @return Launch transport and logical-session details.
      */
     [[nodiscard]] LaunchResult launch(const std::string& address, std::uint16_t httpsPort,
                                       const std::string& clientId,
                                       const std::string& serverCertificate, int appId, bool resume,
                                        const StreamSettings& settings,
-                                       const std::atomic_bool* cancellation = nullptr,
-                                       const std::string& appUuid = {},
-                                       const std::string& launchProfileId = {}) const;
+                                        const std::atomic_bool* cancellation = nullptr,
+                                        const std::string& appUuid = {},
+                                        const std::string& launchProfileId = {},
+                                        const std::string& workspaceId = {},
+                                        const std::string& displayId = {},
+                                        bool primary = true) const;
 
     /**
      * @brief Send a bounded JSON request to paired Sol's Eclipse API.

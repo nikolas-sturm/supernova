@@ -1,5 +1,6 @@
 #include "audio_renderer.h"
 #include "stream_session.h"
+#include "stream_worker_protocol.h"
 #include "video_renderer.h"
 
 #include <atomic>
@@ -7,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -451,5 +453,25 @@ int main() {
         savedCallbacks.connectionStarted();
         savedCallbacks.connectionTerminated(ML_ERROR_GRACEFUL_TERMINATION);
         expect(session.stopRequested(), "Synchronous disconnect did not stop session.");
+    }
+
+    {
+        auto config = testConfig();
+        config.audioEnabled = false;
+        config.controllerEnabled = false;
+        config.launch.logicalSessionId = "11111111-1111-4111-8111-111111111111";
+        config.launch.childStreamId = "22222222-2222-4222-8222-222222222222";
+        const auto parsed = terra::parseStreamWorkerConfig(terra::streamWorkerConfigJson(config));
+        expect(!parsed.audioEnabled && !parsed.controllerEnabled,
+               "Worker role flags did not survive serialization.");
+        expect(parsed.launch.logicalSessionId == config.launch.logicalSessionId &&
+                   parsed.launch.childStreamId == config.launch.childStreamId,
+               "Worker stream identifiers did not survive serialization.");
+
+        std::stringstream framed;
+        expect(terra::writeStreamWorkerFrame(framed, {{"type", "stop"}}),
+               "Worker frame write failed.");
+        const auto frame = terra::readStreamWorkerFrame(framed);
+        expect(frame && frame->value("type", "") == "stop", "Worker frame round trip failed.");
     }
 }

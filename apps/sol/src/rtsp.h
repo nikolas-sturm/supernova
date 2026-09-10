@@ -7,6 +7,7 @@
 // standard includes
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -37,6 +38,8 @@ namespace rtsp_stream {
   struct launch_session_t {
     uint32_t id;  ///< RTSP launch-session identifier assigned before stream startup.
     std::string session_id;  ///< Stable logical Terra session UUID.
+    std::string stream_id;  ///< Unique Terra child-stream UUID.
+    std::string display_id;  ///< Requested display resource UUID, empty when no resource is bound.
     std::string client_uuid;  ///< Persistent UUID of the paired client owning this session.
     std::string app_uuid;  ///< Stable UUID of the launched application.
     terra_api::input_permissions_t input_permissions;  ///< Input classes granted to this paired client.
@@ -48,6 +51,8 @@ namespace rtsp_stream {
     uint32_t control_connect_data;  ///< Client-provided token used when connecting the control channel.
 
     bool host_audio;  ///< Whether host audio should be played locally.
+    bool terra {};  ///< Whether this transport was launched through Terra API v1.
+    bool primary_stream {true};  ///< Whether this child owns audio and controller transport roles.
     std::string unique_id;  ///< Moonlight client unique identifier for this launch request.
     int width;  ///< Frame or display width in pixels.
     int height;  ///< Frame or display height in pixels.
@@ -80,6 +85,7 @@ namespace rtsp_stream {
     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.
     uint32_t rtsp_iv_counter;  ///< Counter value mixed into encrypted RTSP IVs.
     std::string client_cert;  ///< PEM certificate for the paired Moonlight client.
+    std::function<void()> timeout_cleanup;  ///< Cleanup invoked if RTSP never consumes this launch.
   };
 
   /**
@@ -87,6 +93,10 @@ namespace rtsp_stream {
    */
   struct session_info_t {
     std::string id;  ///< Stable logical session UUID.
+    std::string stream_id;  ///< Unique child transport UUID.
+    std::string display_id;  ///< Bound display resource UUID, empty when no resource is bound.
+    bool terra;  ///< Whether this transport belongs to a Terra API session.
+    bool primary;  ///< Whether this child owns primary stream roles.
     std::string client_uuid;  ///< Persistent owner client UUID.
     std::string app_uuid;  ///< Stable application UUID.
     int legacy_app_id;  ///< Legacy numeric GameStream application ID.
@@ -146,6 +156,12 @@ namespace rtsp_stream {
    * @return Active session snapshots.
    */
   std::vector<session_info_t> sessions();
+  /**
+   * @brief Return one immutable snapshot per active transport.
+   *
+   * @return Active child-stream snapshots without logical-session coalescing.
+   */
+  std::vector<session_info_t> transport_sessions();
   /** @brief Advance fixed-window telemetry rates for every active stream. */
   void sample_telemetry();
   /**

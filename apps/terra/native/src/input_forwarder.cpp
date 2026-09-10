@@ -1113,8 +1113,10 @@ void InputForwarder::start(HWND window, InputSettings settings, int width, int h
         impl_->window = nullptr;
         throw std::runtime_error("Could not install local shortcut hook");
     }
-    impl_->loadXInput();
-    SetTimer(window, kGamepadTimer, kGamepadPollMilliseconds, nullptr);
+    if (settings.controllersEnabled) {
+        impl_->loadXInput();
+        SetTimer(window, kGamepadTimer, kGamepadPollMilliseconds, nullptr);
+    }
     impl_->updateWindowTitle();
 }
 
@@ -1130,8 +1132,9 @@ void InputForwarder::setEnabled(bool enabled) {
     if (!impl_->window || impl_->enabled == enabled) return;
     if (enabled) {
         impl_->enabled = true;
-        impl_->pollGamepad();
-        if (impl_->settings.forceGamepad && !impl_->gamepadConnected[0] &&
+        if (impl_->settings.controllersEnabled) impl_->pollGamepad();
+        if (impl_->settings.controllersEnabled && impl_->settings.forceGamepad &&
+            !impl_->gamepadConnected[0] &&
             gamepadTransportAvailable()) {
             impl_->noteControllerResult(LiSendControllerArrivalEvent(
                 0, 1, LI_CTYPE_XBOX, kSupportedGamepadButtons,
@@ -1143,7 +1146,7 @@ void InputForwarder::setEnabled(bool enabled) {
         impl_->setMouseCaptured(false);
         impl_->releaseRemoteState();
         const auto mask = impl_->gamepadMask();
-        if (gamepadTransportAvailable()) {
+        if (impl_->settings.controllersEnabled && gamepadTransportAvailable()) {
             for (DWORD index = 0; index < XUSER_MAX_COUNT; ++index) {
                 if ((mask & (1U << index)) == 0) continue;
                 impl_->noteControllerResult(LiSendMultiControllerEvent(
@@ -3011,7 +3014,7 @@ void InputForwarder::start(SDL_Window* window, InputSettings settings, int width
     if (const char* previous = SDL_GetHint("SDL_ALLOW_ALT_TAB_WHILE_GRABBED")) {
         impl_->previousAltTabHint = previous;
     }
-    impl_->startControllers();
+    if (settings.controllersEnabled) impl_->startControllers();
     impl_->updateWindowTitle();
 }
 
@@ -3033,23 +3036,27 @@ void InputForwarder::setEnabled(bool enabled) {
         } else {
             impl_->releaseRemoteStateWithRetry();
         }
-        for (std::size_t index = 0; index < impl_->controllers.size(); ++index) {
-            impl_->cancelControllerTouches(index);
+        if (impl_->settings.controllersEnabled) {
+            for (std::size_t index = 0; index < impl_->controllers.size(); ++index) {
+                impl_->cancelControllerTouches(index);
+            }
+            if (impl_->gamepadMask() != 0) impl_->sendNeutralControllerStates(0);
         }
-        if (impl_->gamepadMask() != 0) impl_->sendNeutralControllerStates(0);
     } else {
         impl_->enabled = true;
         impl_->controllerSuppressed = !impl_->backgroundControllerEvents &&
                                       (SDL_GetWindowFlags(impl_->window) &
                                        SDL_WINDOW_INPUT_FOCUS) == 0;
-        impl_->refreshControllerStates();
-        impl_->announceControllers();
-        if (impl_->gamepadMask() == 0) {
-            impl_->sendNeutralControllerState(0, 0);
-        } else if (impl_->controllerSuppressed) {
-            impl_->sendNeutralControllerStates(impl_->gamepadMask());
-        } else {
-            impl_->sendControllerStates();
+        if (impl_->settings.controllersEnabled) {
+            impl_->refreshControllerStates();
+            impl_->announceControllers();
+            if (impl_->gamepadMask() == 0) {
+                impl_->sendNeutralControllerState(0, 0);
+            } else if (impl_->controllerSuppressed) {
+                impl_->sendNeutralControllerStates(impl_->gamepadMask());
+            } else {
+                impl_->sendControllerStates();
+            }
         }
     }
     impl_->enabled = enabled;
@@ -3080,7 +3087,9 @@ void InputForwarder::setGamepadLed(std::uint16_t controllerNumber, std::uint8_t 
     impl_->setGamepadLed(controllerNumber, red, green, blue);
 }
 
-void InputForwarder::updateGamepads() { impl_->updateGamepads(); }
+void InputForwarder::updateGamepads() {
+    if (impl_->settings.controllersEnabled) impl_->updateGamepads();
+}
 
 void InputForwarder::stop() {
     if (!impl_->window) return;

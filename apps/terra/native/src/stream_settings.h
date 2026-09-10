@@ -63,6 +63,7 @@ struct InputSettings {
     bool swapFaceButtons = false;
     bool forceGamepad = false;
     bool backgroundGamepad = false;
+    bool controllersEnabled = true;
 };
 
 struct StreamSettings {
