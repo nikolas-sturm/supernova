@@ -522,6 +522,7 @@
     "device_name": "Device Name",
     "load_failure": "Pending pairing requests could not be loaded",
     "legacy_permissions": "Legacy full access",
+    "no_permissions": "No permissions requested",
     "no_pending_pairings": "No devices are waiting to pair",
     "pair_failure": "Pairing Failed: Check if the PIN is typed correctly",
     "pair_success": "Success! Please check Terra to continue",

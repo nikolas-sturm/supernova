@@ -17,6 +17,8 @@ namespace terra {
 class StreamStatistics;
 
 struct StreamWindowBounds {
+    std::uint64_t revision = 0;
+    bool visible = false;
     int x = 0;
     int y = 0;
     int width = 0;
@@ -24,6 +26,12 @@ struct StreamWindowBounds {
     double scaleFactor = 1.0;
     bool wayland = false;
     bool fullscreen = false;
+};
+
+struct StreamOverlayState {
+    std::uint64_t revision = 0;
+    bool visible = false;
+    bool captureSuspended = false;
 };
 
 [[nodiscard]] int selectVideoFormat(VideoCodec preference, int serverCodecModeSupport,
@@ -34,10 +42,14 @@ public:
     using StatusListener = std::function<void(std::string state, std::string message)>;
     using CloseListener = std::function<void()>;
     using OverlayListener = std::function<void(const StreamWindowBounds&)>;
+    using OverlayCaptureListener =
+        std::function<void(std::uint64_t revision, bool captureSuspended)>;
 
     VideoRenderer(StreamSettings settings, StatusListener listener, CloseListener closeListener,
                    std::shared_ptr<StreamStatistics> statistics = {},
-                   OverlayListener overlayListener = {});
+                   OverlayListener overlayListener = {},
+                   OverlayCaptureListener overlayCaptureListener = {},
+                   StreamOverlayState overlayState = {});
     ~VideoRenderer();
 
     VideoRenderer(const VideoRenderer&) = delete;
@@ -46,7 +58,8 @@ public:
     void initialize(int videoFormat, int width, int height, int frameRate);
     void setInputEnabled(bool enabled);
     void setHdrMode(bool enabled);
-    void resumeOverlay();
+    void closeOverlay(std::uint64_t revision);
+    void acknowledgeOverlayHidden(std::uint64_t revision);
     void setGamepadRumble(std::uint16_t controllerNumber, std::uint16_t lowFrequency,
                           std::uint16_t highFrequency);
     void setGamepadTriggerRumble(std::uint16_t controllerNumber, std::uint16_t leftTrigger,

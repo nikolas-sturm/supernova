@@ -94,7 +94,8 @@ constexpr UINT kSetInputEnabledMessage = WM_APP + 2;
 constexpr UINT kSetGamepadRumbleMessage = WM_APP + 3;
 constexpr UINT kSetGamepadMotionMessage = WM_APP + 4;
 constexpr UINT kSetGamepadLedMessage = WM_APP + 5;
-constexpr UINT kResumeOverlayMessage = WM_APP + 6;
+constexpr UINT kCloseOverlayMessage = WM_APP + 6;
+constexpr UINT kAcknowledgeOverlayHiddenMessage = WM_APP + 7;
 
 struct DisplayMonitor {
     HMONITOR handle = nullptr;
@@ -240,12 +241,16 @@ int selectVideoFormat(VideoCodec preference, int serverCodecModeSupport, bool en
 
 struct VideoRenderer::Impl {
     Impl(StreamSettings streamSettings, StatusListener callback, CloseListener closeCallback,
-          std::shared_ptr<StreamStatistics> streamStatistics, OverlayListener overlayCallback)
+           std::shared_ptr<StreamStatistics> streamStatistics, OverlayListener overlayCallback,
+           OverlayCaptureListener overlayCaptureCallback,
+           StreamOverlayState initialOverlayState)
         : settings(std::move(streamSettings)),
           listener(std::move(callback)),
           closeListener(std::move(closeCallback)),
           statistics(std::move(streamStatistics)),
-          overlayListener(std::move(overlayCallback)) {
+          overlayListener(std::move(overlayCallback)),
+          overlayCaptureListener(std::move(overlayCaptureCallback)),
+          overlayState(initialOverlayState) {
         hdrModeRequested.store(settings.enableHdr);
         overlayVisible.store(settings.showPerformanceStats);
     }
@@ -318,16 +323,24 @@ struct VideoRenderer::Impl {
                     static_cast<std::uint8_t>(color >> 8U), static_cast<std::uint8_t>(color));
                 return 0;
             }
-            if (message == kResumeOverlayMessage) {
+            if (message == kCloseOverlayMessage) {
+                self->inputForwarder.closeOverlay(static_cast<std::uint64_t>(word));
+                return 0;
+            }
+            if (message == kAcknowledgeOverlayHiddenMessage) {
+                if (!self->inputForwarder.acknowledgeOverlayHidden(
+                        static_cast<std::uint64_t>(word))) {
+                    return 0;
+                }
                 ShowWindow(handle, SW_RESTORE);
                 SetForegroundWindow(handle);
                 SetFocus(handle);
-                self->inputForwarder.resumeAfterOverlay();
                 return 0;
             }
             LRESULT result = 0;
             if (self->inputForwarder.handleMessage(message, word, value, result)) return result;
             if (message == WM_EXITSIZEMOVE) {
+                self->inputForwarder.updateOverlay();
                 self->requestDisplayRecovery(handle, false);
             } else if (message == WM_DISPLAYCHANGE) {
                 self->requestDisplayRecovery(handle, true);
@@ -448,7 +461,13 @@ struct VideoRenderer::Impl {
                                          overlayVisible.store(!overlayVisible.load());
                                      },
                                      [this] { return toggleFullscreen(); },
-                                     [this] { requestOverlay(); });
+                                      [this](std::uint64_t revision, bool visible) {
+                                          requestOverlay(revision, visible);
+                                      },
+                                      overlayCaptureListener,
+                                      {.revision = overlayState.revision,
+                                       .visible = overlayState.visible,
+                                       .captureSuspended = overlayState.captureSuspended});
             } catch (const std::exception& exception) {
                 DestroyWindow(created);
                 {
@@ -465,6 +484,7 @@ struct VideoRenderer::Impl {
             }
             ShowWindow(created, SW_SHOW);
             UpdateWindow(created);
+            if (overlayState.visible) inputForwarder.updateOverlay();
             DEVMODEW displayMode{};
             displayMode.dmSize = sizeof(displayMode);
             const bool hasRefreshRate = EnumDisplaySettingsW(targetDisplay.info.szDevice,
@@ -569,13 +589,15 @@ struct VideoRenderer::Impl {
         return true;
     }
 
-    void requestOverlay() {
+    void requestOverlay(std::uint64_t revision, bool visible) {
         if (!overlayListener || !window) return;
         RECT bounds{};
         if (!GetWindowRect(window, &bounds)) return;
         const auto dpi = GetDpiForWindow(window);
         const double scale = dpi == 0 ? 1.0 : static_cast<double>(dpi) / 96.0;
         overlayListener({
+            .revision = revision,
+            .visible = visible,
             .x = static_cast<int>(std::lround(bounds.left / scale)),
             .y = static_cast<int>(std::lround(bounds.top / scale)),
             .width = std::max(static_cast<int>(std::lround((bounds.right - bounds.left) / scale)),
@@ -588,13 +610,27 @@ struct VideoRenderer::Impl {
         });
     }
 
-    void resumeOverlay() {
+    void closeOverlay(std::uint64_t revision) {
         HWND handle = nullptr;
         {
             std::scoped_lock lock{windowMutex};
             handle = window;
         }
-        if (handle) PostMessageW(handle, kResumeOverlayMessage, 0, 0);
+        if (handle) {
+            SendMessageW(handle, kCloseOverlayMessage, static_cast<WPARAM>(revision), 0);
+        }
+    }
+
+    void acknowledgeOverlayHidden(std::uint64_t revision) {
+        HWND handle = nullptr;
+        {
+            std::scoped_lock lock{windowMutex};
+            handle = window;
+        }
+        if (handle) {
+            SendMessageW(handle, kAcknowledgeOverlayHiddenMessage,
+                         static_cast<WPARAM>(revision), 0);
+        }
     }
 
     void initializeD3d(int videoFormat, int inputWidth, int inputHeight, int frameRate) {
@@ -1148,6 +1184,8 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     CloseListener closeListener;
     std::shared_ptr<StreamStatistics> statistics;
     OverlayListener overlayListener;
+    OverlayCaptureListener overlayCaptureListener;
+    StreamOverlayState overlayState;
     std::thread windowThread;
     std::mutex windowMutex;
     std::condition_variable windowCondition;
@@ -1201,10 +1239,13 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 VideoRenderer::VideoRenderer(StreamSettings settings, StatusListener listener,
                                CloseListener closeListener,
                                std::shared_ptr<StreamStatistics> statistics,
-                               OverlayListener overlayListener)
+                               OverlayListener overlayListener,
+                               OverlayCaptureListener overlayCaptureListener,
+                               StreamOverlayState overlayState)
     : impl_(std::make_unique<Impl>(std::move(settings), std::move(listener),
                                      std::move(closeListener), std::move(statistics),
-                                     std::move(overlayListener))) {}
+                                     std::move(overlayListener),
+                                     std::move(overlayCaptureListener), overlayState)) {}
 
 VideoRenderer::~VideoRenderer() = default;
 
@@ -1238,7 +1279,11 @@ void VideoRenderer::setHdrMode(bool enabled) {
     impl_->setHdrMode(enabled);
 }
 
-void VideoRenderer::resumeOverlay() { impl_->resumeOverlay(); }
+void VideoRenderer::closeOverlay(std::uint64_t revision) { impl_->closeOverlay(revision); }
+
+void VideoRenderer::acknowledgeOverlayHidden(std::uint64_t revision) {
+    impl_->acknowledgeOverlayHidden(revision);
+}
 
 void VideoRenderer::setGamepadRumble(std::uint16_t controllerNumber,
                                      std::uint16_t lowFrequency,
@@ -1469,12 +1514,16 @@ struct VideoRenderer::Impl {
     };
 
     Impl(StreamSettings streamSettings, StatusListener callback, CloseListener closeCallback,
-          std::shared_ptr<StreamStatistics> streamStatistics, OverlayListener overlayCallback)
+           std::shared_ptr<StreamStatistics> streamStatistics, OverlayListener overlayCallback,
+           OverlayCaptureListener overlayCaptureCallback,
+           StreamOverlayState initialOverlayState)
         : settings(std::move(streamSettings)),
           listener(std::move(callback)),
           closeListener(std::move(closeCallback)),
           statistics(std::move(streamStatistics)),
-          overlayListener(std::move(overlayCallback)) {
+          overlayListener(std::move(overlayCallback)),
+          overlayCaptureListener(std::move(overlayCaptureCallback)),
+          overlayState(initialOverlayState) {
         hdrModeRequested.store(LiGetCurrentHostDisplayHdrMode());
         overlayVisible = settings.showPerformanceStats;
     }
@@ -1832,9 +1881,16 @@ struct VideoRenderer::Impl {
             throw std::runtime_error(sdlError("Cannot create SDL renderer"));
         }
         inputForwarder.start(window, settings.input, width, height, frameRate,
-                              [this] { togglePerformanceOverlay(); },
-                              [this] { return toggleFullscreen(); },
-                              [this] { requestOverlay(); });
+                             [this] { togglePerformanceOverlay(); },
+                             [this] { return toggleFullscreen(); },
+                              [this](std::uint64_t revision, bool visible) {
+                                  requestOverlay(revision, visible);
+                              },
+                              overlayCaptureListener,
+                              {.revision = overlayState.revision,
+                               .visible = overlayState.visible,
+                               .captureSuspended = overlayState.captureSuspended});
+        if (overlayState.visible) inputForwarder.updateOverlay();
 
         if (settings.keepAwake) {
             SDL_DisableScreenSaver();
@@ -2003,7 +2059,7 @@ struct VideoRenderer::Impl {
                     frameCondition.wait_for(lock, std::chrono::milliseconds{8}, [this] {
                         return stopping || !pendingFrames.empty() ||
                                inputRequestGeneration != inputAppliedGeneration ||
-                               overlayResumeRequested ||
+                               overlayCloseRequested || overlayHiddenAcknowledged ||
                                std::ranges::any_of(pendingRumble,
                                                    [](const auto& value) { return value.has_value(); }) ||
                                std::ranges::any_of(pendingTriggerRumble,
@@ -2024,7 +2080,7 @@ struct VideoRenderer::Impl {
                     led.swap(pendingLed);
                 }
                 applyInputState();
-                applyOverlayResume();
+                applyOverlayCommands();
                 for (const auto& command : rumble) {
                     if (!command) continue;
                     inputForwarder.setGamepadRumble(command->controllerNumber,
@@ -2138,7 +2194,7 @@ struct VideoRenderer::Impl {
         });
     }
 
-    void requestOverlay() {
+    void requestOverlay(std::uint64_t revision, bool visible) {
         if (!overlayListener || !window) return;
         int x = 0;
         int y = 0;
@@ -2157,6 +2213,8 @@ struct VideoRenderer::Impl {
         const bool fullscreen =
             (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
         overlayListener({
+            .revision = revision,
+            .visible = visible,
             .x = x,
             .y = y,
             .width = std::max(width, 1),
@@ -2165,26 +2223,38 @@ struct VideoRenderer::Impl {
             .wayland = wayland,
             .fullscreen = fullscreen,
         });
-        streamOverlayActive = true;
     }
 
-    void applyOverlayResume() {
+    void applyOverlayCommands() {
+        std::optional<std::uint64_t> close;
+        std::optional<std::uint64_t> hidden;
         {
             std::scoped_lock lock{frameMutex};
-            if (!overlayResumeRequested) return;
-            overlayResumeRequested = false;
+            close.swap(overlayCloseRequested);
+            hidden.swap(overlayHiddenAcknowledged);
         }
-        streamOverlayActive = false;
-        SDL_RaiseWindow(window);
-        static_cast<void>(SDL_SetWindowInputFocus(window));
-        inputForwarder.resumeAfterOverlay();
+        if (close) inputForwarder.closeOverlay(*close);
+        if (!hidden) return;
+        if (inputForwarder.acknowledgeOverlayHidden(*hidden)) {
+            SDL_RaiseWindow(window);
+            static_cast<void>(SDL_SetWindowInputFocus(window));
+        }
     }
 
-    void resumeOverlay() {
+    void closeOverlay(std::uint64_t revision) {
         {
             std::scoped_lock lock{frameMutex};
             if (stopping || renderThreadExited) return;
-            overlayResumeRequested = true;
+            overlayCloseRequested = revision;
+        }
+        frameCondition.notify_one();
+    }
+
+    void acknowledgeOverlayHidden(std::uint64_t revision) {
+        {
+            std::scoped_lock lock{frameMutex};
+            if (stopping || renderThreadExited) return;
+            overlayHiddenAcknowledged = revision;
         }
         frameCondition.notify_one();
     }
@@ -2247,8 +2317,9 @@ struct VideoRenderer::Impl {
                 requestDisplayRecovery(true);
             } else if (event.type == SDL_WINDOWEVENT &&
                        event.window.windowID == SDL_GetWindowID(window)) {
-                if (streamOverlayActive && event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                    requestOverlay();
+                if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                    event.window.event == SDL_WINDOWEVENT_MOVED) {
+                    inputForwarder.updateOverlay();
                 }
 #if SDL_VERSION_ATLEAST(2, 0, 18)
                 if (event.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED) {
@@ -2956,6 +3027,8 @@ struct VideoRenderer::Impl {
     CloseListener closeListener;
     std::shared_ptr<StreamStatistics> statistics;
     OverlayListener overlayListener;
+    OverlayCaptureListener overlayCaptureListener;
+    StreamOverlayState overlayState;
     SDL_Window* window = nullptr;
     SDL_Renderer* renderer = nullptr;
     Uint32 rendererFlags = 0;
@@ -3009,8 +3082,8 @@ struct VideoRenderer::Impl {
     bool inputEnabled = false;
     std::uint64_t inputRequestGeneration = 0;
     std::uint64_t inputAppliedGeneration = 0;
-    bool overlayResumeRequested = false;
-    bool streamOverlayActive = false;
+    std::optional<std::uint64_t> overlayCloseRequested;
+    std::optional<std::uint64_t> overlayHiddenAcknowledged;
     int textureWidth = 0;
     int textureHeight = 0;
     int overlayWidth = 0;
@@ -3039,10 +3112,13 @@ struct VideoRenderer::Impl {
 VideoRenderer::VideoRenderer(StreamSettings settings, StatusListener listener,
                                CloseListener closeListener,
                                std::shared_ptr<StreamStatistics> statistics,
-                               OverlayListener overlayListener)
+                               OverlayListener overlayListener,
+                               OverlayCaptureListener overlayCaptureListener,
+                               StreamOverlayState overlayState)
     : impl_(std::make_unique<Impl>(std::move(settings), std::move(listener),
                                      std::move(closeListener), std::move(statistics),
-                                     std::move(overlayListener))) {}
+                                     std::move(overlayListener),
+                                     std::move(overlayCaptureListener), overlayState)) {}
 
 VideoRenderer::~VideoRenderer() = default;
 
@@ -3076,7 +3152,11 @@ void VideoRenderer::setInputEnabled(bool enabled) {
 
 void VideoRenderer::setHdrMode(bool enabled) { impl_->setHdrMode(enabled); }
 
-void VideoRenderer::resumeOverlay() { impl_->resumeOverlay(); }
+void VideoRenderer::closeOverlay(std::uint64_t revision) { impl_->closeOverlay(revision); }
+
+void VideoRenderer::acknowledgeOverlayHidden(std::uint64_t revision) {
+    impl_->acknowledgeOverlayHidden(revision);
+}
 
 void VideoRenderer::setGamepadRumble(std::uint16_t controllerNumber,
                                      std::uint16_t lowFrequency,
@@ -3115,16 +3195,19 @@ int selectVideoFormat(VideoCodec preference, int, bool enableHdr, bool enableYuv
 }
 struct VideoRenderer::Impl {
     Impl(StreamSettings, StatusListener, CloseListener, std::shared_ptr<StreamStatistics>,
-         OverlayListener) {}
+          OverlayListener, OverlayCaptureListener, StreamOverlayState) {}
 };
 
 VideoRenderer::VideoRenderer(StreamSettings settings, StatusListener listener,
                                CloseListener closeListener,
                                std::shared_ptr<StreamStatistics> statistics,
-                               OverlayListener overlayListener)
+                               OverlayListener overlayListener,
+                               OverlayCaptureListener overlayCaptureListener,
+                               StreamOverlayState overlayState)
     : impl_(std::make_unique<Impl>(std::move(settings), std::move(listener),
                                      std::move(closeListener), std::move(statistics),
-                                     std::move(overlayListener))) {}
+                                     std::move(overlayListener),
+                                     std::move(overlayCaptureListener), overlayState)) {}
 VideoRenderer::~VideoRenderer() = default;
 void VideoRenderer::initialize(int, int, int, int) {
     throw std::runtime_error("Native video output is unavailable on this platform.");
@@ -3137,7 +3220,8 @@ bool VideoRenderer::recoveryRequired() const { return false; }
 std::optional<int> VideoRenderer::recoveryDisplayIndex() const { return std::nullopt; }
 void VideoRenderer::setInputEnabled(bool) {}
 void VideoRenderer::setHdrMode(bool) {}
-void VideoRenderer::resumeOverlay() {}
+void VideoRenderer::closeOverlay(std::uint64_t) {}
+void VideoRenderer::acknowledgeOverlayHidden(std::uint64_t) {}
 void VideoRenderer::setGamepadRumble(std::uint16_t, std::uint16_t, std::uint16_t) {}
 void VideoRenderer::setGamepadTriggerRumble(std::uint16_t, std::uint16_t, std::uint16_t) {}
 void VideoRenderer::setGamepadMotionEventState(std::uint16_t, std::uint8_t, std::uint16_t) {}

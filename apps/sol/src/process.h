@@ -14,6 +14,7 @@
 
 // standard includes
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -35,6 +36,8 @@
 #define DEFAULT_APP_IMAGE_PATH SOL_ASSETS_DIR "/box.png"
 
 namespace proc {
+  using runtime_probe_t = std::function<bool()>;
+
   /**
    * @brief Boost.Process pipe stream used for child-process I/O.
    */
@@ -107,6 +110,7 @@ namespace proc {
     ):
         _app_id(0),
         _env(std::move(env)),
+        _base_env(_env),
         _apps(std::move(apps)) {
     }
 
@@ -174,6 +178,7 @@ namespace proc {
     int _app_id;
 
     boost::process::v1::environment _env;
+    boost::process::v1::environment _base_env;  ///< Immutable environment restored before each launch.
     std::vector<ctx_t> _apps;
     ctx_t _app;
     std::chrono::steady_clock::time_point _app_launch_time;
@@ -258,4 +263,21 @@ namespace proc {
   void terminate_process_group(boost::process::v1::child &proc, boost::process::v1::group &group, std::chrono::seconds exit_timeout);
 
   extern proc_t proc;
+
+  /**
+   * @brief Install a probe for application runtimes not represented by a native child process.
+   *
+   * @param probe Probe returning true while an external runtime remains active.
+   */
+  void set_external_runtime_probe(runtime_probe_t probe);
+
+  /**
+   * @brief Check whether either a native process or registered external runtime is active.
+   *
+   * @return True while any application runtime remains active.
+   */
+  bool runtime_running();
+
+  /** @brief Return mutex serializing runtime launch with display restoration. */
+  std::recursive_mutex &runtime_mutex();
 }  // namespace proc

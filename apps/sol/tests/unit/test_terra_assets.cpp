@@ -41,35 +41,89 @@ namespace {
     stream.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     return asset;
   }
+
+  /**
+   * @brief Return a complete valid one-pixel PNG.
+   * @return PNG bytes with valid chunk CRCs.
+   */
+  std::vector<std::uint8_t> valid_png() {
+    return {
+      0x89,
+      0x50,
+      0x4E,
+      0x47,
+      0x0D,
+      0x0A,
+      0x1A,
+      0x0A,
+      0x00,
+      0x00,
+      0x00,
+      0x0D,
+      'I',
+      'H',
+      'D',
+      'R',
+      0x00,
+      0x00,
+      0x00,
+      0x01,
+      0x00,
+      0x00,
+      0x00,
+      0x01,
+      0x08,
+      0x06,
+      0x00,
+      0x00,
+      0x00,
+      0x1F,
+      0x15,
+      0xC4,
+      0x89,
+      0x00,
+      0x00,
+      0x00,
+      0x0D,
+      'I',
+      'D',
+      'A',
+      'T',
+      0x08,
+      0xD7,
+      0x63,
+      0xF8,
+      0xCF,
+      0xC0,
+      0xF0,
+      0x1F,
+      0x00,
+      0x05,
+      0x00,
+      0x01,
+      0xFF,
+      0x72,
+      0x9C,
+      0x52,
+      0x67,
+      0x00,
+      0x00,
+      0x00,
+      0x00,
+      'I',
+      'E',
+      'N',
+      'D',
+      0xAE,
+      0x42,
+      0x60,
+      0x82,
+    };
+  }
 }  // namespace
 
 TEST(TerraAssetsTest, InspectsPngMetadataAndStableRevision) {
-  const std::vector<std::uint8_t> png {
-    0x89,
-    0x50,
-    0x4E,
-    0x47,
-    0x0D,
-    0x0A,
-    0x1A,
-    0x0A,
-    0x00,
-    0x00,
-    0x00,
-    0x0D,
-    'I',
-    'H',
-    'D',
-    'R',
-    0x00,
-    0x00,
-    0x02,
-    0x80,
-    0x00,
-    0x00,
-    0x01,
-    0xE0,
-  };
+  const auto png = valid_png();
   const auto file = write_asset("terra-asset.png", png);
 
   const auto first = terra_assets::inspect(file.path, "poster");
@@ -79,8 +133,8 @@ TEST(TerraAssetsTest, InspectsPngMetadataAndStableRevision) {
   ASSERT_TRUE(second);
   EXPECT_EQ(first->id, "poster");
   EXPECT_EQ(first->media_type, "image/png");
-  EXPECT_EQ(first->width, 640);
-  EXPECT_EQ(first->height, 480);
+  EXPECT_EQ(first->width, 1);
+  EXPECT_EQ(first->height, 1);
   EXPECT_EQ(first->size, png.size());
   EXPECT_EQ(first->revision, second->revision);
   EXPECT_EQ(first->etag, second->etag);
@@ -99,12 +153,29 @@ TEST(TerraAssetsTest, InspectsJpegMetadata) {
     0xFF,
     0xC0,
     0x00,
-    0x07,
+    0x0B,
     0x08,
     0x04,
     0x38,
     0x07,
     0x80,
+    0x01,
+    0x01,
+    0x11,
+    0x00,
+    0xFF,
+    0xDA,
+    0x00,
+    0x08,
+    0x01,
+    0x01,
+    0x00,
+    0x00,
+    0x3F,
+    0x00,
+    0x01,
+    0xFF,
+    0xD9,
   };
   const auto file = write_asset("terra-asset.jpg", jpeg);
   const auto asset = terra_assets::inspect(file.path, "icon");
@@ -123,6 +194,20 @@ TEST(TerraAssetsTest, RejectsMissingEmptyMalformedAndOversizedAssets) {
 
   const auto malformed = write_asset("malformed-terra-asset.png", {0x89, 0x50, 0x4E, 0x47});
   EXPECT_FALSE(terra_assets::inspect(malformed.path, "poster"));
+
+  const auto truncated_png = write_asset("truncated-terra-asset.png", {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 'I', 'H', 'D', 'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01});
+  EXPECT_FALSE(terra_assets::inspect(truncated_png.path, "poster"));
+
+  const auto truncated_jpeg = write_asset("truncated-terra-asset.jpg", {0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00});
+  EXPECT_FALSE(terra_assets::inspect(truncated_jpeg.path, "poster"));
+
+  auto bad_crc_bytes = valid_png();
+  bad_crc_bytes[29] ^= 0x01;
+  const auto bad_crc = write_asset("bad-crc-terra-asset.png", bad_crc_bytes);
+  EXPECT_FALSE(terra_assets::inspect(bad_crc.path, "poster"));
+
+  const auto scan_before_frame = write_asset("scan-before-frame-terra-asset.jpg", {0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x01, 0xFF, 0xD9});
+  EXPECT_FALSE(terra_assets::inspect(scan_before_frame.path, "poster"));
 
   temporary_asset_t oversized {std::filesystem::path {SOL_TEST_BIN_DIR} / "oversized-terra-asset.png"};
   std::ofstream stream {oversized.path, std::ios::binary};

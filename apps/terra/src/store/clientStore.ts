@@ -39,6 +39,15 @@ export interface Host {
   lastSeenAt: number
   paired: boolean
   wakeable?: boolean
+  apiVersion?: number
+  apiPort?: number
+  capabilities?: string[]
+  apiClientUuid?: string
+  apiClientName?: string
+  apiScopes?: string[]
+  allowedApps?: string[]
+  features?: Record<string, unknown>
+  limits?: Record<string, unknown>
 }
 
 export interface PairingUpdate {
@@ -56,6 +65,19 @@ export interface GameApp {
   name: string
   hdrSupported: boolean
   appCollectorGame: boolean
+  uuid?: string
+  kind?: string
+  description?: string
+  source?: string
+  publisher?: string
+  tags?: string[]
+  inputRequirements?: string[]
+  installed?: boolean
+  updateAvailable?: boolean
+  assetRevision?: number
+  displayProfileId?: string | null
+  streamProfileId?: string | null
+  sandboxProfileId?: string | null
   artDataUrl?: string
   artError?: string
 }
@@ -85,6 +107,85 @@ export interface SessionUpdate {
   resumed: boolean
 }
 
+export interface LogicalSession {
+  id: string
+  appUuid: string
+  legacyAppId: number
+  state: 'preparing' | 'starting' | 'running' | 'disconnected' | 'stopped' | 'failed'
+  stateReason: string
+  startedAt: number
+  updatedAt: number
+  width: number
+  height: number
+  refreshRate: number
+  hdr: boolean
+  revision: number
+}
+
+export interface TelemetrySnapshot {
+  timestamp: number
+  host: {
+    healthy: boolean
+    captureHealthy: boolean | null
+    captureFps: number | null
+    encoderHealthy: boolean | null
+    encoderCodec: string | null
+    encoderLatencyMs: number | null
+    audioCaptureHealthy: boolean | null
+    activeLogicalSessions: number
+    activeTransportSessions: number
+  }
+  sessions: Array<{
+    sessionId: string
+    state: string
+    codec: string | null
+    captureFps: number | null
+    encodeFps: number | null
+    transmitFps: number | null
+    encodeLatencyMs: number | null
+    bitrateKbps: number | null
+    droppedFrames: number | null
+  }>
+}
+
+export type SolResourceUpdate =
+  | { hostId: string; resource: 'sessions'; payload: { sessions: LogicalSession[] } }
+  | { hostId: string; resource: 'telemetry'; payload: TelemetrySnapshot }
+  | {
+      hostId: string
+      resource: 'event'
+      payload:
+        | { type: 'session.created' | 'session.updated'; data: LogicalSession }
+        | { type: 'session.removed'; data: { id: string } }
+        | { type: 'telemetry.sample'; data: TelemetrySnapshot }
+        | {
+            type:
+              | 'host.changed'
+              | 'capabilities.changed'
+              | 'catalog.changed'
+              | 'displays.changed'
+              | 'virtualDisplay.created'
+              | 'virtualDisplay.updated'
+              | 'virtualDisplay.removed'
+              | 'workspace.created'
+              | 'workspace.updated'
+              | 'workspace.removed'
+              | 'profile.created'
+              | 'profile.updated'
+              | 'profile.removed'
+              | 'peripheral.added'
+              | 'peripheral.updated'
+              | 'peripheral.removed'
+              | 'sandbox.created'
+              | 'sandbox.updated'
+              | 'sandbox.removed'
+              | 'operation.updated'
+              | 'host.stopping'
+              | 'resync.required'
+            data: unknown
+          }
+    }
+
 interface ClientState {
   bridge: BridgeStatus
   hosts: Host[]
@@ -92,6 +193,8 @@ interface ClientState {
   pairing: PairingState | undefined
   library: AppLibrary
   session: SessionUpdate | undefined
+  logicalSessionsByHost: Record<string, LogicalSession[]>
+  telemetryByHost: Record<string, TelemetrySnapshot | undefined>
   appMode: AppMode
   settingsByMode: Record<AppMode, StreamSettings>
   setBridge: (bridge: BridgeStatus) => void
@@ -103,6 +206,7 @@ interface ClientState {
   setLibrary: (library: AppLibrary) => void
   setArtwork: (hostId: string, appId: number, dataUrl: string, error: string) => void
   setSession: (session: SessionUpdate) => void
+  setSolResource: (update: SolResourceUpdate) => void
   setAppMode: (appMode: AppMode) => void
   updateSettings: (settings: Partial<StreamSettings>) => void
   resetSettings: () => void
@@ -122,6 +226,8 @@ export const useClientStore = create<ClientState>()(
       pairing: undefined,
       library: { hostId: '', state: 'idle', apps: [], message: '' },
       session: undefined,
+      logicalSessionsByHost: {},
+      telemetryByHost: {},
       appMode: 'gaming',
       settingsByMode: {
         gaming: { ...defaultSettingsByMode.gaming },
@@ -171,6 +277,54 @@ export const useClientStore = create<ClientState>()(
               ? { ...session, appId: state.session.appId, appName: state.session.appName }
               : session,
         })),
+      setSolResource: (update) =>
+        set((state) => {
+          if (update.resource === 'sessions') {
+            return {
+              logicalSessionsByHost: {
+                ...state.logicalSessionsByHost,
+                [update.hostId]: update.payload.sessions,
+              },
+            }
+          }
+          if (update.resource === 'telemetry') {
+            return {
+              telemetryByHost: {
+                ...state.telemetryByHost,
+                [update.hostId]: update.payload,
+              },
+            }
+          }
+          const event = update.payload
+          if (event.type === 'telemetry.sample') {
+            return {
+              telemetryByHost: {
+                ...state.telemetryByHost,
+                [update.hostId]: event.data,
+              },
+            }
+          }
+          if (
+            event.type !== 'session.created' &&
+            event.type !== 'session.updated' &&
+            event.type !== 'session.removed'
+          ) {
+            return state
+          }
+          const sessions = state.logicalSessionsByHost[update.hostId] ?? []
+          const nextSessions =
+            event.type === 'session.removed'
+              ? sessions.filter((session) => session.id !== event.data.id)
+              : [...sessions.filter((session) => session.id !== event.data.id), event.data].sort(
+                  (left, right) => right.updatedAt - left.updatedAt,
+                )
+          return {
+            logicalSessionsByHost: {
+              ...state.logicalSessionsByHost,
+              [update.hostId]: nextSessions,
+            },
+          }
+        }),
       setAppMode: (appMode) => set({ appMode }),
       updateSettings: (settings) =>
         set((state) => ({
@@ -206,6 +360,15 @@ export const useClientStore = create<ClientState>()(
               displayModes: [],
               lastSeenAt: 0,
               paired: false,
+              apiVersion: 0,
+              apiPort: 0,
+              capabilities: [],
+              apiClientUuid: '',
+              apiClientName: '',
+              apiScopes: [],
+              allowedApps: [],
+              features: {},
+              limits: {},
             },
           ],
         })),

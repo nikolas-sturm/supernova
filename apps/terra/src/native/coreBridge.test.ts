@@ -1,0 +1,159 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const neutralino = vi.hoisted(() => {
+  const eventHandlers = new Map<string, (event: CustomEvent<unknown>) => void>()
+  return {
+    eventHandlers,
+    dispatch: vi.fn(() => Promise.resolve()),
+    eventsOff: vi.fn((name: string) => {
+      eventHandlers.delete(name)
+      return Promise.resolve()
+    }),
+    eventsOn: vi.fn((name: string, handler: (event: CustomEvent<unknown>) => void) => {
+      eventHandlers.set(name, handler)
+      return Promise.resolve()
+    }),
+    getStats: vi.fn(() => Promise.resolve({ connected: ['dev.terra.core'] })),
+    init: vi.fn(),
+  }
+})
+
+vi.mock('@neutralinojs/lib', () => ({
+  app: { exit: vi.fn() },
+  events: { off: neutralino.eventsOff, on: neutralino.eventsOn },
+  extensions: { dispatch: neutralino.dispatch, getStats: neutralino.getStats },
+  init: neutralino.init,
+  window: {},
+}))
+
+vi.mock('./overlayWindow', () => ({
+  dismissStreamOverlay: vi.fn(() => Promise.resolve()),
+  openStreamOverlay: vi.fn(() => Promise.resolve()),
+  prewarmStreamOverlay: vi.fn(() => Promise.resolve()),
+  stopStreamOverlayPrewarm: vi.fn(() => Promise.resolve()),
+  updateStreamOverlayStatistics: vi.fn(() => Promise.resolve()),
+}))
+
+import { pairCoreHost, startCoreBridge } from './coreBridge'
+
+describe('coreBridge host protocol', () => {
+  beforeEach(() => {
+    Object.defineProperty(window, 'NL_OS', { configurable: true, value: 'Linux' })
+  })
+
+  afterEach(() => {
+    neutralino.eventHandlers.clear()
+    vi.clearAllMocks()
+    Reflect.deleteProperty(window, 'NL_OS')
+  })
+
+  it('normalizes legacy negative host timestamps without rejecting the host list', () => {
+    const onHosts = vi.fn()
+    const onHostError = vi.fn()
+    const stop = startCoreBridge({
+      onStatus: vi.fn(),
+      onHosts,
+      onHostError,
+      onPairing: vi.fn(),
+      onApps: vi.fn(),
+      onArtwork: vi.fn(),
+      onSession: vi.fn(),
+      onSolResource: vi.fn(),
+    })
+
+    neutralino.eventHandlers.get('terra.hosts.changed')?.(
+      new CustomEvent('terra.hosts.changed', {
+        detail: {
+          schemaVersion: 1,
+          hosts: [
+            {
+              id: 'host-1',
+              name: 'RIG',
+              address: 'rig',
+              serverName: 'Rig',
+              serverUniqueId: 'server-1',
+              appVersion: '7.1.431.-1',
+              serverState: 'SUNSHINE_SERVER_FREE',
+              status: 'offline',
+              error: 'Cancelled',
+              httpsPort: 47984,
+              currentGameId: 0,
+              serverCodecModeSupport: 2_032_385,
+              maxLumaPixelsHevc: 1_869_449_984,
+              displayModes: [],
+              lastSeenAt: -2_126_954_256,
+              paired: false,
+              wakeable: false,
+            },
+          ],
+        },
+      }),
+    )
+
+    expect(onHosts).toHaveBeenCalledWith([expect.objectContaining({ id: 'host-1', lastSeenAt: 0 })])
+    expect(onHostError).not.toHaveBeenCalled()
+    stop()
+  })
+
+  it('validates and forwards logical session events', () => {
+    const onSolResource = vi.fn()
+    const stop = startCoreBridge({
+      onStatus: vi.fn(),
+      onHosts: vi.fn(),
+      onHostError: vi.fn(),
+      onPairing: vi.fn(),
+      onApps: vi.fn(),
+      onArtwork: vi.fn(),
+      onSession: vi.fn(),
+      onSolResource,
+    })
+    const logicalSession = {
+      id: '11111111-1111-4111-8111-111111111111',
+      appUuid: '22222222-2222-4222-8222-222222222222',
+      legacyAppId: 7,
+      state: 'running',
+      stateReason: 'streaming',
+      startedAt: 1,
+      updatedAt: 2,
+      width: 2560,
+      height: 1440,
+      refreshRate: 120,
+      hdr: true,
+      revision: 3,
+    }
+
+    neutralino.eventHandlers.get('terra.sol.resource.changed')?.(
+      new CustomEvent('terra.sol.resource.changed', {
+        detail: {
+          schemaVersion: 1,
+          hostId: 'host-1',
+          resource: 'event',
+          payload: {
+            schemaVersion: 1,
+            id: 4,
+            type: 'session.updated',
+            timestamp: 5,
+            data: logicalSession,
+          },
+        },
+      }),
+    )
+
+    expect(onSolResource).toHaveBeenCalledWith({
+      hostId: 'host-1',
+      resource: 'event',
+      payload: { type: 'session.updated', data: logicalSession },
+    })
+    stop()
+  })
+
+  it('requests workstation access while pairing', async () => {
+    await pairCoreHost('host-1', '0427', 'workstation')
+
+    expect(neutralino.dispatch).toHaveBeenCalledWith('dev.terra.core', 'host.pair', {
+      id: 'host-1',
+      pin: '0427',
+      access: 'workstation',
+    })
+  })
+})

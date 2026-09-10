@@ -80,6 +80,7 @@ export const pairingSchema = z.looseObject({
   name: z.string().optional(),
   address: z.string().optional(),
   platform: z.string().optional(),
+  explicit_policy: z.boolean().default(false),
   requested_scopes: z.array(z.string()).default([]),
   requested_inputs: z.array(z.string()).default([]),
 })

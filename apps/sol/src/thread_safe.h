@@ -408,22 +408,32 @@ namespace safe {
      * @brief Notify waiters that a new event value is available.
      *
      * @param args Arguments forwarded to the callable or parser.
+     * @return Number of older elements discarded to make room.
      */
     template<class... Args>
-    void raise(Args &&...args) {
+    std::size_t raise(Args &&...args) {
       std::lock_guard ul {_lock};
 
       if (!_continue) {
-        return;
+        return 0;
       }
 
+      std::size_t dropped = 0;
       if (_queue.size() == _max_elements) {
+        dropped = _queue.size();
         _queue.clear();
       }
 
       _queue.emplace_back(std::forward<Args>(args)...);
 
       _cv.notify_all();
+      return dropped;
+    }
+
+    /** @brief Return current queued element count. @return Number of queued elements. */
+    std::size_t size() {
+      std::lock_guard lock {_lock};
+      return _queue.size();
     }
 
     /**

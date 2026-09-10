@@ -10,6 +10,12 @@
 
 namespace terra {
 
+struct InputOverlayState {
+    std::uint64_t revision = 0;
+    bool visible = false;
+    bool captureSuspended = false;
+};
+
 std::uint16_t connectedGamepadMask();
 bool gamepadTransportAvailable() noexcept;
 [[nodiscard]] std::optional<std::string> prepareClipboardText(std::string_view text);
@@ -26,6 +32,10 @@ namespace terra {
 
 class InputForwarder {
  public:
+    using OverlayListener = std::function<void(std::uint64_t revision, bool visible)>;
+    using OverlayCaptureListener =
+        std::function<void(std::uint64_t revision, bool captureSuspended)>;
+
     InputForwarder();
     ~InputForwarder();
 
@@ -33,10 +43,14 @@ class InputForwarder {
     InputForwarder& operator=(const InputForwarder&) = delete;
 
     void start(HWND window, InputSettings settings, int width, int height, int fps,
-               std::function<void()> toggleStatistics = {},
-               std::function<bool()> toggleFullscreen = {},
-               std::function<void()> openOverlay = {});
-    void resumeAfterOverlay();
+                std::function<void()> toggleStatistics = {},
+                std::function<bool()> toggleFullscreen = {},
+                OverlayListener overlayListener = {},
+                OverlayCaptureListener overlayCaptureListener = {},
+                InputOverlayState overlayState = {});
+    void closeOverlay(std::uint64_t revision);
+    [[nodiscard]] bool acknowledgeOverlayHidden(std::uint64_t revision);
+    void updateOverlay();
     void setEnabled(bool enabled);
     void setGamepadRumble(std::uint16_t controllerNumber, std::uint16_t lowFrequency,
                           std::uint16_t highFrequency);
@@ -67,6 +81,10 @@ namespace terra {
 
 class InputForwarder {
  public:
+    using OverlayListener = std::function<void(std::uint64_t revision, bool visible)>;
+    using OverlayCaptureListener =
+        std::function<void(std::uint64_t revision, bool captureSuspended)>;
+
     InputForwarder();
     ~InputForwarder();
 
@@ -74,10 +92,14 @@ class InputForwarder {
     InputForwarder& operator=(const InputForwarder&) = delete;
 
     void start(SDL_Window* window, InputSettings settings, int width, int height, int fps,
-               std::function<void()> toggleStatistics = {},
-               std::function<bool()> toggleFullscreen = {},
-               std::function<void()> openOverlay = {});
-    void resumeAfterOverlay();
+                std::function<void()> toggleStatistics = {},
+                std::function<bool()> toggleFullscreen = {},
+                OverlayListener overlayListener = {},
+                OverlayCaptureListener overlayCaptureListener = {},
+                InputOverlayState overlayState = {});
+    void closeOverlay(std::uint64_t revision);
+    [[nodiscard]] bool acknowledgeOverlayHidden(std::uint64_t revision);
+    void updateOverlay();
     void setEnabled(bool enabled);
     void setGamepadRumble(std::uint16_t controllerNumber, std::uint16_t lowFrequency,
                           std::uint16_t highFrequency);

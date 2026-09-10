@@ -421,6 +421,7 @@ namespace terra_sandboxes {
         impl_->resources.clear();
         return;
       }
+      const auto loaded = impl_->resources;
       auto candidate = impl_->resources;
       const auto now = impl_->time();
       if (!now) {
@@ -472,6 +473,19 @@ namespace terra_sandboxes {
       }
       impl_->resources = std::move(candidate);
       impl_->usable = true;
+      if (impl_->callbacks.on_change) {
+        for (const auto &[id, previous] : loaded) {
+          const auto current = impl_->resources.find(id);
+          try {
+            if (current == impl_->resources.end()) {
+              impl_->callbacks.on_change(previous, std::nullopt);
+            } else if (to_json(previous) != to_json(current->second)) {
+              impl_->callbacks.on_change(previous, current->second);
+            }
+          } catch (...) {
+          }
+        }
+      }
     } catch (...) {
       impl_->resources.clear();
     }
@@ -848,6 +862,10 @@ namespace terra_sandboxes {
   }
 
   status_t manager_t::revoke_owner(const std::string &owner) {
+    return revoke_unauthorized(owner, {}, std::nullopt);
+  }
+
+  status_t manager_t::revoke_unauthorized(const std::string &owner, const std::vector<std::string> &authorized_ids, const std::optional<std::uint64_t> expected_collection_revision) {
     std::scoped_lock lock {impl_->mutex};
     if (!impl_->usable) {
       return status_t::unavailable;
@@ -855,9 +873,12 @@ namespace terra_sandboxes {
     if (!valid_uuid(owner)) {
       return status_t::invalid;
     }
+    if (expected_collection_revision && *expected_collection_revision != impl_->collection_revision) {
+      return status_t::conflict;
+    }
     std::vector<std::string> affected;
     for (const auto &[id, resource] : impl_->resources) {
-      if (resource.owner_client_uuid && *resource.owner_client_uuid == owner) {
+      if (resource.owner_client_uuid && *resource.owner_client_uuid == owner && !std::ranges::contains(authorized_ids, id)) {
         affected.push_back(id);
       }
     }
@@ -880,6 +901,7 @@ namespace terra_sandboxes {
       return status_t::persistence_error;
     }
     auto completed = impl_->resources;
+    bool failed = false;
     for (const auto &id : affected) {
       auto &resource = completed.at(id);
       const auto terminated = impl_->terminate(resource, true);
@@ -888,12 +910,8 @@ namespace terra_sandboxes {
           impl_->clear_runtime(resource, terminated.exit_code, *now);
         }
         impl_->fail(resource, terminated.terminated ? make_error("cleanup_failed", "Sandbox resource cleanup failed") : (terminated.error ? *terminated.error : make_error("termination_failed", "Sandbox termination failed")), *now);
-        if (!impl_->publish(std::move(completed))) {
-          impl_->usable = false;
-          return status_t::persistence_error;
-        }
-        impl_->usable = false;
-        return status_t::provider_error;
+        failed = true;
+        continue;
       }
       if (!resource.persistent) {
         completed.erase(id);
@@ -909,7 +927,7 @@ namespace terra_sandboxes {
       impl_->usable = false;
       return status_t::persistence_error;
     }
-    return status_t::success;
+    return failed ? status_t::provider_error : status_t::success;
   }
 
   nlohmann::json to_json(const resource_t &resource) {

@@ -662,6 +662,14 @@ namespace rtsp_stream {
       return result;
     }
 
+    /** @brief Advance fixed-window telemetry rates for active session slots. */
+    void sample_telemetry() {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        stream::session::sample_telemetry(*slot);
+      }
+    }
+
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;  ///< Launch event.
 
     /**
@@ -807,6 +815,11 @@ namespace rtsp_stream {
   std::vector<session_info_t> sessions() {
     server.clear(false);
     return server.sessions();
+  }
+
+  void sample_telemetry() {
+    server.clear(false);
+    server.sample_telemetry();
   }
 
   bool terminate_session(const std::string_view session_id, const std::string_view client_uuid) {
@@ -1262,6 +1275,28 @@ namespace rtsp_stream {
       config.monitor.enableIntraRefresh = (int) util::from_view(args.at("x-ss-video[0].intraRefresh"sv));
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
+      if (session.profile_bitrate_kbps) {
+        config.monitor.bitrate = *session.profile_bitrate_kbps;
+        configuredBitrateKbps = 0;
+      }
+      if (session.profile_video_format) {
+        config.monitor.videoFormat = *session.profile_video_format;
+      }
+      if (session.profile_chroma_sampling) {
+        config.monitor.chromaSamplingType = *session.profile_chroma_sampling;
+      }
+      if (session.profile_audio_channels && session.profile_audio_mask) {
+        config.audio.channels = *session.profile_audio_channels;
+        config.audio.mask = *session.profile_audio_mask;
+      }
+      if (session.profile_stream_applied) {
+        config.monitor.width = session.width;
+        config.monitor.height = session.height;
+        config.monitor.framerate = session.fps;
+        config.monitor.framerateX100 = 0;
+        config.monitor.dynamicRange = session.enable_hdr ? 1 : 0;
+      }
+      config.monitor.output_name = session.capture_output_name;
     } catch (std::out_of_range &) {
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
       return;
@@ -1348,7 +1383,7 @@ namespace rtsp_stream {
 
     // Check that any required encryption is enabled
     auto encryption_mode = net::encryption_mode_for_address(sock.remote_endpoint().address());
-    if (encryption_mode == config::ENCRYPTION_MODE_MANDATORY && (config.encryptionFlagsEnabled & (SS_ENC_VIDEO | SS_ENC_AUDIO)) != (SS_ENC_VIDEO | SS_ENC_AUDIO)) {
+    if ((encryption_mode == config::ENCRYPTION_MODE_MANDATORY || session.profile_encryption_required) && (config.encryptionFlagsEnabled & (SS_ENC_VIDEO | SS_ENC_AUDIO)) != (SS_ENC_VIDEO | SS_ENC_AUDIO)) {
       BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
 
       respond(sock, session, &option, 403, "Forbidden", req->sequenceNumber, {});

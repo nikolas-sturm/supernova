@@ -139,9 +139,16 @@ namespace terra::profiles {
   }  // namespace
 
   struct manager_t::impl_t {
+    /** @brief Caller-visible collection revision state. */
+    struct projection_t {
+      std::string fingerprint;  ///< Last serialized visible collection.
+      std::uint64_t revision {};  ///< Monotonic revision for this projection.
+    };
+
     callbacks_t cb;
     mutable std::mutex mutex;
     std::map<std::string, profile_t> profiles;
+    std::map<std::string, projection_t, std::less<>> projections;
     std::uint64_t revision {};
     status_t available {status_t::success};
 
@@ -153,6 +160,9 @@ namespace terra::profiles {
       try {
         const auto text = cb.load();
         if (!text) {
+          if (!save(profiles, revision)) {
+            available = status_t::unavailable;
+          }
           return;
         }
         const auto doc = json::parse(*text);
@@ -164,20 +174,25 @@ namespace terra::profiles {
         for (const auto &v : doc["profiles"]) {
           try {
             if (!exact(v, {"id", "type", "name", "ownerClientUuid", "shared", "revision", "configuration"}) || v.size() != 7 || !v.contains("id") || !v.at("id").is_string() || !v.contains("type") || !v.at("type").is_string() || !v.contains("name") || !v.at("name").is_string() || v.at("name").get_ref<const std::string &>().empty() || !v.contains("ownerClientUuid") || (!v.at("ownerClientUuid").is_null() && !v.at("ownerClientUuid").is_string()) || !v.contains("shared") || !v.at("shared").is_boolean() || !v.contains("revision") || !integer(v.at("revision"), 1, std::numeric_limits<std::uint64_t>::max()) || !v.contains("configuration")) {
-              continue;
+              throw std::invalid_argument("profile record shape");
             }
             profile_t p {v.at("id"), v.at("type"), v.at("name"), v.at("ownerClientUuid").is_null() ? std::nullopt : std::optional<std::string>(v.at("ownerClientUuid")), v.at("shared"), v.at("revision"), v.at("configuration")};
             json normalized = p.configuration;
             if (!uuid(p.id) || (p.owner_client_uuid && !uuid(*p.owner_client_uuid)) || !validate(p.type, normalized)) {
-              continue;
+              throw std::invalid_argument("profile record");
             }
             p.configuration = std::move(normalized);
-            // Persisted order is authoritative: first valid occurrence wins deterministically.
-            profiles.emplace(p.id, std::move(p));
+            if (!profiles.emplace(p.id, std::move(p)).second) {
+              throw std::invalid_argument("duplicate profile record");
+            }
           } catch (...) {
+            profiles.clear();
+            available = status_t::unavailable;
+            return;
           }
         }
       } catch (...) {
+        profiles.clear();
         available = status_t::unavailable;
       }
     }
@@ -248,6 +263,9 @@ namespace terra::profiles {
       }
       for (const auto &[kind, id] : values) {
         if (kind == "application") {
+          if (!actor.allowed_apps.empty() && !actor.allowed_apps.contains(id)) {
+            return status_t::not_found;
+          }
           if (cb.validate_reference) {
             const auto result = cb.validate_reference(kind, id);
             if (result != status_t::success) {
@@ -338,12 +356,31 @@ namespace terra::profiles {
       return {status_t::invalid, "invalid profile type"};
     }
     result_t result;
-    result.collection_revision = impl_->revision;
     for (const auto &[id, p] : impl_->profiles) {
       if ((!type || p.type == *type) && impl_->visible(actor, p)) {
         result.profiles.push_back(p);
       }
     }
+    nlohmann::json visible = nlohmann::json::array();
+    for (const auto &profile : result.profiles) {
+      visible.push_back(to_json(profile));
+    }
+    auto &projection = impl_->projections[actor.client_uuid + '\0' + type.value_or(std::string {})];
+    const auto fingerprint = visible.dump();
+    if (projection.revision == 0) {
+      projection.revision = impl_->available == status_t::success ? impl_->revision + 1 : 1;
+      if (impl_->cb.clock) {
+        try {
+          projection.revision = std::max(projection.revision, impl_->cb.clock());
+        } catch (...) {
+        }
+      }
+      projection.fingerprint = fingerprint;
+    } else if (projection.fingerprint != fingerprint) {
+      projection.fingerprint = fingerprint;
+      ++projection.revision;
+    }
+    result.collection_revision = projection.revision;
     return result;
   }
 
@@ -497,6 +534,12 @@ namespace terra::profiles {
     }
     if (!actor.scopes.contains("host.control") || !impl_->scope(actor, it->second.type, true)) {
       return {status_t::forbidden, "profile adoption forbidden"};
+    }
+    if (const auto refs = impl_->refs(actor, it->second); refs != status_t::success) {
+      return {refs, "profile reference unavailable"};
+    }
+    if (impl_->cb.provider_supports && !impl_->cb.provider_supports(it->second.type, it->second.configuration)) {
+      return {status_t::unsupported, "unsupported profile configuration"};
     }
     if (it->second.revision != expected) {
       return {status_t::conflict, "profile revision conflict"};

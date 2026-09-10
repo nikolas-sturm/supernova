@@ -297,6 +297,8 @@ namespace terra_sandboxes {
      * @return Aggregate operation status.
      */
     status_t revoke_owner(const std::string &owner_client_uuid);
+    /** @brief Revoke only owned sandboxes absent from current authorization. @param owner_client_uuid Owner UUID. @param authorized_ids Resource UUIDs owner may retain. @param expected_collection_revision Revision used to build authorized IDs, or empty for unconditional owner revocation. @return Completion status. */
+    status_t revoke_unauthorized(const std::string &owner_client_uuid, const std::vector<std::string> &authorized_ids, std::optional<std::uint64_t> expected_collection_revision = std::nullopt);
 
   private:
     struct impl_t;  ///< Hidden synchronized implementation.

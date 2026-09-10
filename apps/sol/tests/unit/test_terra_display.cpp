@@ -64,6 +64,13 @@ TEST(TerraDisplayTest, ClassifiesOutputTechnologyWithoutNames) {
   EXPECT_EQ(kind_from_output_technology(DISPLAYCONFIG_OUTPUT_TECHNOLOGY_OTHER), Kind::Unknown);
 }
 
+TEST(TerraDisplayTest, SerializesOnlyContractDisplayKinds) {
+  EXPECT_EQ(kind_name(Kind::Unknown), "physical");
+  EXPECT_EQ(kind_name(Kind::Internal), "physical");
+  EXPECT_EQ(kind_name(Kind::External), "physical");
+  EXPECT_EQ(kind_name(Kind::Virtual), "virtual");
+}
+
 TEST(TerraDisplayTest, TransformsDevicesWithoutGuessingKind) {
   const display_device::EnumeratedDeviceList devices {
     {.m_device_id = "stable-id",
@@ -129,5 +136,12 @@ TEST(TerraDisplayTest, SerializesExactContractWithoutInternalDeviceId) {
   EXPECT_EQ(json.at("currentMode").at("refreshNumerator"), 60);
   EXPECT_EQ(json.at("scale"), (nlohmann::json {{"numerator", 3}, {"denominator", 2}}));
   EXPECT_FALSE(json.contains("deviceId"));
+}
+
+TEST(TerraDisplayTest, SerializesPhysicalDisplayKind) {
+  Snapshot snapshot;
+  snapshot.kind = Kind::Internal;
+
+  EXPECT_EQ(to_json(snapshot).at("kind"), "physical");
 }
 #endif

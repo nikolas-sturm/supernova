@@ -892,6 +892,80 @@
 .hostPrimaryActions .libraryButton {
   color: var(--color-primary);
 }
+.logicalSessionGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: 16px;
+}
+.logicalSessionCard {
+  min-width: 0;
+  padding: 20px;
+  border: 1px solid var(--color-border);
+  border-top: 2px solid var(--color-primary);
+  background: var(--color-surface);
+}
+.logicalSessionCard header,
+.logicalSessionCard footer,
+.telemetryPanel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.logicalSessionCard header {
+  justify-content: space-between;
+}
+.logicalSessionCard header code {
+  color: var(--color-text-subtle);
+  font-size: 9px;
+}
+.logicalSessionCard h3 {
+  margin: 22px 0 6px;
+  font: 650 21px / 1.2 var(--font-display);
+}
+.logicalSessionCard > p {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+.logicalSessionCard dl {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin: 22px 0;
+}
+.logicalSessionCard dt {
+  color: var(--color-text-subtle);
+  font: 650 9px / 1.4 var(--font-mono);
+  text-transform: uppercase;
+}
+.logicalSessionCard dd {
+  margin: 5px 0 0;
+  font: 11px / 1.4 var(--font-mono);
+}
+.logicalSessionCard footer {
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border);
+}
+.telemetryPanel {
+  margin-top: 20px;
+  padding: 16px 18px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-subtle);
+}
+.telemetryPanel span {
+  color: var(--color-primary);
+  font: 650 9px / 1 var(--font-mono);
+  letter-spacing: 0.1em;
+}
+.telemetryPanel strong {
+  font: 650 14px / 1.2 var(--font-display);
+}
+.telemetryPanel code {
+  flex: 1;
+  color: var(--color-text-muted);
+  font-size: 10px;
+}
 .sessionBanner {
   display: flex;
   align-items: center;
@@ -1433,6 +1507,10 @@
     gap: 12px;
   }
   .sessionBanner {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .telemetryPanel {
     align-items: flex-start;
     flex-direction: column;
   }

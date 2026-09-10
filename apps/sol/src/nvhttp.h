@@ -171,6 +171,7 @@ namespace nvhttp {
     std::string name;  ///< Untrusted device name reported by the pairing client.
     std::string address;  ///< Network address from which the request originated.
     std::string platform;  ///< Untrusted client platform reported during pairing.
+    bool explicit_policy {};  ///< Whether Terra policy fields were explicitly supplied.
     std::vector<std::string> requested_scopes;  ///< Terra scopes requested by the pairing client.
     std::vector<std::string> requested_inputs;  ///< Streamed input classes requested by the pairing client.
   };
@@ -436,6 +437,46 @@ namespace nvhttp {
    * @brief Test-only accessors for paired-client authorization state.
    */
   namespace test_support {
+    /**
+     * @brief Test production Terra API namespace matching.
+     *
+     * @param path Absolute request path.
+     * @return True only for API root or descendants.
+     */
+    bool is_terra_api_path(std::string_view path);
+
+    /**
+     * @brief Translate one HID keyboard usage through production mapping.
+     *
+     * @param usage HID keyboard usage byte.
+     * @return Windows-compatible virtual-key code, or zero when unmapped.
+     */
+    std::uint16_t hid_usage_to_virtual_key(std::uint8_t usage);
+
+    /**
+     * @brief Translate HID boot-keyboard modifiers through production mapping.
+     *
+     * @param modifiers HID left/right modifier bitmap.
+     * @return Moonlight modifier bitmap.
+     */
+    std::uint8_t hid_keyboard_modifiers(std::uint8_t modifiers);
+
+    /**
+     * @brief Match a token using production comma-separated HTTP header parsing.
+     *
+     * @param value Complete header value.
+     * @param token Token to match case-insensitively.
+     * @return `true` when one trimmed list entry equals the token.
+     */
+    bool http_header_contains_token(std::string_view value, std::string_view token);
+
+    /**
+     * @brief Serialize live operational capabilities through production logic.
+     *
+     * @return Comma-separated capability names advertised by authenticated server information.
+     */
+    std::string operational_capabilities_csv();
+
     /**
      * @brief Build a capability document through production serialization logic.
      *

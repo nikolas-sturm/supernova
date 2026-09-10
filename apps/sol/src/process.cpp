@@ -57,6 +57,31 @@ namespace proc {
   std::atomic_uint64_t catalog_revision_counter {};  ///< Monotonic application catalog revision.
   std::mutex catalog_snapshot_mutex;  ///< Protects the copied catalog published to HTTP readers.
   catalog_snapshot_t cached_catalog_snapshot {};  ///< Last complete catalog and matching revision.
+  std::mutex external_runtime_probe_mutex;  ///< Protects the external runtime probe.
+  runtime_probe_t external_runtime_probe;  ///< Reports sandbox or other provider-owned runtime liveness.
+  std::recursive_mutex process_state_mutex;  ///< Serializes native process lifecycle and cleanup.
+
+  void set_external_runtime_probe(runtime_probe_t probe) {
+    std::lock_guard lock {external_runtime_probe_mutex};
+    external_runtime_probe = std::move(probe);
+  }
+
+  bool runtime_running() {
+    if (proc.running() > 0) {
+      return true;
+    }
+    runtime_probe_t probe;
+    {
+      std::lock_guard lock {external_runtime_probe_mutex};
+      probe = external_runtime_probe;
+    }
+    return probe && probe();
+  }
+
+  std::recursive_mutex &runtime_mutex() {
+    static std::recursive_mutex mutex;
+    return mutex;
+  }
 
   /**
    * @brief RAII helper that runs shutdown cleanup when destroyed.
@@ -162,6 +187,8 @@ namespace proc {
   }
 
   int proc_t::execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    std::lock_guard runtime_lock {runtime_mutex()};
+    std::lock_guard process_lock {process_state_mutex};
     // Ensure starting from a clean slate
     terminate();
 
@@ -176,6 +203,19 @@ namespace proc {
 
     _app_id = app_id;
     _app = *iter;
+    _env = _base_env;
+    for (const auto &argument : launch_session->app_arguments) {
+      _app.cmd += ' ' + argument;
+    }
+    if (launch_session->app_working_directory) {
+      _app.working_dir = *launch_session->app_working_directory;
+    }
+    if (launch_session->app_elevated) {
+      _app.elevated = *launch_session->app_elevated;
+    }
+    for (const auto &[name, value] : launch_session->app_environment) {
+      _env[name] = value;
+    }
     _app_prep_begin = std::begin(_app.prep_cmds);
     _app_prep_it = _app_prep_begin;
 
@@ -297,6 +337,7 @@ namespace proc {
   }
 
   int proc_t::running() {
+    std::lock_guard process_lock {process_state_mutex};
 #ifndef _WIN32
     // On POSIX OSes, we must periodically wait for our children to avoid
     // them becoming zombies. This must be synchronized carefully with
@@ -332,6 +373,7 @@ namespace proc {
   }
 
   void proc_t::terminate() {
+    std::lock_guard process_lock {process_state_mutex};
     input::terminate_gamepads();
     std::error_code ec;
     placebo = false;
@@ -374,8 +416,6 @@ namespace proc {
 #if defined SOL_TRAY && SOL_TRAY >= 1
       system_tray::update_tray_stopped(proc::proc.get_last_run_app_name());
 #endif
-
-      display_device::revert_configuration();
     }
 
     _app_id = -1;
@@ -414,6 +454,7 @@ namespace proc {
   }
 
   std::string proc_t::get_last_run_app_name() {
+    std::lock_guard process_lock {process_state_mutex};
     return _app.name;
   }
 
@@ -1000,7 +1041,10 @@ namespace proc {
 
     if (proc_opt) {
       auto apps = proc_opt->get_apps();
-      proc = std::move(*proc_opt);
+      {
+        std::lock_guard process_lock {process_state_mutex};
+        proc = std::move(*proc_opt);
+      }
       const auto revision = ++catalog_revision_counter;
       std::lock_guard lock {catalog_snapshot_mutex};
       cached_catalog_snapshot = {.revision = revision, .apps = std::move(apps)};

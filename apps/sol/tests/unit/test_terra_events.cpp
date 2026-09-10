@@ -111,12 +111,12 @@ TEST(TerraEventsTest, PublishReadsClockOnceAndClockFailureIsAtomic) {
   std::size_t calls = 0;
   bool fails = true;
   terra_events::hub_t events {8, [&]() {
-                                  ++calls;
-                                  if (fails) {
-                                    throw std::runtime_error("clock failed");
-                                  }
-                                  return now;
-                                }};
+                                ++calls;
+                                if (fails) {
+                                  throw std::runtime_error("clock failed");
+                                }
+                                return now;
+                              }};
   const auto first = events.open("first", std::nullopt, {}).stream;
   const auto second = events.open("second", std::nullopt, {}).stream;
 
@@ -187,6 +187,20 @@ TEST(TerraEventsTest, DisconnectsCurrentStreamByClientIdentity) {
   events->disconnect_client("client");
 
   EXPECT_EQ(events->wait(stream, 0ms).status, terra_events::wait_status_t::disconnected);
+}
+
+TEST(TerraEventsTest, AuthorizationResetDiscardsReplayHistory) {
+  std::int64_t now = 1000;
+  auto events = hub(now);
+  events->open("client", std::nullopt, {"sessions"});
+  events->publish({"session.updated", "resource", 1, nlohmann::json::object()}, {"client"});
+
+  events->reset_client("client");
+  const auto reopened = events->open("client", std::optional<std::string> {"1"}, {"sessions"});
+
+  ASSERT_TRUE(reopened.resync_required);
+  ASSERT_EQ(reopened.replay.size(), 1);
+  EXPECT_EQ(reopened.replay.front().event.type, "resync.required");
 }
 
 TEST(TerraEventsTest, DestructorWakesAndJoinsActiveWaiters) {

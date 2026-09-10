@@ -5,6 +5,9 @@
 #pragma once
 
 // standard includes
+#include <atomic>
+#include <chrono>
+#include <memory>
 #include <utility>
 
 // lib includes
@@ -21,6 +24,15 @@ namespace stream {
   constexpr auto AUDIO_STREAM_PORT = 11;  ///< GameStream base-port offset used for the audio UDP stream.
 
   struct session_t;
+
+  /** @brief Capture counters shared with asynchronous provider callbacks. */
+  struct capture_telemetry_t {
+    std::atomic_uint64_t events {};  ///< Capture-provider callback count.
+    std::atomic_uint64_t captured_frames {};  ///< Fresh captured frame count.
+    std::atomic_uint64_t dropped_frames {};  ///< Captured frames dropped before encoding.
+    std::atomic_uint64_t queue_depth {};  ///< Latest capture queue depth.
+    std::atomic_uint64_t queue_drops {};  ///< Capture queue overflow count.
+  };
 
   /**
    * @brief Stream configuration shared by capture and network senders.
@@ -94,6 +106,22 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+    /** @brief Return lifetime-safe capture telemetry. @param session Active stream session. @return Shared counters. */
+    std::shared_ptr<capture_telemetry_t> capture_telemetry(session_t &session);
+    /** @brief Record one fresh captured frame. @param session Active stream session. */
+    void record_captured_frame(session_t &session);
+    /** @brief Record one successfully encoded frame. @param session Active stream session. */
+    void record_encoded_frame(session_t &session);
+    /** @brief Record captured frames dropped before encoding. @param session Active stream session. @param count Number of frames. */
+    void record_dropped_frame(session_t &session, std::uint64_t count = 1);
+    /** @brief Record captured-frame queue state. @param session Active stream session. @param depth Current depth. @param dropped Frames discarded by this update. */
+    void record_capture_queue(session_t &session, std::uint64_t depth, std::uint64_t dropped);
+    /** @brief Record latest capture-to-encode frame age. @param session Active stream session. @param latency Capture frame age, or empty when provider supplied no timestamp. */
+    void record_capture_latency(session_t &session, std::optional<std::chrono::steady_clock::duration> latency);
+    /** @brief Record latest encoder-only latency. @param session Active stream session. @param latency Encoder duration. */
+    void record_encode_latency(session_t &session, std::chrono::steady_clock::duration latency);
+    /** @brief Advance cached interval telemetry rates. @param session Active stream session. */
+    void sample_telemetry(session_t &session);
     /**
      * @brief Build an immutable Terra snapshot for a stream session.
      *
@@ -101,5 +129,7 @@ namespace stream {
      * @return Session metadata safe to use after releasing registry lock.
      */
     rtsp_stream::session_info_t snapshot(session_t &session);
+    /** @brief Complete deferred display and input restoration after application runtime termination. */
+    void runtime_stopped();
   }  // namespace session
 }  // namespace stream

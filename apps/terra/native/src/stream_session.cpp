@@ -217,9 +217,32 @@ void StreamSession::stop() {
 
 bool StreamSession::stopRequested() const noexcept { return stopRequested_.load(); }
 
-void StreamSession::resumeOverlay() {
+void StreamSession::closeOverlay(std::uint64_t revision) {
     std::scoped_lock lock{videoMutex_};
-    if (video_) video_->resumeOverlay();
+    std::optional<StreamWindowBounds> hiddenBounds;
+    {
+        std::scoped_lock stateLock{overlayStateMutex_};
+        if (!overlayState_.visible || overlayState_.revision != revision) return;
+        ++overlayState_.revision;
+        overlayState_.visible = false;
+        overlayBounds_.revision = overlayState_.revision;
+        overlayBounds_.visible = false;
+        hiddenBounds = overlayBounds_;
+    }
+    if (video_) video_->closeOverlay(revision);
+    try {
+        if (overlayListener_) overlayListener_(*hiddenBounds);
+    } catch (...) {
+    }
+}
+
+void StreamSession::acknowledgeOverlayHidden(std::uint64_t revision) {
+    std::scoped_lock lock{videoMutex_};
+    {
+        std::scoped_lock stateLock{overlayStateMutex_};
+        if (overlayState_.visible || overlayState_.revision != revision) return;
+    }
+    if (video_) video_->acknowledgeOverlayHidden(revision);
 }
 
 void StreamSession::publish(std::string state, std::string message) const noexcept {
@@ -491,6 +514,15 @@ void StreamSession::connectionStatusUpdate(int status) {
 void StreamSession::createVideoRendererLocked() {
     auto settings = config_.settings;
     if (videoDisplayOverride_) settings.displayIndex = *videoDisplayOverride_;
+    StreamOverlayState overlayState;
+    {
+        std::scoped_lock stateLock{overlayStateMutex_};
+        overlayState = {
+            .revision = overlayState_.revision,
+            .visible = overlayState_.visible,
+            .captureSuspended = overlayState_.captureSuspended,
+        };
+    }
     video_ = std::make_unique<VideoRenderer>(
         std::move(settings),
         [this](std::string state, std::string message) {
@@ -499,11 +531,30 @@ void StreamSession::createVideoRendererLocked() {
         [this] { requestDisconnect("terminated", "Render window closed.", false, true); },
         statistics_,
         [this](const StreamWindowBounds& bounds) {
+            {
+                std::scoped_lock stateLock{overlayStateMutex_};
+                if (bounds.revision < overlayState_.revision) return;
+                if (bounds.revision == overlayState_.revision &&
+                    bounds.visible == overlayState_.visible) {
+                    return;
+                }
+                overlayState_.revision = bounds.revision;
+                overlayState_.visible = bounds.visible;
+                overlayState_.captureSuspended = true;
+                overlayBounds_ = bounds;
+            }
             try {
                 if (overlayListener_) overlayListener_(bounds);
             } catch (...) {
             }
-        });
+        },
+        [this](std::uint64_t revision, bool captureSuspended) {
+            std::scoped_lock stateLock{overlayStateMutex_};
+            if (revision == overlayState_.revision) {
+                overlayState_.captureSuspended = captureSuspended;
+            }
+        },
+        overlayState);
     video_->initialize(negotiatedVideoFormat_, negotiatedWidth_, negotiatedHeight_,
                        negotiatedFrameRate_);
     hdrMode_.store(LiGetCurrentHostDisplayHdrMode());

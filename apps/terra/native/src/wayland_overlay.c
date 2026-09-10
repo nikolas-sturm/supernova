@@ -13,14 +13,17 @@
 typedef struct {
     GtkWidget* window;
     WebKitWebView* web_view;
+    struct wl_compositor* compositor;
     struct zwlr_layer_shell_v1* shell;
     struct zwlr_layer_surface_v1* surface;
+    struct wl_surface* wayland_surface;
     gboolean prewarm;
     gboolean prewarm_reported;
     gboolean show_requested;
     gboolean layer_configured;
     gboolean page_loaded;
     gboolean ready_reported;
+    gchar* revision;
 } OverlayState;
 
 static void maybe_report_ready(OverlayState* state) {
@@ -65,6 +68,9 @@ static void registry_global(void* data, struct wl_registry* registry, uint32_t n
     if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
         state->shell = wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface,
                                         version < 4 ? version : 4);
+    } else if (strcmp(interface, wl_compositor_interface.name) == 0) {
+        state->compositor = wl_registry_bind(registry, name, &wl_compositor_interface,
+                                             version < 4 ? version : 4);
     }
 }
 
@@ -89,11 +95,14 @@ static void apply_layer_shell(GtkWidget* widget, gpointer user_data) {
     struct wl_registry* registry = wl_display_get_registry(display);
     if (!registry) exit(EXIT_FAILURE);
     wl_registry_add_listener(registry, &registry_listener, state);
-    if (wl_display_roundtrip(display) < 0 || !state->shell) exit(EXIT_FAILURE);
+    if (wl_display_roundtrip(display) < 0 || !state->shell || !state->compositor) {
+        exit(EXIT_FAILURE);
+    }
     wl_registry_destroy(registry);
 
     gdk_wayland_window_set_use_custom_surface(window);
     struct wl_surface* wayland_surface = gdk_wayland_window_get_wl_surface(window);
+    state->wayland_surface = wayland_surface;
     state->surface = zwlr_layer_shell_v1_get_layer_surface(
         state->shell, wayland_surface, NULL, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
         "terra-stream-overlay");
@@ -107,14 +116,41 @@ static void apply_layer_shell(GtkWidget* widget, gpointer user_data) {
                             ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
     zwlr_layer_surface_v1_set_exclusive_zone(state->surface, -1);
     zwlr_layer_surface_v1_set_keyboard_interactivity(
-        state->surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
+        state->surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
     wl_surface_commit(wayland_surface);
     if (wl_display_roundtrip(display) < 0 || !state->layer_configured) exit(EXIT_FAILURE);
 }
 
 static void hide_overlay(OverlayState* state) {
-    // Preserve the realized WebKit view and layer role so reopening only remaps existing state.
-    gtk_widget_hide(state->window);
+    gtk_widget_set_opacity(state->window, 0.0);
+    if (state->surface && state->wayland_surface && state->compositor) {
+        struct wl_region* empty_region = wl_compositor_create_region(state->compositor);
+        wl_surface_set_input_region(state->wayland_surface, empty_region);
+        wl_region_destroy(empty_region);
+        zwlr_layer_surface_v1_set_keyboard_interactivity(
+            state->surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+        wl_surface_commit(state->wayland_surface);
+        struct wl_display* display =
+            gdk_wayland_display_get_wl_display(gtk_widget_get_display(state->window));
+        if (wl_display_roundtrip(display) < 0) gtk_main_quit();
+    }
+}
+
+static void report_hidden(const OverlayState* state) {
+    printf("TERRA_OVERLAY_HIDDEN %s\n", state->revision ? state->revision : "0");
+    fflush(stdout);
+}
+
+static void show_overlay(OverlayState* state) {
+    gtk_widget_show_all(state->window);
+    gtk_widget_set_opacity(state->window, 1.0);
+    if (state->surface && state->wayland_surface) {
+        wl_surface_set_input_region(state->wayland_surface, NULL);
+        zwlr_layer_surface_v1_set_keyboard_interactivity(
+            state->surface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+        wl_surface_commit(state->wayland_surface);
+    }
+    gdk_display_flush(gtk_widget_get_display(state->window));
 }
 
 static void close_overlay(WebKitUserContentManager* manager, WebKitJavascriptResult* result,
@@ -126,16 +162,15 @@ static void close_overlay(WebKitUserContentManager* manager, WebKitJavascriptRes
     const char* action = strcmp(requested_action, "disconnect") == 0
                              ? "disconnect"
                              : strcmp(requested_action, "quit") == 0 ? "quit" : "resume";
-    printf("TERRA_OVERLAY_CLOSED %s\n", action);
-    fflush(stdout);
     g_free(requested_action);
-    if (!state->prewarm) {
-        gtk_widget_destroy(state->window);
-        return;
-    }
     state->show_requested = FALSE;
     state->ready_reported = FALSE;
+    // Remove overlay input before the parent restores stream capture.
     hide_overlay(state);
+    report_hidden(state);
+    printf("TERRA_OVERLAY_CLOSED %s\n", action);
+    fflush(stdout);
+    if (!state->prewarm) gtk_widget_destroy(state->window);
 }
 
 static void load_changed(WebKitWebView* web_view, WebKitLoadEvent event, gpointer user_data) {
@@ -167,13 +202,22 @@ static gboolean read_command(GIOChannel* channel, GIOCondition condition, gpoint
 
     g_strchomp(line);
     if (g_str_has_prefix(line, "SHOW ") && line[5] != '\0') {
-        gchar* script = g_strdup_printf("window.TERRA_OVERLAY_SET_REQUEST('%s')", line + 5);
+        gchar* request = strchr(line + 5, ' ');
+        if (!request || request[1] == '\0') {
+            g_free(line);
+            return G_SOURCE_CONTINUE;
+        }
+        *request = '\0';
+        g_free(state->revision);
+        state->revision = g_strdup(line + 5);
+        ++request;
+        gchar* script = g_strdup_printf("window.TERRA_OVERLAY_SET_REQUEST('%s')", request);
         webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL, NULL, NULL, NULL,
                                             NULL);
         g_free(script);
         state->show_requested = TRUE;
         state->ready_reported = FALSE;
-        gtk_widget_show_all(state->window);
+        show_overlay(state);
         maybe_report_ready(state);
     } else if (g_str_has_prefix(line, "STATS ") && line[6] != '\0') {
         gchar* script =
@@ -181,10 +225,14 @@ static gboolean read_command(GIOChannel* channel, GIOCondition condition, gpoint
         webkit_web_view_evaluate_javascript(state->web_view, script, -1, NULL, NULL, NULL, NULL,
                                             NULL);
         g_free(script);
-    } else if (strcmp(line, "HIDE") == 0) {
+    } else if (g_str_has_prefix(line, "HIDE ") && line[5] != '\0') {
+        g_free(state->revision);
+        state->revision = g_strdup(line + 5);
         state->show_requested = FALSE;
         state->ready_reported = FALSE;
         hide_overlay(state);
+        report_hidden(state);
+        if (!state->prewarm) gtk_widget_destroy(state->window);
     }
     g_free(line);
     return G_SOURCE_CONTINUE;
@@ -211,13 +259,14 @@ static void web_process_terminated(WebKitWebView* web_view, WebKitWebProcessTerm
 
 int main(int argc, char** argv) {
     const gboolean prewarm = argc == 3 && strcmp(argv[1], "--prewarm") == 0;
-    if ((!prewarm && argc != 2) || (prewarm && argc != 3)) return EXIT_FAILURE;
-    const char* url = argv[prewarm ? 2 : 1];
+    if (argc != 3) return EXIT_FAILURE;
+    const char* url = argv[2];
     setenv("GDK_BACKEND", "wayland", 1);
     if (!gtk_init_check(&argc, &argv)) return EXIT_FAILURE;
 
     OverlayState state = {0};
     state.prewarm = prewarm;
+    state.revision = prewarm ? NULL : g_strdup(argv[1]);
     state.show_requested = !prewarm;
     state.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(state.window), "Terra Stream Overlay");
@@ -264,7 +313,8 @@ int main(int argc, char** argv) {
     g_io_channel_set_encoding(input, NULL, NULL);
     g_io_add_watch(input, G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL, read_command, &state);
     g_io_channel_unref(input);
-    if (!prewarm) gtk_widget_show_all(state.window);
+    if (!prewarm) show_overlay(&state);
     gtk_main();
+    g_free(state.revision);
     return EXIT_SUCCESS;
 }

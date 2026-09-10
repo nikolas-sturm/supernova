@@ -2,8 +2,8 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -14,9 +14,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "gamestream_client.h"
-#include "stream_statistics.h"
 #include "stream_settings.h"
+#include "stream_statistics.h"
 
 namespace terra {
 
@@ -42,6 +44,15 @@ struct HostRecord {
     std::string wakeMacAddress;
     std::int64_t lastSeenAt = 0;
     bool paired = false;
+    int apiVersion = 0;
+    std::uint16_t apiPort = 0;
+    std::vector<std::string> capabilities;
+    std::string apiClientUuid;
+    std::string apiClientName;
+    std::vector<std::string> apiScopes;
+    std::vector<std::string> allowedApps;
+    nlohmann::json features = nlohmann::json::object();
+    nlohmann::json limits = nlohmann::json::object();
 };
 
 struct SessionRecord {
@@ -50,8 +61,16 @@ struct SessionRecord {
     std::string appName;
     std::string sessionUrl;
     bool resumed = false;
+    std::string logicalSessionId;
     std::array<unsigned char, 16> remoteInputKey{};
     std::array<unsigned char, 16> remoteInputIv{};
+};
+
+/** @brief Low-rate Sol API resource update forwarded to Terra UI. */
+struct ApiResourceUpdate {
+    std::string hostId;      ///< Terra-local host identifier.
+    std::string resource;    ///< Stable resource collection name.
+    nlohmann::json payload;  ///< Schema-versioned Sol API response or event.
 };
 
 struct SessionUpdate {
@@ -68,6 +87,8 @@ struct StreamOverlayRequest {
     int appId = 0;
     std::string appName;
     std::uint64_t generation = 0;
+    std::uint64_t revision = 0;
+    bool visible = false;
     int x = 0;
     int y = 0;
     int width = 0;
@@ -96,17 +117,28 @@ public:
     HostRecord addHost(std::string name, std::string address);
     HostRecord discoverHost(std::string name, std::string address);
     HostRecord probeHost(const std::string& id);
-    HostRecord pairHost(const std::string& id, const std::string& pin);
+    HostRecord pairHost(const std::string& id, const std::string& pin,
+                        PairingAccess access = PairingAccess::gaming);
     void wakeHost(const std::string& id);
     [[nodiscard]] std::vector<GameStreamApp> loadApps(const std::string& hostId);
     [[nodiscard]] std::string boxArtDataUrl(const std::string& hostId, int appId);
+    [[nodiscard]] nlohmann::json loadApiResource(const std::string& hostId,
+                                                 const std::string& resource);
+    [[nodiscard]] nlohmann::json
+    mutateApiResource(const std::string& hostId, const std::string& method, const std::string& path,
+                      nlohmann::json body, std::optional<std::uint64_t> revision = std::nullopt,
+                      bool idempotent = false);
     [[nodiscard]] SessionRecord launchApp(const std::string& hostId, int appId,
                                           const StreamSettings& settings);
     void stopSession(const std::string& hostId, bool quitHost);
-    void resumeStreamOverlay(const std::string& hostId, std::uint64_t generation);
+    void closeStreamOverlay(const std::string& hostId, std::uint64_t generation,
+                            std::uint64_t revision);
+    void acknowledgeStreamOverlayHidden(const std::string& hostId, std::uint64_t generation,
+                                        std::uint64_t revision);
     void setSessionListener(std::function<void(const SessionUpdate&)> listener);
     void setStreamOverlayListener(std::function<void(const StreamOverlayRequest&)> listener);
     void setStreamStatisticsListener(std::function<void(const StreamStatisticsUpdate&)> listener);
+    void setApiResourceListener(std::function<void(const ApiResourceUpdate&)> listener);
     void removeHost(const std::string& id);
 
 private:
@@ -125,10 +157,12 @@ private:
     void load();
     void saveLocked() const;
     void requestSessionDisconnect(std::uint64_t generation, std::string hostId, int appId,
-                                  std::string appName, bool resumed,
-                                  StreamSessionEvent event, bool hostEnded, bool quitHost);
+                                  std::string appName, bool resumed, StreamSessionEvent event,
+                                  bool hostEnded, bool quitHost);
     void cleanupSessions();
     void finishSessionDisconnect(const DisconnectRequest& request);
+    void startApiEvents(const HostRecord& host);
+    void stopApiEvents(const std::string& hostId);
 
     std::filesystem::path dataPath_;
     std::filesystem::path statePath_;
@@ -151,6 +185,8 @@ private:
     std::function<void(const SessionUpdate&)> sessionListener_;
     std::function<void(const StreamOverlayRequest&)> streamOverlayListener_;
     std::function<void(const StreamStatisticsUpdate&)> streamStatisticsListener_;
+    std::function<void(const ApiResourceUpdate&)> apiResourceListener_;
+    std::unordered_map<std::string, std::jthread> apiEventThreads_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> lastWakeRequests_;
 };
 

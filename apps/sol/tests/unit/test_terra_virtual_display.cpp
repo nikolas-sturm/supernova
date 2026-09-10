@@ -36,9 +36,13 @@ namespace {
     bool apply_succeeds = true;  ///< Configuration apply result.
     bool save_succeeds = true;  ///< Persistence result.
     bool ambiguous_growth = false;  ///< Add two IDs while count grows once.
+    std::uint32_t max_count = 99;  ///< Provider connector capacity.
     int apply_calls = 0;  ///< Configuration apply call count.
     int set_calls = 0;  ///< Count setter call count.
+    int capture_calls = 0;  ///< Host display rollback snapshot count.
+    int restore_calls = 0;  ///< Host display rollback restore count.
     int fail_set_on_call = 0;  ///< One-based count setter call that fails, or zero.
+    std::vector<std::pair<std::optional<resource_t>, std::optional<resource_t>>> changes;  ///< Committed resource transitions.
 
     /**
      * @brief Set count using highest-connector removal semantics.
@@ -119,6 +123,18 @@ namespace {
         [&](std::vector<platform_configuration_t> &values) {
           return apply(values);
         },
+        max_count,
+        [&](const std::optional<resource_t> &previous, const std::optional<resource_t> &current) {
+          changes.emplace_back(previous, current);
+        },
+        [&]() {
+          ++capture_calls;
+          return true;
+        },
+        [&]() {
+          ++restore_calls;
+          return true;
+        },
       };
     }
   };
@@ -138,6 +154,7 @@ TEST(TerraVirtualDisplayTest, PreservesBaselineAndCreatesStableResource) {
   fake_t fake;
   manager_t manager {fake.callbacks()};
   ASSERT_TRUE(manager.available());
+  EXPECT_EQ(manager.max_active(), 97);
   const auto result = manager.create(OWNER, specification());
   ASSERT_EQ(result.status, status_t::success);
   EXPECT_EQ(fake.count, 3);
@@ -150,6 +167,52 @@ TEST(TerraVirtualDisplayTest, PreservesBaselineAndCreatesStableResource) {
   EXPECT_TRUE(listed.changed);
   EXPECT_EQ(listed.resources.size(), 1);
   EXPECT_FALSE(manager.list(listed.revision).changed);
+}
+
+TEST(TerraVirtualDisplayTest, AvailabilityTracksLiveProviderHealth) {
+  fake_t fake;
+  manager_t manager {fake.callbacks()};
+  ASSERT_TRUE(manager.available());
+  fake.healthy = false;
+  EXPECT_FALSE(manager.available());
+  EXPECT_EQ(manager.adopt(RESOURCE, 1, OWNER).status, status_t::unavailable);
+  fake.healthy = true;
+  EXPECT_TRUE(manager.available());
+}
+
+TEST(TerraVirtualDisplayTest, RejectsCreationAtProviderCapacity) {
+  fake_t fake;
+  fake.max_count = fake.count;
+  manager_t manager {fake.callbacks()};
+
+  EXPECT_EQ(manager.max_active(), 0);
+  EXPECT_EQ(manager.create(OWNER, specification()).status, status_t::limit_reached);
+  EXPECT_TRUE(fake.changes.empty());
+}
+
+TEST(TerraVirtualDisplayTest, ReportsOnlyCommittedResourceTransitions) {
+  fake_t fake;
+  manager_t manager {fake.callbacks()};
+  ASSERT_EQ(manager.create(OWNER, specification()).status, status_t::success);
+  ASSERT_EQ(fake.changes.size(), 1);
+  EXPECT_FALSE(fake.changes[0].first);
+  ASSERT_TRUE(fake.changes[0].second);
+  EXPECT_EQ(fake.changes[0].second->id, RESOURCE);
+
+  patch_t patch;
+  patch.name = "Changed";
+  ASSERT_EQ(manager.patch(RESOURCE, 1, patch).status, status_t::success);
+  ASSERT_EQ(fake.changes.size(), 2);
+  ASSERT_TRUE(fake.changes[1].first);
+  ASSERT_TRUE(fake.changes[1].second);
+  EXPECT_EQ(fake.changes[1].first->name, "Virtual");
+  EXPECT_EQ(fake.changes[1].second->name, "Changed");
+
+  ASSERT_EQ(manager.remove(RESOURCE, 2).status, status_t::success);
+  ASSERT_EQ(fake.changes.size(), 3);
+  ASSERT_TRUE(fake.changes[2].first);
+  EXPECT_FALSE(fake.changes[2].second);
+  EXPECT_EQ(fake.changes[2].first->id, RESOURCE);
 }
 
 TEST(TerraVirtualDisplayTest, CountDriftFailsClosedWithoutChangingState) {
@@ -176,6 +239,8 @@ TEST(TerraVirtualDisplayTest, ApplyAndPersistenceFailuresRollbackProviderAndPubl
   apply_fake.apply_succeeds = false;
   EXPECT_EQ(apply_manager.create(OWNER, specification()).status, status_t::provider_error);
   EXPECT_EQ(apply_fake.count, 2);
+  EXPECT_EQ(apply_fake.capture_calls, 1);
+  EXPECT_EQ(apply_fake.restore_calls, 1);
   EXPECT_FALSE(apply_manager.get(RESOURCE));
 
   fake_t save_fake;
@@ -183,6 +248,8 @@ TEST(TerraVirtualDisplayTest, ApplyAndPersistenceFailuresRollbackProviderAndPubl
   save_fake.save_succeeds = false;
   EXPECT_EQ(save_manager.create(OWNER, specification()).status, status_t::persistence_error);
   EXPECT_EQ(save_fake.count, 2);
+  EXPECT_EQ(save_fake.capture_calls, 1);
+  EXPECT_EQ(save_fake.restore_calls, 1);
   EXPECT_FALSE(save_manager.get(RESOURCE));
 }
 
@@ -297,6 +364,23 @@ TEST(TerraVirtualDisplayTest, RestartRetainsPersistentAndRemovesEphemeralResourc
   ASSERT_TRUE(persistent);
   EXPECT_EQ(persistent->platform_id, "managed-2");
   EXPECT_EQ(fake.count, 3);
+}
+
+TEST(TerraVirtualDisplayTest, RestartRepairsUntrackedProviderConnector) {
+  fake_t fake;
+  {
+    manager_t manager {fake.callbacks()};
+    ASSERT_EQ(manager.create(OWNER, specification(true)).status, status_t::success);
+  }
+  fake.ids.back() = "untracked";
+  fake.uuid_index = 0;
+
+  manager_t restarted {fake.callbacks()};
+
+  ASSERT_TRUE(restarted.available());
+  EXPECT_EQ(fake.set_calls, 3);
+  ASSERT_TRUE(restarted.get(RESOURCE));
+  EXPECT_EQ(restarted.get(RESOURCE)->platform_id, "managed-2");
 }
 
 TEST(TerraVirtualDisplayTest, RestartDetachesPersistentRuntimeAttachment) {

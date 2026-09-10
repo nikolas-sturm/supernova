@@ -208,11 +208,16 @@ struct InputForwarder::Impl {
     std::optional<int> inputResult;
     std::function<void()> toggleStatistics;
     std::function<bool()> toggleFullscreen;
-    std::function<void()> openOverlay;
+    OverlayListener overlayListener;
+    OverlayCaptureListener overlayCaptureListener;
     bool localCursorVisible = true;
     bool pointerRegionLocked = false;
     bool absoluteInputCaptured = true;
     bool overlayCaptureSuspended = false;
+    bool overlayDesiredVisible = false;
+    bool overlayShortcutArmed = false;
+    bool overlayResumePending = false;
+    std::uint64_t overlayRevision = 0;
     bool restoreRelativeCapture = false;
     bool restoreAbsoluteCapture = false;
 
@@ -313,9 +318,11 @@ struct InputForwarder::Impl {
     }
 
     bool overlayShortcutActive() const {
-        return enabled && window && GetForegroundWindow() == window && openOverlay &&
-               (settings.absoluteMouseMode ? absoluteInputCaptured : mouseCaptured) &&
-               !overlayCaptureSuspended;
+        return enabled && window && overlayListener &&
+               (overlayCaptureSuspended ||
+                (GetForegroundWindow() == window &&
+                 (overlayShortcutArmed ||
+                  (settings.absoluteMouseMode ? absoluteInputCaptured : mouseCaptured))));
     }
 
     bool overlayChordActive() const {
@@ -468,9 +475,15 @@ struct InputForwarder::Impl {
     }
 
     void suspendForOverlay() {
-        restoreRelativeCapture = !settings.absoluteMouseMode && mouseCaptured;
-        restoreAbsoluteCapture = settings.absoluteMouseMode && absoluteInputCaptured;
-        overlayCaptureSuspended = restoreRelativeCapture || restoreAbsoluteCapture;
+        if (!overlayCaptureSuspended) {
+            restoreRelativeCapture = !settings.absoluteMouseMode && mouseCaptured;
+            restoreAbsoluteCapture = settings.absoluteMouseMode && absoluteInputCaptured;
+        }
+        overlayCaptureSuspended = true;
+        overlayResumePending = false;
+        overlayShortcutArmed = true;
+        cancelPointerState();
+        gamepadSuppressed = false;
         if (restoreRelativeCapture) {
             setMouseCaptured(false);
         } else if (restoreAbsoluteCapture) {
@@ -483,14 +496,22 @@ struct InputForwarder::Impl {
 
     void resumeAfterOverlay() {
         if (!overlayCaptureSuspended) return;
+        if (consumedShortcutKeys.contains('O')) {
+            overlayResumePending = true;
+            return;
+        }
+        overlayResumePending = false;
         if (!enabled || !window) {
             overlayCaptureSuspended = false;
             restoreRelativeCapture = false;
             restoreAbsoluteCapture = false;
+            if (overlayCaptureListener) overlayCaptureListener(overlayRevision, false);
             return;
         }
-        if (GetForegroundWindow() != window) return;
-        consumedShortcutKeys.erase('O');
+        if (GetForegroundWindow() != window) {
+            overlayResumePending = true;
+            return;
+        }
         const bool relative = std::exchange(restoreRelativeCapture, false);
         const bool absolute = std::exchange(restoreAbsoluteCapture, false);
         overlayCaptureSuspended = false;
@@ -501,6 +522,44 @@ struct InputForwarder::Impl {
             updateCursorClip();
             updateWindowTitle();
         }
+        if (overlayCaptureListener) overlayCaptureListener(overlayRevision, false);
+    }
+
+    void publishOverlayState() {
+        if (overlayListener) overlayListener(overlayRevision, overlayDesiredVisible);
+    }
+
+    void toggleOverlay() {
+        const bool previous = overlayDesiredVisible;
+        if (!previous) suspendForOverlay();
+        overlayDesiredVisible = !previous;
+        ++overlayRevision;
+        try {
+            publishOverlayState();
+        } catch (...) {
+            overlayDesiredVisible = previous;
+            if (!previous) resumeAfterOverlay();
+            throw;
+        }
+    }
+
+    void closeOverlay(std::uint64_t revision) {
+        if (!overlayDesiredVisible || revision != overlayRevision) return;
+        overlayDesiredVisible = false;
+        ++overlayRevision;
+        publishOverlayState();
+    }
+
+    bool acknowledgeOverlayHidden(std::uint64_t revision) {
+        if (overlayDesiredVisible || revision != overlayRevision) return false;
+        resumeAfterOverlay();
+        return true;
+    }
+
+    void updateOverlay() {
+        if (!overlayDesiredVisible) return;
+        ++overlayRevision;
+        publishOverlayState();
     }
 
     void toggleCursorDisplay() {
@@ -554,7 +613,10 @@ struct InputForwarder::Impl {
     }
 
     void handleKeyboardKey(short key, bool pressed, bool repeated) {
-        if (!pressed && consumedShortcutKeys.erase(key) != 0) return;
+        if (!pressed && consumedShortcutKeys.erase(key) != 0) {
+            if (key == 'O' && overlayResumePending) resumeAfterOverlay();
+            return;
+        }
         if (pressed && consumedShortcutKeys.contains(key)) return;
         const bool shortcutModifiers =
             ((GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
@@ -586,16 +648,15 @@ struct InputForwarder::Impl {
             } else if (key == 'L') {
                 togglePointerRegionLock();
             } else if (overlayShortcut) {
-                suspendForOverlay();
                 try {
-                    openOverlay();
+                    toggleOverlay();
                 } catch (...) {
-                    resumeAfterOverlay();
                 }
             }
             return;
         }
         if (pressed && repeated) return;
+        if (overlayCaptureSuspended) return;
         if (settings.absoluteMouseMode && !absoluteInputCaptured) return;
         if (!pressed && !keysDown.contains(key)) return;
         const int input = LiSendKeyboardEvent(static_cast<short>(0x8000 | key),
@@ -812,6 +873,7 @@ struct InputForwarder::Impl {
     }
 
     bool handlePointer(UINT message, WPARAM wparam) {
+        if (overlayCaptureSuspended) return true;
         const UINT32 pointerId = GET_POINTERID_WPARAM(wparam);
         POINTER_INPUT_TYPE pointerType = PT_POINTER;
         if (!GetPointerType(pointerId, &pointerType)) return false;
@@ -925,7 +987,8 @@ struct InputForwarder::Impl {
 
     void pollGamepad() {
         if (!enabled || !xinputGetState || !gamepadTransportAvailable()) return;
-        if (!settings.backgroundGamepad && GetForegroundWindow() != window) {
+        if (overlayCaptureSuspended ||
+            (!settings.backgroundGamepad && GetForegroundWindow() != window)) {
             if (!gamepadSuppressed) {
                 const auto mask = gamepadMask();
                 bool sent = true;
@@ -1014,13 +1077,22 @@ InputForwarder::~InputForwarder() { stop(); }
 void InputForwarder::start(HWND window, InputSettings settings, int width, int height, int fps,
                            std::function<void()> toggleStatistics,
                            std::function<bool()> toggleFullscreen,
-                           std::function<void()> openOverlay) {
+                           OverlayListener overlayListener,
+                           OverlayCaptureListener overlayCaptureListener,
+                           InputOverlayState overlayState) {
     if (impl_->window) throw std::runtime_error("Input forwarding is already active");
     impl_->window = window;
     impl_->settings = settings;
     impl_->toggleStatistics = std::move(toggleStatistics);
     impl_->toggleFullscreen = std::move(toggleFullscreen);
-    impl_->openOverlay = std::move(openOverlay);
+    impl_->overlayListener = std::move(overlayListener);
+    impl_->overlayCaptureListener = std::move(overlayCaptureListener);
+    impl_->overlayRevision = overlayState.revision;
+    impl_->overlayDesiredVisible = overlayState.visible;
+    impl_->overlayCaptureSuspended = overlayState.captureSuspended;
+    impl_->overlayShortcutArmed = overlayState.visible || overlayState.captureSuspended;
+    impl_->restoreRelativeCapture = overlayState.captureSuspended && !settings.absoluteMouseMode;
+    impl_->restoreAbsoluteCapture = overlayState.captureSuspended && settings.absoluteMouseMode;
     impl_->streamWidth = std::max(width, 1);
     impl_->streamHeight = std::max(height, 1);
     impl_->streamLabel = std::to_wstring(width) + L"x" + std::to_wstring(height) + L" @ " +
@@ -1046,7 +1118,13 @@ void InputForwarder::start(HWND window, InputSettings settings, int width, int h
     impl_->updateWindowTitle();
 }
 
-void InputForwarder::resumeAfterOverlay() { impl_->resumeAfterOverlay(); }
+void InputForwarder::closeOverlay(std::uint64_t revision) { impl_->closeOverlay(revision); }
+
+bool InputForwarder::acknowledgeOverlayHidden(std::uint64_t revision) {
+    return impl_->acknowledgeOverlayHidden(revision);
+}
+
+void InputForwarder::updateOverlay() { impl_->updateOverlay(); }
 
 void InputForwarder::setEnabled(bool enabled) {
     if (!impl_->window || impl_->enabled == enabled) return;
@@ -1106,9 +1184,14 @@ void InputForwarder::stop() {
     impl_->window = nullptr;
     impl_->toggleStatistics = {};
     impl_->toggleFullscreen = {};
-    impl_->openOverlay = {};
+    impl_->overlayListener = {};
+    impl_->overlayCaptureListener = {};
     impl_->consumedShortcutKeys.clear();
     impl_->overlayCaptureSuspended = false;
+    impl_->overlayDesiredVisible = false;
+    impl_->overlayShortcutArmed = false;
+    impl_->overlayResumePending = false;
+    impl_->overlayRevision = 0;
     impl_->restoreRelativeCapture = false;
     impl_->restoreAbsoluteCapture = false;
     if (impl_->xinputModule) {
@@ -1127,6 +1210,12 @@ bool InputForwarder::handleMessage(UINT message, WPARAM wparam, LPARAM lparam, L
             return true;
         }
         return false;
+    }
+    if (impl_->overlayCaptureSuspended &&
+        (message == WM_INPUT || (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) ||
+         message == WM_POINTERDOWN || message == WM_POINTERUPDATE || message == WM_POINTERUP)) {
+        result = 0;
+        return true;
     }
     switch (message) {
         case kHookKeyboardMessage: {
@@ -1247,7 +1336,7 @@ bool InputForwarder::handleMessage(UINT message, WPARAM wparam, LPARAM lparam, L
                 } else {
                     impl_->setMouseCaptured(false);
                 }
-            } else {
+            } else if (impl_->overlayResumePending) {
                 impl_->resumeAfterOverlay();
             }
             break;
@@ -1591,6 +1680,7 @@ struct InputForwarder::Impl {
     float gestureDistance = 0;
     std::unordered_map<short, char> remoteKeysDown;
     std::unordered_set<SDL_Scancode> consumedShortcutKeys;
+    std::unordered_set<SDL_Scancode> localKeysDown;
     std::unordered_set<int> remoteMouseButtonsDown;
     std::array<ControllerSlot, kMaximumControllers> controllers{};
     std::array<std::optional<std::uint16_t>, kMaximumControllers> pendingNeutralMasks{};
@@ -1605,12 +1695,18 @@ struct InputForwarder::Impl {
     std::optional<std::string> previousAltTabHint;
     std::function<void()> toggleStatistics;
     std::function<bool()> toggleFullscreen;
-    std::function<void()> openOverlay;
+    OverlayListener overlayListener;
+    OverlayCaptureListener overlayCaptureListener;
     bool localCursorVisible = true;
     bool pointerRegionLocked = false;
     bool absoluteInputCaptured = true;
     bool windowFocused = false;
     bool overlayCaptureSuspended = false;
+    bool overlayDesiredVisible = false;
+    bool overlayShortcutArmed = false;
+    bool overlayResumePending = false;
+    Uint32 overlayResumeRetryAt = 0;
+    std::uint64_t overlayRevision = 0;
     bool restoreRelativeCapture = false;
     bool restoreAbsoluteCapture = false;
 
@@ -1830,6 +1926,10 @@ struct InputForwarder::Impl {
     void updateGamepads() {
         if (!enabled) return;
         const auto now = SDL_GetTicks();
+        if (overlayResumePending && !overlayDesiredVisible && overlayToggleKeyReleased() &&
+            SDL_TICKS_PASSED(now, overlayResumeRetryAt)) {
+            resumeAfterOverlay();
+        }
         for (std::size_t index = 0; index < controllers.size(); ++index) {
             if (pendingNeutralMasks[index]) {
                 sendNeutralControllerState(index, *pendingNeutralMasks[index]);
@@ -1982,7 +2082,7 @@ struct InputForwarder::Impl {
 
     void sendControllerState(std::size_t index) {
         if (!enabled || !controllerInputAvailable || !gamepadTransportAvailable() ||
-            controllerSuppressed || gamepadMask() == 0 ||
+            controllerSuppressed || overlayCaptureSuspended || gamepadMask() == 0 ||
             (!controllers[index].controller && !(index == 0 && settings.forceGamepad))) {
             return;
         }
@@ -2145,7 +2245,8 @@ struct InputForwarder::Impl {
 
     void handleControllerSensor(const SDL_ControllerSensorEvent& event) {
         const auto index = controllerIndex(event.which);
-        if (!index || !enabled || controllerSuppressed || !controllerInputAvailable ||
+        if (!index || !enabled || controllerSuppressed || overlayCaptureSuspended ||
+            !controllerInputAvailable ||
             !gamepadTransportAvailable() ||
             (LiGetHostFeatureFlags() & LI_FF_CONTROLLER_TOUCH_EVENTS) == 0) {
             return;
@@ -2183,7 +2284,8 @@ struct InputForwarder::Impl {
 
     void handleControllerTouchpad(const SDL_ControllerTouchpadEvent& event) {
         const auto index = controllerIndex(event.which);
-        if (!index || !enabled || controllerSuppressed || !controllerInputAvailable ||
+        if (!index || !enabled || controllerSuppressed || overlayCaptureSuspended ||
+            !controllerInputAvailable ||
             !gamepadTransportAvailable() || event.touchpad < 0 || event.touchpad > 1 ||
             event.finger < 0 ||
             (LiGetHostFeatureFlags() & LI_FF_CONTROLLER_TOUCH_EVENTS) == 0) {
@@ -2368,15 +2470,16 @@ struct InputForwarder::Impl {
         gestureDistance = 0;
     }
 
-    void setMouseCaptured(bool capture) {
-        if (!window || !enabled || settings.absoluteMouseMode || mouseCaptured == capture) return;
+    bool setMouseCaptured(bool capture) {
+        if (!window || !enabled || settings.absoluteMouseMode) return false;
+        if (mouseCaptured == capture) return true;
         if (capture) {
             SDL_SetWindowGrab(window, SDL_TRUE);
             if (SDL_SetRelativeMouseMode(SDL_TRUE) < 0) {
                 SDL_SetWindowGrab(window, SDL_FALSE);
                 inputError = "Mouse capture unavailable: " + std::string{SDL_GetError()};
                 updateWindowTitle();
-                return;
+                return false;
             }
             mouseCaptured = true;
         } else {
@@ -2387,6 +2490,7 @@ struct InputForwarder::Impl {
         }
         updateKeyboardGrab();
         updateWindowTitle();
+        return true;
     }
 
     void applyPointerRegionLock() {
@@ -2435,15 +2539,29 @@ struct InputForwarder::Impl {
     }
 
     bool overlayShortcutActive() const {
-        return enabled && window && windowFocused && openOverlay &&
-               (settings.absoluteMouseMode ? absoluteInputCaptured : mouseCaptured) &&
-               !overlayCaptureSuspended;
+        return enabled && window && windowFocused && overlayListener &&
+               (overlayShortcutArmed || overlayCaptureSuspended ||
+                 (settings.absoluteMouseMode ? absoluteInputCaptured : mouseCaptured));
+    }
+
+    bool overlayToggleKeyReleased() const {
+        return !localKeysDown.contains(SDL_SCANCODE_O);
     }
 
     void suspendForOverlay() {
-        restoreRelativeCapture = !settings.absoluteMouseMode && mouseCaptured;
-        restoreAbsoluteCapture = settings.absoluteMouseMode && absoluteInputCaptured;
-        overlayCaptureSuspended = restoreRelativeCapture || restoreAbsoluteCapture;
+        if (!overlayCaptureSuspended) {
+            restoreRelativeCapture = !settings.absoluteMouseMode && mouseCaptured;
+            restoreAbsoluteCapture = settings.absoluteMouseMode && absoluteInputCaptured;
+        }
+        overlayCaptureSuspended = true;
+        overlayResumePending = false;
+        overlayResumeRetryAt = 0;
+        overlayShortcutArmed = true;
+        cancelTouchState();
+        for (std::size_t index = 0; index < controllers.size(); ++index) {
+            cancelControllerTouches(index);
+        }
+        if (gamepadMask() != 0) sendNeutralControllerStates(gamepadMask());
         if (restoreRelativeCapture) {
             setMouseCaptured(false);
         } else if (restoreAbsoluteCapture) {
@@ -2461,25 +2579,78 @@ struct InputForwarder::Impl {
 
     void resumeAfterOverlay() {
         if (!overlayCaptureSuspended) return;
+        if (!overlayToggleKeyReleased()) {
+            overlayResumePending = true;
+            return;
+        }
         if (!enabled || !window) {
+            overlayResumePending = false;
             overlayCaptureSuspended = false;
             restoreRelativeCapture = false;
             restoreAbsoluteCapture = false;
+            if (overlayCaptureListener) overlayCaptureListener(overlayRevision, false);
             return;
         }
-        if (!windowFocused) return;
-        consumedShortcutKeys.erase(SDL_SCANCODE_O);
-        const bool relative = std::exchange(restoreRelativeCapture, false);
-        const bool absolute = std::exchange(restoreAbsoluteCapture, false);
-        overlayCaptureSuspended = false;
-        if (relative && !settings.absoluteMouseMode) {
-            setMouseCaptured(true);
-        } else if (absolute && settings.absoluteMouseMode) {
+        if (!windowFocused) {
+            overlayResumePending = true;
+            return;
+        }
+        if (restoreRelativeCapture && !settings.absoluteMouseMode) {
+            if (!setMouseCaptured(true)) {
+                overlayResumePending = true;
+                overlayResumeRetryAt = SDL_GetTicks() + 50;
+                return;
+            }
+        } else if (restoreAbsoluteCapture && settings.absoluteMouseMode) {
             absoluteInputCaptured = true;
             applyPointerRegionLock();
             updateKeyboardGrab();
             updateWindowTitle();
         }
+        overlayResumePending = false;
+        overlayResumeRetryAt = 0;
+        consumedShortcutKeys.erase(SDL_SCANCODE_O);
+        restoreRelativeCapture = false;
+        restoreAbsoluteCapture = false;
+        overlayCaptureSuspended = false;
+        if (overlayCaptureListener) overlayCaptureListener(overlayRevision, false);
+    }
+
+    void publishOverlayState() {
+        if (overlayListener) overlayListener(overlayRevision, overlayDesiredVisible);
+    }
+
+    void toggleOverlay() {
+        const bool previous = overlayDesiredVisible;
+        if (!previous) suspendForOverlay();
+        overlayDesiredVisible = !previous;
+        ++overlayRevision;
+        try {
+            publishOverlayState();
+        } catch (...) {
+            overlayDesiredVisible = previous;
+            if (!previous) resumeAfterOverlay();
+            throw;
+        }
+    }
+
+    void closeOverlay(std::uint64_t revision) {
+        if (!overlayDesiredVisible || revision != overlayRevision) return;
+        overlayDesiredVisible = false;
+        ++overlayRevision;
+        publishOverlayState();
+    }
+
+    bool acknowledgeOverlayHidden(std::uint64_t revision) {
+        if (overlayDesiredVisible || revision != overlayRevision) return false;
+        resumeAfterOverlay();
+        return true;
+    }
+
+    void updateOverlay() {
+        if (!overlayDesiredVisible) return;
+        ++overlayRevision;
+        publishOverlayState();
     }
 
     void toggleCursorDisplay() {
@@ -2505,7 +2676,16 @@ struct InputForwarder::Impl {
 
     void handleKeyboard(const SDL_KeyboardEvent& event) {
         const bool pressed = event.state == SDL_PRESSED;
-        if (!pressed && consumedShortcutKeys.erase(event.keysym.scancode) != 0) return;
+        if (pressed) {
+            localKeysDown.insert(event.keysym.scancode);
+        } else {
+            localKeysDown.erase(event.keysym.scancode);
+        }
+        if (!pressed) {
+            const bool consumed = consumedShortcutKeys.erase(event.keysym.scancode) != 0;
+            if (overlayResumePending && overlayToggleKeyReleased()) resumeAfterOverlay();
+            if (consumed) return;
+        }
         if (pressed && consumedShortcutKeys.contains(event.keysym.scancode)) return;
         const auto modifiers = static_cast<SDL_Keymod>(event.keysym.mod);
         const bool overlayShortcut = event.keysym.scancode == SDL_SCANCODE_O &&
@@ -2544,16 +2724,15 @@ struct InputForwarder::Impl {
             } else if (event.keysym.scancode == SDL_SCANCODE_L) {
                 togglePointerRegionLock();
             } else if (overlayShortcut) {
-                suspendForOverlay();
                 try {
-                    openOverlay();
+                    toggleOverlay();
                 } catch (...) {
-                    resumeAfterOverlay();
                 }
             }
             return;
         }
         if (event.repeat != 0) return;
+        if (overlayCaptureSuspended) return;
         if (settings.absoluteMouseMode && !absoluteInputCaptured) return;
         const auto mapping = windowsVirtualKey(event.keysym.scancode);
         if (!mapping) return;
@@ -2601,7 +2780,7 @@ struct InputForwarder::Impl {
     }
 
     void handleMouseButton(const SDL_MouseButtonEvent& event) {
-        if (event.which == SDL_TOUCH_MOUSEID) return;
+        if (event.which == SDL_TOUCH_MOUSEID || overlayCaptureSuspended) return;
         const bool pressed = event.state == SDL_PRESSED;
         if (settings.absoluteMouseMode && !absoluteInputCaptured) {
             if (!pressed && event.button == SDL_BUTTON_LEFT) {
@@ -2627,7 +2806,7 @@ struct InputForwarder::Impl {
     }
 
     void handleMouseMotion(const SDL_MouseMotionEvent& event) {
-        if (event.which == SDL_TOUCH_MOUSEID) return;
+        if (event.which == SDL_TOUCH_MOUSEID || overlayCaptureSuspended) return;
         if (settings.absoluteMouseMode && !absoluteInputCaptured) return;
         if (settings.absoluteMouseMode) {
             const auto bounds = videoBounds();
@@ -2645,7 +2824,7 @@ struct InputForwarder::Impl {
     }
 
     void handleMouseWheel(const SDL_MouseWheelEvent& event) {
-        if (event.which == SDL_TOUCH_MOUSEID ||
+        if (event.which == SDL_TOUCH_MOUSEID || overlayCaptureSuspended ||
             (settings.absoluteMouseMode ? !absoluteInputCaptured : !mouseCaptured)) {
             return;
         }
@@ -2791,6 +2970,7 @@ struct InputForwarder::Impl {
     }
 
     void handleTouch(const SDL_TouchFingerEvent& event) {
+        if (overlayCaptureSuspended) return;
         if (!touchDeviceAccepted(event.touchId)) return;
         if (settings.touchscreenTrackpad) {
             handleTrackpadTouch(event);
@@ -2807,13 +2987,22 @@ InputForwarder::~InputForwarder() { stop(); }
 void InputForwarder::start(SDL_Window* window, InputSettings settings, int width, int height,
                            int fps, std::function<void()> toggleStatistics,
                            std::function<bool()> toggleFullscreen,
-                           std::function<void()> openOverlay) {
+                           OverlayListener overlayListener,
+                           OverlayCaptureListener overlayCaptureListener,
+                           InputOverlayState overlayState) {
     if (impl_->window) throw std::runtime_error("Input forwarding is already active");
     impl_->window = window;
     impl_->settings = settings;
     impl_->toggleStatistics = std::move(toggleStatistics);
     impl_->toggleFullscreen = std::move(toggleFullscreen);
-    impl_->openOverlay = std::move(openOverlay);
+    impl_->overlayListener = std::move(overlayListener);
+    impl_->overlayCaptureListener = std::move(overlayCaptureListener);
+    impl_->overlayRevision = overlayState.revision;
+    impl_->overlayDesiredVisible = overlayState.visible;
+    impl_->overlayCaptureSuspended = overlayState.captureSuspended;
+    impl_->overlayShortcutArmed = overlayState.visible || overlayState.captureSuspended;
+    impl_->restoreRelativeCapture = overlayState.captureSuspended && !settings.absoluteMouseMode;
+    impl_->restoreAbsoluteCapture = overlayState.captureSuspended && settings.absoluteMouseMode;
     impl_->windowFocused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
     impl_->streamWidth = std::max(width, 1);
     impl_->streamHeight = std::max(height, 1);
@@ -2826,7 +3015,13 @@ void InputForwarder::start(SDL_Window* window, InputSettings settings, int width
     impl_->updateWindowTitle();
 }
 
-void InputForwarder::resumeAfterOverlay() { impl_->resumeAfterOverlay(); }
+void InputForwarder::closeOverlay(std::uint64_t revision) { impl_->closeOverlay(revision); }
+
+bool InputForwarder::acknowledgeOverlayHidden(std::uint64_t revision) {
+    return impl_->acknowledgeOverlayHidden(revision);
+}
+
+void InputForwarder::updateOverlay() { impl_->updateOverlay(); }
 
 void InputForwarder::setEnabled(bool enabled) {
     if (!impl_->window || impl_->enabled == enabled) return;
@@ -2902,10 +3097,17 @@ void InputForwarder::stop() {
     impl_->window = nullptr;
     impl_->toggleStatistics = {};
     impl_->toggleFullscreen = {};
-    impl_->openOverlay = {};
+    impl_->overlayListener = {};
+    impl_->overlayCaptureListener = {};
     impl_->consumedShortcutKeys.clear();
+    impl_->localKeysDown.clear();
     impl_->windowFocused = false;
     impl_->overlayCaptureSuspended = false;
+    impl_->overlayDesiredVisible = false;
+    impl_->overlayShortcutArmed = false;
+    impl_->overlayResumePending = false;
+    impl_->overlayResumeRetryAt = 0;
+    impl_->overlayRevision = 0;
     impl_->restoreRelativeCapture = false;
     impl_->restoreAbsoluteCapture = false;
 }
@@ -2976,7 +3178,7 @@ void InputForwarder::handleEvent(const SDL_Event& event) {
                 impl_->windowFocused = true;
                 impl_->setControllerFocus(true);
                 impl_->updateKeyboardGrab();
-                impl_->resumeAfterOverlay();
+                if (impl_->overlayResumePending) impl_->resumeAfterOverlay();
             }
             break;
         default: break;

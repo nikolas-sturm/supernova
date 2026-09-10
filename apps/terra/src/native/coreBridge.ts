@@ -9,8 +9,11 @@ import type {
   AppLibrary,
   BridgeStatus,
   Host,
+  LogicalSession,
   PairingUpdate,
   SessionUpdate,
+  SolResourceUpdate,
+  TelemetrySnapshot,
 } from '../store/clientStore'
 import {
   dismissStreamOverlay,
@@ -31,6 +34,7 @@ const artworkEvent = 'terra.app.art.changed'
 const sessionEvent = 'terra.session.changed'
 const streamOverlayEvent = 'terra.stream.overlay.requested'
 const streamStatisticsEvent = 'terra.stream.statistics'
+const solResourceEvent = 'terra.sol.resource.changed'
 
 const statusSchema = z.object({
   schemaVersion: z.literal(1),
@@ -65,9 +69,21 @@ const hostSchema = z.object({
     )
     .optional()
     .default([]),
-  lastSeenAt: z.number().int().nonnegative(),
+  lastSeenAt: z
+    .number()
+    .int()
+    .transform((value) => Math.max(0, value)),
   paired: z.boolean(),
   wakeable: z.boolean().optional().default(false),
+  apiVersion: z.number().int().nonnegative().optional().default(0),
+  apiPort: z.number().int().min(0).max(65535).optional().default(0),
+  capabilities: z.array(z.string()).optional().default([]),
+  apiClientUuid: z.string().optional().default(''),
+  apiClientName: z.string().optional().default(''),
+  apiScopes: z.array(z.string()).optional().default([]),
+  allowedApps: z.array(z.string()).optional().default([]),
+  features: z.record(z.string(), z.unknown()).optional().default({}),
+  limits: z.record(z.string(), z.unknown()).optional().default({}),
 })
 
 const hostsSchema = z.object({
@@ -92,6 +108,19 @@ const appSchema = z.object({
   name: z.string(),
   hdrSupported: z.boolean(),
   appCollectorGame: z.boolean(),
+  uuid: z.string().optional().default(''),
+  kind: z.string().optional().default('unknown'),
+  description: z.string().optional().default(''),
+  source: z.string().optional().default(''),
+  publisher: z.string().optional().default(''),
+  tags: z.array(z.string()).optional().default([]),
+  inputRequirements: z.array(z.string()).optional().default([]),
+  installed: z.boolean().optional().default(true),
+  updateAvailable: z.boolean().optional().default(false),
+  assetRevision: z.number().int().nonnegative().optional().default(0),
+  displayProfileId: z.string().nullable().optional().default(null),
+  streamProfileId: z.string().nullable().optional().default(null),
+  sandboxProfileId: z.string().nullable().optional().default(null),
 })
 
 const appsSchema = z.object({
@@ -130,6 +159,86 @@ const sessionSchema = z.object({
   resumed: z.boolean(),
 })
 
+const logicalSessionSchema: z.ZodType<LogicalSession> = z.object({
+  id: z.uuid(),
+  appUuid: z.string(),
+  legacyAppId: z.number().int().nonnegative(),
+  state: z.enum(['preparing', 'starting', 'running', 'disconnected', 'stopped', 'failed']),
+  stateReason: z.string(),
+  startedAt: z.number().int(),
+  updatedAt: z.number().int(),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+  refreshRate: z.number().int().positive(),
+  hdr: z.boolean(),
+  revision: z.number().int().positive(),
+})
+
+const nullableMetric = z.number().nullable()
+const telemetrySchema: z.ZodType<TelemetrySnapshot> = z.object({
+  timestamp: z.number().int(),
+  host: z.object({
+    healthy: z.boolean(),
+    captureHealthy: z.boolean().nullable(),
+    captureFps: nullableMetric,
+    encoderHealthy: z.boolean().nullable(),
+    encoderCodec: z.string().nullable(),
+    encoderLatencyMs: nullableMetric,
+    audioCaptureHealthy: z.boolean().nullable(),
+    activeLogicalSessions: z.number().int().nonnegative(),
+    activeTransportSessions: z.number().int().nonnegative(),
+  }),
+  sessions: z.array(
+    z.object({
+      sessionId: z.uuid(),
+      state: z.string(),
+      codec: z.string().nullable(),
+      captureFps: nullableMetric,
+      encodeFps: nullableMetric,
+      transmitFps: nullableMetric,
+      encodeLatencyMs: nullableMetric,
+      bitrateKbps: nullableMetric,
+      droppedFrames: z.number().int().nonnegative().nullable(),
+    }),
+  ),
+})
+
+const solEventTypeSchema = z.enum([
+  'host.changed',
+  'capabilities.changed',
+  'catalog.changed',
+  'session.created',
+  'session.updated',
+  'session.removed',
+  'displays.changed',
+  'virtualDisplay.created',
+  'virtualDisplay.updated',
+  'virtualDisplay.removed',
+  'telemetry.sample',
+  'workspace.created',
+  'workspace.updated',
+  'workspace.removed',
+  'profile.created',
+  'profile.updated',
+  'profile.removed',
+  'peripheral.added',
+  'peripheral.updated',
+  'peripheral.removed',
+  'sandbox.created',
+  'sandbox.updated',
+  'sandbox.removed',
+  'operation.updated',
+  'host.stopping',
+  'resync.required',
+])
+
+const solResourceEnvelopeSchema = z.object({
+  schemaVersion: z.literal(1),
+  hostId: z.string().min(1),
+  resource: z.string().min(1),
+  payload: z.unknown(),
+})
+
 interface CoreBridgeHandlers {
   onStatus: (status: BridgeStatus) => void
   onHosts: (hosts: Host[]) => void
@@ -138,6 +247,7 @@ interface CoreBridgeHandlers {
   onApps: (library: AppLibrary) => void
   onArtwork: (hostId: string, appId: number, dataUrl: string, error: string) => void
   onSession: (update: SessionUpdate) => void
+  onSolResource: (update: SolResourceUpdate) => void
 }
 
 async function dispatchConnected(event: string, data?: unknown) {
@@ -169,6 +279,7 @@ export function startCoreBridge({
   onApps,
   onArtwork,
   onSession,
+  onSolResource,
 }: CoreBridgeHandlers) {
   if (!hasNeutralinoRuntime()) {
     onStatus({
@@ -280,16 +391,27 @@ export function startCoreBridge({
       onHostError('Native core returned invalid stream overlay bounds.')
       return
     }
-    void openStreamOverlay(result.data, (action) =>
-      action === 'resume'
-        ? dispatchConnected('stream.overlay.closed', {
-            hostId: result.data.hostId,
-            generation: result.data.generation,
-          })
-        : dispatchConnected('session.cancel', {
-            hostId: result.data.hostId,
-            quitHost: action === 'quit',
-          }),
+    void openStreamOverlay(
+      result.data,
+      (action) =>
+        action === 'resume'
+          ? dispatchConnected('stream.overlay.close', {
+              hostId: result.data.hostId,
+              generation: result.data.generation,
+              revision: result.data.revision,
+            })
+          : dispatchConnected('session.cancel', {
+              hostId: result.data.hostId,
+              quitHost: action === 'quit',
+            }),
+      (revision, visible) =>
+        visible
+          ? Promise.resolve()
+          : dispatchConnected('stream.overlay.hidden', {
+              hostId: result.data.hostId,
+              generation: result.data.generation,
+              revision,
+            }),
     ).catch((error: unknown) => {
       onHostError(
         error instanceof Error ? error.message : 'Terra could not open the stream overlay.',
@@ -302,6 +424,71 @@ export function startCoreBridge({
     if (result.success) void updateStreamOverlayStatistics(result.data)
   }
 
+  const handleSolResource = (event: CustomEvent<unknown>) => {
+    const envelope = solResourceEnvelopeSchema.safeParse(event.detail)
+    if (!envelope.success) {
+      onHostError('Native core returned an invalid Sol API resource.')
+      return
+    }
+    const { hostId, resource, payload } = envelope.data
+    if (resource === 'sessions') {
+      const result = z.object({ sessions: z.array(logicalSessionSchema) }).safeParse(payload)
+      if (result.success) onSolResource({ hostId, resource, payload: result.data })
+      else onHostError('Sol returned an invalid logical session collection.')
+      return
+    }
+    if (resource === 'telemetry') {
+      const result = telemetrySchema.safeParse(payload)
+      if (result.success) onSolResource({ hostId, resource, payload: result.data })
+      else onHostError('Sol returned invalid telemetry.')
+      return
+    }
+    if (resource !== 'event') return
+    const result = z.object({ type: solEventTypeSchema, data: z.unknown() }).safeParse(payload)
+    if (!result.success) {
+      onHostError('Sol returned an invalid event.')
+      return
+    }
+    const eventPayload = result.data
+    if (eventPayload.type === 'session.created' || eventPayload.type === 'session.updated') {
+      const data = logicalSessionSchema.safeParse(eventPayload.data)
+      if (data.success) {
+        onSolResource({ hostId, resource, payload: { type: eventPayload.type, data: data.data } })
+      }
+      return
+    }
+    if (eventPayload.type === 'session.removed') {
+      const data = z.object({ id: z.uuid() }).safeParse(eventPayload.data)
+      if (data.success) {
+        onSolResource({ hostId, resource, payload: { type: 'session.removed', data: data.data } })
+      }
+      return
+    }
+    if (eventPayload.type === 'telemetry.sample') {
+      const data = telemetrySchema.safeParse(eventPayload.data)
+      if (data.success) {
+        onSolResource({ hostId, resource, payload: { type: 'telemetry.sample', data: data.data } })
+      }
+      return
+    }
+    onSolResource({ hostId, resource, payload: eventPayload } as SolResourceUpdate)
+    if (eventPayload.type === 'catalog.changed') void dispatchConnected('host.apps', { id: hostId })
+    if (eventPayload.type === 'resync.required') {
+      const collections = z
+        .object({ collections: z.array(z.string()) })
+        .safeParse(eventPayload.data)
+      if (collections.success) {
+        for (const collection of collections.data.collections) {
+          if (collection === 'sessions' || collection === 'telemetry') {
+            void dispatchConnected('host.resource', { hostId, resource: collection })
+          } else if (collection === 'apps') {
+            void dispatchConnected('host.apps', { id: hostId })
+          }
+        }
+      }
+    }
+  }
+
   void events.on(statusEvent, handleStatus)
   void events.on(hostsEvent, handleHosts)
   void events.on(hostErrorEvent, handleHostError)
@@ -311,6 +498,7 @@ export function startCoreBridge({
   void events.on(sessionEvent, handleSession)
   void events.on(streamOverlayEvent, handleStreamOverlay)
   void events.on(streamStatisticsEvent, handleStreamStatistics)
+  void events.on(solResourceEvent, handleSolResource)
   void events.on('extClientDisconnect', handleExtensionDisconnect)
   void extensions.dispatch(extensionId, 'core.status').catch(() => {
     onStatus({
@@ -331,6 +519,7 @@ export function startCoreBridge({
     void events.off(sessionEvent, handleSession)
     void events.off(streamOverlayEvent, handleStreamOverlay)
     void events.off(streamStatisticsEvent, handleStreamStatistics)
+    void events.off(solResourceEvent, handleSolResource)
     void events.off('extClientDisconnect', handleExtensionDisconnect)
   }
 }
@@ -356,14 +545,38 @@ export async function wakeCoreHost(id: string) {
   await dispatchConnected('host.wake', { id })
 }
 
-export async function pairCoreHost(id: string, pin: string) {
+export async function pairCoreHost(
+  id: string,
+  pin: string,
+  access: 'gaming' | 'workstation' = 'gaming',
+) {
   if (!hasNeutralinoRuntime()) return
-  await dispatchConnected('host.pair', { id, pin })
+  await dispatchConnected('host.pair', { id, pin, access })
 }
 
 export async function loadCoreApps(id: string) {
   if (!hasNeutralinoRuntime()) return
   await dispatchConnected('host.apps', { id })
+}
+
+export async function loadCoreResource(hostId: string, resource: 'sessions' | 'telemetry') {
+  if (!hasNeutralinoRuntime()) return
+  await dispatchConnected('host.resource', { hostId, resource })
+}
+
+export async function controlCoreLogicalSession(
+  hostId: string,
+  sessionId: string,
+  action: 'disconnect' | 'stop',
+) {
+  if (!hasNeutralinoRuntime()) return
+  await dispatchConnected('host.resource.mutate', {
+    hostId,
+    method: 'POST',
+    path: `/eclipse/v1/sessions/${z.uuid().parse(sessionId)}/${action}`,
+    body: {},
+    idempotent: true,
+  })
 }
 
 export async function launchCoreApp(hostId: string, appId: number, settings: StreamSettings) {

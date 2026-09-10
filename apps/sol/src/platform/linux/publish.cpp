@@ -420,9 +420,11 @@ namespace platf::publish {
 
     switch (state) {
       case avahi::ENTRY_GROUP_ESTABLISHED:
+        set_registration_state(state_t::available);
         BOOST_LOG(info) << "Avahi service " << name.get() << " successfully established.";
         break;
       case avahi::ENTRY_GROUP_COLLISION:
+        set_registration_state(state_t::starting);
         name.reset(avahi::alternative_service_name(name.get()));
 
         BOOST_LOG(info) << "Avahi service name collision, renaming service to " << name.get();
@@ -430,11 +432,14 @@ namespace platf::publish {
         create_services(avahi::entry_group_get_client(g));
         break;
       case avahi::ENTRY_GROUP_FAILURE:
+        set_registration_state(state_t::unavailable, "registration_lost", "Avahi DNS-SD service registration failed");
         BOOST_LOG(error) << "Avahi entry group failure: " << avahi::strerror(avahi::client_errno(avahi::entry_group_get_client(g)));
         avahi::simple_poll_quit(poll.get());
         break;
       case avahi::ENTRY_GROUP_UNCOMMITED:
-      case avahi::ENTRY_GROUP_REGISTERING:;
+      case avahi::ENTRY_GROUP_REGISTERING:
+        set_registration_state(state_t::starting);
+        break;
     }
   }
 
@@ -450,6 +455,7 @@ namespace platf::publish {
 
     if (!group) {
       if (!(group = avahi::entry_group_new(c, entry_group_callback, nullptr))) {
+        set_registration_state(state_t::unavailable, "registration_failed", "Avahi entry group creation failed");
         BOOST_LOG(error) << "avahi::entry_group_new() failed: "sv << avahi::strerror(avahi::client_errno(c));
         return;
       }
@@ -486,12 +492,14 @@ namespace platf::publish {
         }
 
         BOOST_LOG(error) << "Failed to add "sv << platf::SERVICE_TYPE << " service: "sv << avahi::strerror(ret);
+        set_registration_state(state_t::unavailable, "registration_failed", "Avahi DNS-SD service creation failed");
         return;
       }
 
       ret = avahi::entry_group_commit(group);
       if (ret < 0) {
         BOOST_LOG(error) << "Failed to commit entry group: "sv << avahi::strerror(ret);
+        set_registration_state(state_t::unavailable, "registration_failed", "Avahi DNS-SD service commit failed");
         return;
       }
     }
@@ -508,19 +516,24 @@ namespace platf::publish {
   void client_callback(avahi::Client *c, avahi::ClientState state, void *) {
     switch (state) {
       case avahi::CLIENT_S_RUNNING:
+        set_registration_state(state_t::starting);
         create_services(c);
         break;
       case avahi::CLIENT_FAILURE:
+        set_registration_state(state_t::unavailable, "provider_unavailable", "Avahi daemon connection failed");
         BOOST_LOG(error) << "Client failure: "sv << avahi::strerror(avahi::client_errno(c));
         avahi::simple_poll_quit(poll.get());
         break;
       case avahi::CLIENT_S_COLLISION:
       case avahi::CLIENT_S_REGISTERING:
+        set_registration_state(state_t::starting);
         if (group) {
           avahi::entry_group_reset(group);
         }
         break;
-      case avahi::CLIENT_CONNECTING:;
+      case avahi::CLIENT_CONNECTING:
+        set_registration_state(state_t::starting);
+        break;
     }
   }
 
@@ -553,26 +566,32 @@ namespace platf::publish {
       }
 
       poll.reset();
+      set_registration_state(state_t::stopped);
     }
   };
 
   [[nodiscard]] std::unique_ptr<::platf::deinit_t> start() {
+    set_registration_state(state_t::starting);
     if (avahi::init_client()) {
+      set_registration_state(state_t::unavailable, "provider_unavailable", "Avahi client libraries are unavailable");
       return nullptr;
     }
-
-    platf::set_thread_name("publish::avahi");
 
     int avhi_error;
 
     poll.reset(avahi::simple_poll_new());
     if (!poll) {
       BOOST_LOG(error) << "Failed to create simple poll object."sv;
+      set_registration_state(state_t::unavailable, "provider_unavailable", "Avahi poll initialization failed");
       return nullptr;
     }
 
     auto instance_name = net::mdns_instance_name(platf::get_host_name());
     name.reset(avahi::strdup(instance_name.c_str()));
+    if (!name) {
+      set_registration_state(state_t::unavailable, "provider_unavailable", "Avahi service-name allocation failed");
+      return nullptr;
+    }
 
     client.reset(
       avahi::client_new(avahi::simple_poll_get(poll.get()), avahi::ClientFlags(0), client_callback, nullptr, &avhi_error)
@@ -580,11 +599,18 @@ namespace platf::publish {
 
     if (!client) {
       BOOST_LOG(error) << "Failed to create client: "sv << avahi::strerror(avhi_error);
+      set_registration_state(state_t::unavailable, "provider_unavailable", "Avahi client initialization failed");
       return nullptr;
     }
 
     return std::make_unique<deinit_t>(std::jthread {[]() {
+      platf::set_thread_name("publish::avahi");
       avahi::simple_poll_loop(poll.get());
+
+      const auto registration = health().registration;
+      if (registration == state_t::starting || registration == state_t::available) {
+        set_registration_state(state_t::unavailable, "provider_stopped", "Avahi DNS-SD polling stopped unexpectedly");
+      }
 
       // simple_poll_loop() returns only once publishing has stopped for good: either at
       // shutdown, or because a failure path called simple_poll_quit(). Nothing services the

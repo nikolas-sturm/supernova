@@ -146,6 +146,10 @@ namespace terra_virtual_display {
     std::function<bool(std::uint32_t)> set_count;  ///< Set global MttVDD connector count and await completion.
     std::function<std::optional<std::vector<std::string>>()> inventory;  ///< Read stable provider connector identifiers.
     std::function<bool(std::vector<platform_configuration_t> &)> apply_configuration;  ///< Apply configurations and populate actual modes.
+    std::uint32_t max_count {};  ///< Maximum global connector count supported by provider.
+    std::function<void(const std::optional<resource_t> &, const std::optional<resource_t> &)> changed;  ///< Observe committed create, update, reconciliation, and removal changes.
+    std::function<bool()> capture_configuration;  ///< Capture exact host topology before mutation.
+    std::function<bool()> restore_configuration;  ///< Restore topology captured before failed mutation.
   };
 
   /**
@@ -156,6 +160,7 @@ namespace terra_virtual_display {
     not_found,  ///< Resource does not exist.
     invalid,  ///< Input failed validation.
     conflict,  ///< State or revision precondition conflicts.
+    limit_reached,  ///< Provider connector capacity is exhausted.
     provider_error,  ///< Provider health, count, inventory, or apply operation failed.
     persistence_error,  ///< Candidate document could not be saved.
     unavailable,  ///< Manager failed closed during initialization or reconciliation.
@@ -202,6 +207,12 @@ namespace terra_virtual_display {
      * @return True when mutations are available.
      */
     bool available() const;
+    /**
+     * @brief Return remaining provider capacity above immutable baseline.
+     *
+     * @return Maximum additional managed virtual displays.
+     */
+    std::uint32_t max_active() const;
     /**
      * @brief Create one managed connector above immutable baseline.
      *

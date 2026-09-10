@@ -11,6 +11,8 @@
 #include <chrono>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <ranges>
 #include <set>
 #include <thread>
@@ -23,18 +25,27 @@
 #include <display_device/windows/win_display_device.h>
 
 // local includes
-#include "terra_display.h"
 #include "mttvdd.h"
 #include "src/file_handler.h"
 #include "src/logging.h"
 #include "src/utility.h"
 #include "src/uuid.h"
+#include "terra_display.h"
 
 namespace terra::windows::virtual_display {
   namespace {
     using configuration_t = terra_virtual_display::platform_configuration_t;
     constexpr std::chrono::seconds DISPLAY_CONFIG_TIMEOUT {20};  ///< Maximum DisplayConfig convergence wait.
     constexpr std::chrono::milliseconds DISPLAY_CONFIG_POLL_INTERVAL {250};  ///< DisplayConfig polling interval.
+
+    /** @brief Exact Windows display state retained for failed mutation rollback. */
+    struct rollback_state_t {
+      std::mutex mutex;  ///< Protects captured state.
+      std::optional<display_device::ActiveTopology> topology;  ///< Active topology before mutation.
+      std::optional<std::string> primary;  ///< Primary display device ID before mutation.
+      std::map<std::string, DEVMODEA, std::less<>> modes;  ///< Exact active display modes and positions by stable device ID.
+      display_device::HdrStateMap hdr_states;  ///< HDR state by stable device ID.
+    };
 
     /**
      * @brief Find libdisplaydevice ID for one MttVDD PnP instance.
@@ -218,6 +229,11 @@ namespace terra::windows::virtual_display {
     }
   }  // namespace
 
+  std::optional<std::string> resolve_device_id(const std::string_view platform_id) {
+    display_device::WinApiLayer api_layer;
+    return device_id(api_layer, platform_id);
+  }
+
   bool available() {
     if (!mttvdd::probe().available) {
       return false;
@@ -234,6 +250,7 @@ namespace terra::windows::virtual_display {
   }
 
   terra_virtual_display::callbacks_t make_callbacks(const std::filesystem::path &persistence_path) {
+    const auto rollback = std::make_shared<rollback_state_t>();
     return {
       [persistence_path]() -> std::optional<std::string> {
         if (!std::filesystem::exists(persistence_path)) {
@@ -255,6 +272,82 @@ namespace terra::windows::virtual_display {
       mttvdd::set_display_count_and_wait,
       mttvdd::display_inventory,
       apply,
+      mttvdd::MAX_DISPLAY_COUNT,
+      {},
+      [rollback]() {
+        auto api_layer = std::make_shared<display_device::WinApiLayer>();
+        display_device::WinDisplayDevice display_api {api_layer};
+        if (!display_api.isApiAccessAvailable()) {
+          return false;
+        }
+        const auto topology = display_api.getCurrentTopology();
+        const auto devices = display_api.enumAvailableDevices();
+        const auto primary = std::ranges::find_if(devices, [](const auto &device) {
+          return device.m_info && device.m_info->m_primary;
+        });
+        if (!display_api.isTopologyValid(topology) || primary == devices.end()) {
+          return false;
+        }
+        std::map<std::string, DEVMODEA, std::less<>> modes;
+        display_device::StringSet active_ids;
+        for (const auto &group : topology) {
+          active_ids.insert(group.begin(), group.end());
+        }
+        for (const auto &device : devices) {
+          if (!device.m_info || device.m_display_name.empty()) {
+            continue;
+          }
+          DEVMODEA mode {.dmSize = sizeof(DEVMODEA)};
+          if (!EnumDisplaySettingsExA(device.m_display_name.c_str(), ENUM_CURRENT_SETTINGS, &mode, 0)) {
+            return false;
+          }
+          modes.emplace(device.m_device_id, mode);
+        }
+        const auto hdr_states = display_api.getCurrentHdrStates(active_ids);
+        if (modes.size() != active_ids.size() || hdr_states.size() != active_ids.size()) {
+          return false;
+        }
+        std::lock_guard lock {rollback->mutex};
+        rollback->topology = topology;
+        rollback->primary = primary->m_device_id;
+        rollback->modes = std::move(modes);
+        rollback->hdr_states = hdr_states;
+        return true;
+      },
+      [rollback]() {
+        std::optional<display_device::ActiveTopology> topology;
+        std::optional<std::string> primary;
+        std::map<std::string, DEVMODEA, std::less<>> modes;
+        display_device::HdrStateMap hdr_states;
+        {
+          std::lock_guard lock {rollback->mutex};
+          topology = rollback->topology;
+          primary = rollback->primary;
+          modes = rollback->modes;
+          hdr_states = rollback->hdr_states;
+        }
+        if (!topology || !primary || modes.empty()) {
+          return false;
+        }
+        auto api_layer = std::make_shared<display_device::WinApiLayer>();
+        display_device::WinDisplayDevice display_api {api_layer};
+        if (!display_api.isApiAccessAvailable()) {
+          return false;
+        }
+        const bool topology_restored = display_api.setTopology(*topology);
+        const auto devices = display_api.enumAvailableDevices();
+        bool staged = true;
+        for (auto &[device_id, mode] : modes) {
+          const auto device = std::ranges::find(devices, device_id, &display_device::EnumeratedDevice::m_device_id);
+          if (device == devices.end() || device->m_display_name.empty() || ChangeDisplaySettingsExA(device->m_display_name.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr) != DISP_CHANGE_SUCCESSFUL) {
+            staged = false;
+          }
+        }
+        const bool committed = ChangeDisplaySettingsExA(nullptr, nullptr, nullptr, 0, nullptr) == DISP_CHANGE_SUCCESSFUL;
+        const bool hdr_restored = hdr_states.empty() || display_api.setHdrStates(hdr_states);
+        const bool primary_restored = display_api.setAsPrimary(*primary);
+        return topology_restored && staged && committed && hdr_restored && primary_restored;
+      },
     };
   }
 }  // namespace terra::windows::virtual_display

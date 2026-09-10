@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <vector>
@@ -39,6 +40,9 @@ namespace {
     bool stop_succeeds = true;  ///< Stop result.
     bool restore_succeeds = true;  ///< Runtime restoration result.
     bool reconcile_succeeds = true;  ///< Reconciliation result.
+    bool report_preparation_progress = false;  ///< Report one acquired display before completion.
+    bool cleanup_succeeds = true;  ///< Whether failed preparation cleanup resolves all IDs.
+    bool progress_was_persisted = false;  ///< Whether manager persisted reported IDs before provider continued.
     int fail_stop_on_call = 0;  ///< One-based stop call to fail, or zero.
     std::vector<std::string> uuids {WORKSPACE, WORKSPACE_2};  ///< Generated workspace UUIDs.
     std::size_t uuid_index = 0;  ///< Next generated UUID.
@@ -85,14 +89,25 @@ namespace {
         [&](const peripheral_policy_t &) {
           return validation_succeeds;
         },
-        [&](const preparation_t &request) -> std::optional<prepared_t> {
+        [&](const preparation_t &request, const std::function<bool(const prepared_t &)> &persist) -> std::optional<prepared_t> {
           ++prepare_calls;
           prepared_owner = request.owner_client_uuid;
+          if (report_preparation_progress) {
+            prepared_t progress {true, std::nullopt, std::nullopt, {DISPLAY}, {}};
+            if (!persist(progress)) {
+              progress.success = false;
+              return progress;
+            }
+            progress_was_persisted = document && document->find(DISPLAY) != std::string::npos;
+            progress.success = prepare_succeeds;
+            return progress;
+          }
           return prepared_t {prepare_succeeds, std::nullopt, SANDBOX, {DISPLAY}, {CLAIM}};
         },
         [&](const prepared_t &value) {
           ++cleanup_calls;
           cleaned = value;
+          return cleanup_succeeds ? prepared_t {false} : value;
         },
         [&](const resource_t &resource, const bool terminate) {
           ++stop_calls;
@@ -262,6 +277,43 @@ TEST(TerraWorkspacesTest, FailedPreparationCleansPartialActualResources) {
   EXPECT_EQ(fake.cleaned.peripheral_claim_ids, (std::vector<std::string> {CLAIM}));
 }
 
+TEST(TerraWorkspacesTest, PersistsPreparationProgressAndRetainsFailedCleanup) {
+  fake_t fake;
+  fake.prepare_succeeds = false;
+  fake.report_preparation_progress = true;
+  fake.cleanup_succeeds = false;
+  manager_t manager {fake.callbacks()};
+  ASSERT_EQ(manager.create(OWNER, definition()).status, status_t::success);
+
+  const auto result = manager.start(WORKSPACE, 1);
+  ASSERT_EQ(result.status, status_t::preparation_error);
+  ASSERT_TRUE(result.resource);
+  EXPECT_TRUE(fake.progress_was_persisted);
+  EXPECT_EQ(result.resource->state, state_t::failed);
+  EXPECT_EQ(result.resource->display_ids, (std::vector<std::string> {DISPLAY}));
+  EXPECT_EQ(result.resource->error["code"], "cleanup_failed");
+  EXPECT_EQ(result.resource->revision, 4);
+  EXPECT_EQ(manager.start(WORKSPACE, result.resource->revision).status, status_t::conflict);
+
+  const auto retried = manager.stop(WORKSPACE, result.resource->revision, true);
+  ASSERT_EQ(retried.status, status_t::success);
+  EXPECT_EQ(retried.resource->state, state_t::stopped);
+  EXPECT_TRUE(retried.resource->display_ids.empty());
+}
+
+TEST(TerraWorkspacesTest, ReadyRevisionAdvancesPastPreparationProgress) {
+  fake_t fake;
+  fake.report_preparation_progress = true;
+  manager_t manager {fake.callbacks()};
+  ASSERT_EQ(manager.create(OWNER, definition()).status, status_t::success);
+
+  const auto result = manager.start(WORKSPACE, 1);
+  ASSERT_EQ(result.status, status_t::success);
+  ASSERT_TRUE(result.resource);
+  EXPECT_EQ(result.resource->state, state_t::ready);
+  EXPECT_EQ(result.resource->revision, 4);
+}
+
 TEST(TerraWorkspacesTest, FailedReadyPublicationCleansPreparedResources) {
   fake_t fake;
   int saves = 0;
@@ -280,6 +332,32 @@ TEST(TerraWorkspacesTest, FailedReadyPublicationCleansPreparedResources) {
   EXPECT_EQ(fake.cleanup_calls, 1);
   EXPECT_EQ(manager.get(WORKSPACE)->state, state_t::stopped);
   EXPECT_TRUE(manager.available());
+}
+
+TEST(TerraWorkspacesTest, FailedReadyPublicationRetainsUnresolvedResources) {
+  fake_t fake;
+  fake.cleanup_succeeds = false;
+  int saves = 0;
+  auto callbacks = fake.callbacks();
+  callbacks.save = [&](const std::string &value) {
+    ++saves;
+    if (saves == 4) {
+      return false;
+    }
+    fake.document = value;
+    return true;
+  };
+  manager_t manager {std::move(callbacks)};
+  ASSERT_EQ(manager.create(OWNER, definition()).status, status_t::success);
+
+  const auto result = manager.start(WORKSPACE, 1);
+  ASSERT_EQ(result.status, status_t::persistence_error);
+  ASSERT_TRUE(result.resource);
+  EXPECT_EQ(result.resource->state, state_t::failed);
+  EXPECT_EQ(result.resource->sandbox_id, SANDBOX);
+  EXPECT_EQ(result.resource->display_ids, (std::vector<std::string> {DISPLAY}));
+  EXPECT_EQ(result.resource->peripheral_claim_ids, (std::vector<std::string> {CLAIM}));
+  EXPECT_EQ(result.resource->error["code"], "cleanup_failed");
 }
 
 TEST(TerraWorkspacesTest, FailedStartRollbackSaveDisablesManager) {
@@ -389,7 +467,23 @@ TEST(TerraWorkspacesTest, RevocationStopsAndOrphansPersistentButDeletesEphemeral
   EXPECT_FALSE(ephemeral.get(WORKSPACE));
 }
 
-TEST(TerraWorkspacesTest, MultiResourceRevokeRestoresEarlierRuntimeAfterLaterStopFailure) {
+TEST(TerraWorkspacesTest, RejectsAdoptionAfterOrphanBecomesEphemeral) {
+  fake_t fake;
+  manager_t manager {fake.callbacks()};
+  ASSERT_EQ(manager.create(OWNER, definition()).status, status_t::success);
+  ASSERT_EQ(manager.revoke_owner(OWNER), status_t::success);
+  const auto orphan = manager.get(WORKSPACE);
+  ASSERT_TRUE(orphan);
+
+  patch_t patch;
+  patch.persistent = false;
+  const auto ephemeral = manager.patch(WORKSPACE, orphan->revision, patch);
+  ASSERT_EQ(ephemeral.status, status_t::success);
+  ASSERT_TRUE(ephemeral.resource);
+  EXPECT_EQ(manager.adopt(WORKSPACE, ephemeral.resource->revision, OTHER).status, status_t::invalid);
+}
+
+TEST(TerraWorkspacesTest, MultiResourceRevokeNeverRestartsRevokedRuntimeAfterFailure) {
   fake_t fake;
   manager_t manager {fake.callbacks()};
   ASSERT_EQ(manager.create(OWNER, definition()).status, status_t::success);
@@ -399,13 +493,33 @@ TEST(TerraWorkspacesTest, MultiResourceRevokeRestoresEarlierRuntimeAfterLaterSto
   fake.fail_stop_on_call = 2;
   EXPECT_EQ(manager.revoke_owner(OWNER), status_t::provider_error);
   EXPECT_EQ(fake.stop_calls, 2);
-  ASSERT_EQ(fake.restored_ids.size(), 1);
-  EXPECT_EQ(fake.restored_ids[0], fake.stopped_ids[0]);
+  EXPECT_TRUE(fake.restored_ids.empty());
   EXPECT_EQ(manager.get(WORKSPACE)->owner_client_uuid, OWNER);
+  EXPECT_FALSE(manager.get(WORKSPACE_2)->owner_client_uuid);
+  const auto persisted = nlohmann::json::parse(*fake.document);
+  const auto persisted_first = std::ranges::find_if(persisted["workspaces"], [](const auto &value) {
+    return value["id"] == WORKSPACE_2;
+  });
+  ASSERT_NE(persisted_first, persisted["workspaces"].end());
+  EXPECT_TRUE((*persisted_first)["ownerClientUuid"].is_null());
+}
+
+TEST(TerraWorkspacesTest, SelectiveRevocationRetainsAuthorizedDefinitions) {
+  fake_t fake;
+  manager_t manager {fake.callbacks()};
+  ASSERT_EQ(manager.create(OWNER, definition()).status, status_t::success);
+  const auto stale_revision = manager.list().revision;
+  auto retained = definition();
+  retained.name = "Retained";
+  ASSERT_EQ(manager.create(OWNER, retained).status, status_t::success);
+  EXPECT_EQ(manager.revoke_unauthorized(OWNER, {WORKSPACE_2}, stale_revision), status_t::conflict);
+  EXPECT_EQ(manager.get(WORKSPACE)->owner_client_uuid, OWNER);
+  ASSERT_EQ(manager.revoke_unauthorized(OWNER, {WORKSPACE_2}, manager.list().revision), status_t::success);
+  EXPECT_FALSE(manager.get(WORKSPACE)->owner_client_uuid);
   EXPECT_EQ(manager.get(WORKSPACE_2)->owner_client_uuid, OWNER);
 }
 
-TEST(TerraWorkspacesTest, RevokeSaveFailureRestoresEveryStoppedRuntime) {
+TEST(TerraWorkspacesTest, RevokeSaveFailureFailsClosedWithoutRestartingRuntime) {
   fake_t fake;
   manager_t manager {fake.callbacks()};
   ASSERT_EQ(manager.create(OWNER, definition()).status, status_t::success);
@@ -413,15 +527,15 @@ TEST(TerraWorkspacesTest, RevokeSaveFailureRestoresEveryStoppedRuntime) {
   ASSERT_EQ(manager.start(WORKSPACE, 1).status, status_t::success);
   ASSERT_EQ(manager.start(WORKSPACE_2, 1).status, status_t::success);
   fake.save_succeeds = false;
-  EXPECT_EQ(manager.revoke_owner(OWNER), status_t::persistence_error);
-  EXPECT_EQ(fake.stop_calls, 2);
-  EXPECT_EQ(fake.restore_calls, 2);
+  EXPECT_EQ(manager.revoke_owner(OWNER), status_t::unavailable);
+  EXPECT_EQ(fake.stop_calls, 1);
+  EXPECT_EQ(fake.restore_calls, 0);
   EXPECT_EQ(manager.get(WORKSPACE)->owner_client_uuid, OWNER);
   EXPECT_EQ(manager.get(WORKSPACE_2)->owner_client_uuid, OWNER);
-  EXPECT_TRUE(manager.available());
+  EXPECT_FALSE(manager.available());
 }
 
-TEST(TerraWorkspacesTest, RestartReconcilesRuntimeAndIsolatesMalformedRecords) {
+TEST(TerraWorkspacesTest, RestartRejectsMalformedRecordsFailClosed) {
   fake_t fake;
   {
     manager_t manager {fake.callbacks()};
@@ -441,13 +555,8 @@ TEST(TerraWorkspacesTest, RestartReconcilesRuntimeAndIsolatesMalformedRecords) {
   fake.document = document.dump();
   fake.reconcile_succeeds = false;
   manager_t restarted {fake.callbacks()};
-  ASSERT_TRUE(restarted.available());
-  const auto resource = restarted.get(WORKSPACE);
-  ASSERT_TRUE(resource);
-  EXPECT_EQ(resource->state, state_t::failed);
-  EXPECT_FALSE(resource->session_id);
-  EXPECT_TRUE(resource->display_ids.empty());
-  EXPECT_EQ(restarted.list().workspaces.size(), 1);
+  EXPECT_FALSE(restarted.available());
+  EXPECT_TRUE(restarted.list().workspaces.empty());
 }
 
 TEST(TerraWorkspacesTest, PersistentDefinitionsSurviveRestartAndEphemeralDoNot) {

@@ -6,6 +6,7 @@
 
 // standard includes
 #include <chrono>
+#include <string>
 #include <string_view>
 
 // local includes
@@ -39,6 +40,7 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    std::string output_name;  ///< Per-stream display selector, empty for host default.
   };
 
   namespace amf {
@@ -682,6 +684,9 @@ namespace video {
   extern int active_av1_mode;
   extern bool last_encoder_probe_supported_ref_frames_invalidation;
   extern std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec;  // 0 - H.264, 1 - HEVC, 2 - AV1
+
+  /** @brief Return platform identifier of display currently selected for capture. */
+  std::string capture_display_name();
 
   /**
    * @brief Resolve a client-requested dynamic range against probed encoder capabilities.

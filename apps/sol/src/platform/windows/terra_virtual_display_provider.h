@@ -6,11 +6,22 @@
 
 // standard includes
 #include <filesystem>
+#include <optional>
+#include <string>
+#include <string_view>
 
 // local includes
 #include "src/terra_virtual_display.h"
 
 namespace terra::windows::virtual_display {
+  /**
+   * @brief Resolve one MttVDD PnP instance to its libdisplaydevice identifier.
+   *
+   * @param platform_id MttVDD monitor PnP instance ID.
+   * @return Stable libdisplaydevice ID, or no value when correlation is unavailable.
+   */
+  [[nodiscard]] std::optional<std::string> resolve_device_id(std::string_view platform_id);
+
   /**
    * @brief Probe complete read-only MttVDD and display-correlation path.
    *

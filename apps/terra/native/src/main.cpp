@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -46,10 +47,10 @@ void configureDpiAwareness() noexcept {
 #if defined(_WIN32)
     using SetDpiAwarenessContext = BOOL(WINAPI*)(HANDLE);
     const auto user32 = GetModuleHandleW(L"user32.dll");
-    const auto procedure = user32 ? GetProcAddress(user32, "SetProcessDpiAwarenessContext") : nullptr;
+    const auto procedure =
+        user32 ? GetProcAddress(user32, "SetProcessDpiAwarenessContext") : nullptr;
     if (procedure) {
-        const auto setDpiAwarenessContext =
-            reinterpret_cast<SetDpiAwarenessContext>(procedure);
+        const auto setDpiAwarenessContext = reinterpret_cast<SetDpiAwarenessContext>(procedure);
         if (setDpiAwarenessContext(reinterpret_cast<HANDLE>(-4))) return;
     }
     SetProcessDPIAware();
@@ -80,7 +81,7 @@ Json makeStatus() {
 #if TERRA_HAS_MOONLIGHT_COMMON
     static_cast<void>(LiGetMillis());
 #endif
-#if defined(_WIN32) && defined(TERRA_HAS_WINDOWS_VIDEO) || \
+#if defined(_WIN32) && defined(TERRA_HAS_WINDOWS_VIDEO) ||                                         \
     defined(__linux__) && defined(TERRA_HAS_LINUX_VIDEO)
     constexpr bool streamingAvailable = true;
 #else
@@ -100,9 +101,8 @@ Json makeStatus() {
 Json hostJson(const terra::HostRecord& host) {
     Json displayModes = Json::array();
     for (const auto& mode : host.displayModes) {
-        displayModes.push_back({{"width", mode.width},
-                                {"height", mode.height},
-                                {"refreshRate", mode.refreshRate}});
+        displayModes.push_back(
+            {{"width", mode.width}, {"height", mode.height}, {"refreshRate", mode.refreshRate}});
     }
     return {
         {"id", host.id},
@@ -122,6 +122,15 @@ Json hostJson(const terra::HostRecord& host) {
         {"lastSeenAt", host.lastSeenAt},
         {"paired", host.paired},
         {"wakeable", !host.wakeMacAddress.empty()},
+        {"apiVersion", host.apiVersion},
+        {"apiPort", host.apiPort},
+        {"capabilities", host.capabilities},
+        {"apiClientUuid", host.apiClientUuid},
+        {"apiClientName", host.apiClientName},
+        {"apiScopes", host.apiScopes},
+        {"allowedApps", host.allowedApps},
+        {"features", host.features},
+        {"limits", host.limits},
     };
 }
 
@@ -131,32 +140,57 @@ Json appJson(const terra::GameStreamApp& app) {
         {"name", app.name},
         {"hdrSupported", app.hdrSupported},
         {"appCollectorGame", app.appCollectorGame},
+        {"uuid", app.uuid},
+        {"kind", app.kind},
+        {"description", app.description},
+        {"source", app.source},
+        {"publisher", app.publisher},
+        {"tags", app.tags},
+        {"inputRequirements", app.inputRequirements},
+        {"installed", app.installed},
+        {"updateAvailable", app.updateAvailable},
+        {"assetRevision", app.assetRevision},
+        {"displayProfileId",
+         app.displayProfileId.empty() ? Json(nullptr) : Json(app.displayProfileId)},
+        {"streamProfileId",
+         app.streamProfileId.empty() ? Json(nullptr) : Json(app.streamProfileId)},
+        {"sandboxProfileId",
+         app.sandboxProfileId.empty() ? Json(nullptr) : Json(app.sandboxProfileId)},
     };
 }
 
 const char* displayModeName(terra::DisplayMode mode) {
     switch (mode) {
-        case terra::DisplayMode::fullscreen: return "fullscreen";
-        case terra::DisplayMode::borderless: return "borderless";
-        case terra::DisplayMode::windowed: return "windowed";
+        case terra::DisplayMode::fullscreen:
+            return "fullscreen";
+        case terra::DisplayMode::borderless:
+            return "borderless";
+        case terra::DisplayMode::windowed:
+            return "windowed";
     }
     return "windowed";
 }
 
 const char* audioConfigName(terra::AudioConfig config) {
     switch (config) {
-        case terra::AudioConfig::surround51: return "5.1";
-        case terra::AudioConfig::surround71: return "7.1";
-        case terra::AudioConfig::stereo: return "stereo";
+        case terra::AudioConfig::surround51:
+            return "5.1";
+        case terra::AudioConfig::surround71:
+            return "7.1";
+        case terra::AudioConfig::stereo:
+            return "stereo";
     }
     return "stereo";
 }
 
 const char* systemKeyCaptureName(terra::SystemKeyCapture capture) {
     switch (capture) {
-        case terra::SystemKeyCapture::fullscreen: return "fullscreen";
-        case terra::SystemKeyCapture::always: return "always";
-        case terra::SystemKeyCapture::off: return "off";
+        case terra::SystemKeyCapture::fullscreen:
+            return "fullscreen";
+        case terra::SystemKeyCapture::always:
+            return "always";
+        case terra::SystemKeyCapture::off:
+            return "off";
     }
     return "off";
 }
@@ -247,11 +281,11 @@ terra::StreamSettings parseStreamSettings(const Json& value) {
 void broadcast(ix::WebSocket& socket, const ExtensionContext& context, const std::string& event,
                const Json& data) {
     socket.send(Json{
-                    {"id", ix::uuid4()},
-                    {"method", "app.broadcast"},
-                    {"accessToken", context.accessToken},
-                    {"data", {{"event", event}, {"data", data}}},
-                }
+        {"id", ix::uuid4()},
+        {"method", "app.broadcast"},
+        {"accessToken", context.accessToken},
+        {"data", {{"event", event}, {"data", data}}},
+    }
                     .dump());
 }
 }  // namespace
@@ -299,9 +333,17 @@ int main(int argc, char** argv) {
             std::scoped_lock lock{workerMutex};
             workers.emplace_back([&, hostId] {
                 try {
-                    controlPlane.probeHost(hostId);
+                    const auto host = controlPlane.probeHost(hostId);
                     if (!closed) {
                         publishHosts();
+                    }
+                    if (host.apiVersion == 1 &&
+                        std::ranges::contains(host.apiScopes, "session.control")) {
+                        static_cast<void>(controlPlane.loadApiResource(hostId, "sessions"));
+                    }
+                    if (host.apiVersion == 1 &&
+                        std::ranges::contains(host.apiScopes, "telemetry.read")) {
+                        static_cast<void>(controlPlane.loadApiResource(hostId, "telemetry"));
                     }
                 } catch (const std::exception& exception) {
                     if (!closed) {
@@ -336,9 +378,9 @@ int main(int argc, char** argv) {
                 if (endpoint.find(':') != std::string::npos) endpoint = "[" + endpoint + "]";
                 if (service.port != 47989) endpoint += ":" + std::to_string(service.port);
                 try {
-                    controlPlane.discoverHost(
-                        service.name.empty() ? service.hostname : service.name,
-                        std::move(endpoint));
+                    controlPlane.discoverHost(service.name.empty() ? service.hostname
+                                                                   : service.name,
+                                              std::move(endpoint));
                     if (!closed) publishHosts();
                 } catch (const std::exception&) {
                     // DNS-SD advertisements are untrusted until a Sol probe succeeds.
@@ -363,20 +405,18 @@ int main(int argc, char** argv) {
 
         const auto publishPairing = [&](const std::string& hostId, const std::string& state,
                                         const std::string& message) {
-            broadcast(socket, context, "terra.pairing.changed",
-                      {{"schemaVersion", 1},
-                       {"hostId", hostId},
-                       {"state", state},
-                       {"message", message}});
+            broadcast(
+                socket, context, "terra.pairing.changed",
+                {{"schemaVersion", 1}, {"hostId", hostId}, {"state", state}, {"message", message}});
         };
 
-        const auto pairHost = [&](const std::string& hostId, const std::string& pin) {
-            publishPairing(hostId, "pairing",
-                           "Enter the displayed PIN in Sol's web interface.");
+        const auto pairHost = [&](const std::string& hostId, const std::string& pin,
+                                  terra::PairingAccess access) {
+            publishPairing(hostId, "pairing", "Enter the displayed PIN in Sol's web interface.");
             std::scoped_lock lock{workerMutex};
-            workers.emplace_back([&, hostId, pin] {
+            workers.emplace_back([&, hostId, pin, access] {
                 try {
-                    controlPlane.pairHost(hostId, pin);
+                    controlPlane.pairHost(hostId, pin, access);
                     if (!closed) {
                         publishHosts();
                         publishPairing(hostId, "paired", "Server identity verified and pinned.");
@@ -466,46 +506,48 @@ int main(int argc, char** argv) {
 
         controlPlane.setStreamOverlayListener([&](const terra::StreamOverlayRequest& request) {
             if (!closed) {
-                broadcast(socket, context, "terra.stream.overlay.requested",
-                          {{"schemaVersion", 1},
-                           {"hostId", request.hostId},
-                           {"appId", request.appId},
-                           {"appName", request.appName},
-                           {"generation", std::to_string(request.generation)},
-                           {"bounds",
-                            {{"x", request.x},
-                             {"y", request.y},
-                             {"width", request.width},
-                             {"height", request.height},
-                             {"scaleFactor", request.scaleFactor}}},
-                           {"wayland", request.wayland},
-                           {"fullscreen", request.fullscreen},
-                           {"stream",
-                            {{"width", request.settings.width},
-                             {"height", request.settings.height},
-                             {"fps", request.settings.fps},
-                             {"bitrateKbps", request.settings.bitrateKbps},
-                             {"codec", codecName(request.videoFormat)},
-                             {"displayMode", displayModeName(request.settings.displayMode)},
-                             {"displayIndex", request.settings.displayIndex},
-                             {"enableVsync", request.settings.enableVsync},
-                             {"audioConfig", audioConfigName(request.settings.audioConfig)},
-                             {"muteHostAudio", request.settings.muteHostAudio},
-                             {"gameOptimizations", request.settings.gameOptimizations},
-                             {"quitAppAfter", request.settings.quitAppAfter},
-                             {"enableHdr", request.settings.enableHdr},
-                             {"enableYuv444", request.settings.enableYuv444},
-                             {"absoluteMouseMode", request.settings.input.absoluteMouseMode},
-                             {"captureSystemKeys",
-                              systemKeyCaptureName(request.settings.input.captureSystemKeys)},
-                             {"touchscreenTrackpad", request.settings.input.touchscreenTrackpad},
-                             {"swapMouseButtons", request.settings.input.swapMouseButtons},
-                             {"reverseScrollDirection",
-                              request.settings.input.reverseScrollDirection},
-                             {"swapFaceButtons", request.settings.input.swapFaceButtons},
-                             {"forceGamepad", request.settings.input.forceGamepad},
-                             {"backgroundGamepad", request.settings.input.backgroundGamepad},
-                             {"controllerMask", request.controllerMask}}}});
+                broadcast(
+                    socket, context, "terra.stream.overlay.requested",
+                    {{"schemaVersion", 1},
+                     {"hostId", request.hostId},
+                     {"appId", request.appId},
+                     {"appName", request.appName},
+                     {"generation", std::to_string(request.generation)},
+                     {"revision", std::to_string(request.revision)},
+                     {"visible", request.visible},
+                     {"bounds",
+                      {{"x", request.x},
+                       {"y", request.y},
+                       {"width", request.width},
+                       {"height", request.height},
+                       {"scaleFactor", request.scaleFactor}}},
+                     {"wayland", request.wayland},
+                     {"fullscreen", request.fullscreen},
+                     {"stream",
+                      {{"width", request.settings.width},
+                       {"height", request.settings.height},
+                       {"fps", request.settings.fps},
+                       {"bitrateKbps", request.settings.bitrateKbps},
+                       {"codec", codecName(request.videoFormat)},
+                       {"displayMode", displayModeName(request.settings.displayMode)},
+                       {"displayIndex", request.settings.displayIndex},
+                       {"enableVsync", request.settings.enableVsync},
+                       {"audioConfig", audioConfigName(request.settings.audioConfig)},
+                       {"muteHostAudio", request.settings.muteHostAudio},
+                       {"gameOptimizations", request.settings.gameOptimizations},
+                       {"quitAppAfter", request.settings.quitAppAfter},
+                       {"enableHdr", request.settings.enableHdr},
+                       {"enableYuv444", request.settings.enableYuv444},
+                       {"absoluteMouseMode", request.settings.input.absoluteMouseMode},
+                       {"captureSystemKeys",
+                        systemKeyCaptureName(request.settings.input.captureSystemKeys)},
+                       {"touchscreenTrackpad", request.settings.input.touchscreenTrackpad},
+                       {"swapMouseButtons", request.settings.input.swapMouseButtons},
+                       {"reverseScrollDirection", request.settings.input.reverseScrollDirection},
+                       {"swapFaceButtons", request.settings.input.swapFaceButtons},
+                       {"forceGamepad", request.settings.input.forceGamepad},
+                       {"backgroundGamepad", request.settings.input.backgroundGamepad},
+                       {"controllerMask", request.controllerMask}}}});
             }
         });
 
@@ -540,8 +582,18 @@ int main(int argc, char** argv) {
             }
         });
 
+        controlPlane.setApiResourceListener([&](const terra::ApiResourceUpdate& update) {
+            if (!closed) {
+                broadcast(socket, context, "terra.sol.resource.changed",
+                          {{"schemaVersion", 1},
+                           {"hostId", update.hostId},
+                           {"resource", update.resource},
+                           {"payload", update.payload}});
+            }
+        });
+
         const auto launchApp = [&](const std::string& hostId, int appId,
-                                    const terra::StreamSettings& settings) {
+                                   const terra::StreamSettings& settings) {
             std::scoped_lock lock{workerMutex};
             workers.emplace_back([&, hostId, appId, settings] {
                 try {
@@ -616,8 +668,9 @@ int main(int argc, char** argv) {
                     } else if (event == "host.add") {
                         try {
                             const auto& data = payload.at("data");
-                            const auto host = controlPlane.addHost(data.at("name").get<std::string>(),
-                                                                   data.at("address").get<std::string>());
+                            const auto host =
+                                controlPlane.addHost(data.at("name").get<std::string>(),
+                                                     data.at("address").get<std::string>());
                             publishHosts();
                             probeHost(host.id);
                         } catch (const std::exception& exception) {
@@ -639,13 +692,60 @@ int main(int argc, char** argv) {
                         try {
                             const auto& data = payload.at("data");
                             pairHost(data.at("id").get<std::string>(),
-                                     data.at("pin").get<std::string>());
+                                     data.at("pin").get<std::string>(),
+                                     data.value("access", "gaming") == "workstation"
+                                         ? terra::PairingAccess::workstation
+                                         : terra::PairingAccess::gaming);
                         } catch (const std::exception& exception) {
                             publishHostError(exception.what());
                         }
                     } else if (event == "host.apps") {
                         try {
                             loadApps(payload.at("data").at("id").get<std::string>());
+                        } catch (const std::exception& exception) {
+                            publishHostError(exception.what());
+                        }
+                    } else if (event == "host.resource") {
+                        try {
+                            const auto& data = payload.at("data");
+                            const auto hostId = data.at("hostId").get<std::string>();
+                            const auto resource = data.at("resource").get<std::string>();
+                            std::scoped_lock lock{workerMutex};
+                            workers.emplace_back([&, hostId, resource] {
+                                try {
+                                    static_cast<void>(
+                                        controlPlane.loadApiResource(hostId, resource));
+                                } catch (const std::exception& exception) {
+                                    if (!closed) publishHostError(exception.what());
+                                }
+                            });
+                        } catch (const std::exception& exception) {
+                            publishHostError(exception.what());
+                        }
+                    } else if (event == "host.resource.mutate") {
+                        try {
+                            const auto& data = payload.at("data");
+                            const auto hostId = data.at("hostId").get<std::string>();
+                            const auto method = data.at("method").get<std::string>();
+                            const auto path = data.at("path").get<std::string>();
+                            const auto body = data.value("body", Json::object());
+                            const auto revision =
+                                data.contains("revision") &&
+                                        data.at("revision").is_number_unsigned()
+                                    ? std::optional<std::uint64_t>{data.at("revision")
+                                                                       .get<std::uint64_t>()}
+                                    : std::nullopt;
+                            const auto idempotent = data.value("idempotent", false);
+                            std::scoped_lock lock{workerMutex};
+                            workers.emplace_back(
+                                [&, hostId, method, path, body, revision, idempotent] {
+                                    try {
+                                        static_cast<void>(controlPlane.mutateApiResource(
+                                            hostId, method, path, body, revision, idempotent));
+                                    } catch (const std::exception& exception) {
+                                        if (!closed) publishHostError(exception.what());
+                                    }
+                                });
                         } catch (const std::exception& exception) {
                             publishHostError(exception.what());
                         }
@@ -666,17 +766,30 @@ int main(int argc, char** argv) {
                         } catch (const std::exception& exception) {
                             publishHostError(exception.what());
                         }
-                    } else if (event == "stream.overlay.closed") {
+                    } else if (event == "stream.overlay.close" ||
+                               event == "stream.overlay.hidden") {
                         try {
                             const auto& data = payload.at("data");
-                            std::size_t parsed = 0;
+                            std::size_t generationParsed = 0;
                             const auto generationText = data.at("generation").get<std::string>();
-                            const auto generation = std::stoull(generationText, &parsed);
-                            if (parsed != generationText.size()) {
-                                throw std::invalid_argument("Stream overlay generation is invalid.");
+                            const auto generation = std::stoull(generationText, &generationParsed);
+                            if (generationParsed != generationText.size()) {
+                                throw std::invalid_argument(
+                                    "Stream overlay generation is invalid.");
                             }
-                            controlPlane.resumeStreamOverlay(data.at("hostId").get<std::string>(),
-                                                             generation);
+                            std::size_t revisionParsed = 0;
+                            const auto revisionText = data.at("revision").get<std::string>();
+                            const auto revision = std::stoull(revisionText, &revisionParsed);
+                            if (revisionParsed != revisionText.size()) {
+                                throw std::invalid_argument("Stream overlay revision is invalid.");
+                            }
+                            if (event == "stream.overlay.close") {
+                                controlPlane.closeStreamOverlay(
+                                    data.at("hostId").get<std::string>(), generation, revision);
+                            } else {
+                                controlPlane.acknowledgeStreamOverlayHidden(
+                                    data.at("hostId").get<std::string>(), generation, revision);
+                            }
                         } catch (const std::exception& exception) {
                             publishHostError(exception.what());
                         }
@@ -691,8 +804,8 @@ int main(int argc, char** argv) {
                     break;
                 }
                 case ix::WebSocketMessageType::Error:
-                    std::cerr << "[terra-core] connection error: "
-                              << message->errorInfo.reason << std::endl;
+                    std::cerr << "[terra-core] connection error: " << message->errorInfo.reason
+                              << std::endl;
                     closed = true;
                     closedCondition.notify_one();
                     break;

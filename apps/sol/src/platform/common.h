@@ -6,11 +6,14 @@
 
 // standard includes
 #include <bitset>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 
 // lib includes
 #include <boost/core/noncopyable.hpp>
@@ -1288,8 +1291,162 @@ namespace platf {
   constexpr auto SERVICE_TYPE = "_nvstream._tcp";  ///< mDNS service type advertised for GameStream discovery.
 
   namespace publish {
+    /**
+     * @brief DNS-SD registration lifecycle state.
+     */
+    enum class state_t {
+      stopped,  ///< Publisher is intentionally stopped.
+      starting,  ///< Platform registration is in progress.
+      available,  ///< Service registration is established.
+      unavailable,  ///< Registration failed or was lost.
+    };
+
+    /**
+     * @brief Combined DNS-SD and discovery HTTP health.
+     */
+    struct health_t {
+      bool available {};  ///< Whether clients can discover and verify this host.
+      state_t registration {state_t::stopped};  ///< Current platform registration state.
+      bool http_available {};  ///< Whether unauthenticated `/serverinfo` is listening.
+      std::string reason_code;  ///< Stable unavailable reason code, or empty when available.
+      std::string reason;  ///< Human-readable unavailable reason, or empty when available.
+    };
+
+    /**
+     * @brief Process-wide discovery health storage.
+     */
+    struct health_state_t {
+      std::mutex mutex;  ///< Serializes callbacks and server lifecycle updates.
+      std::mutex callback_mutex;  ///< Serializes callback replacement and ordered delivery.
+      state_t registration {state_t::stopped};  ///< Last platform registration state.
+      bool http_available {};  ///< Last discovery HTTP listener state.
+      std::string reason_code;  ///< Platform failure code for unavailable registration.
+      std::string reason;  ///< Platform failure description for unavailable registration.
+      std::function<void(bool)> availability_callback;  ///< Invoked when combined availability changes.
+      std::uint64_t availability_generation {};  ///< Monotonic availability transition generation.
+    };
+
+    inline health_state_t health_state;  ///< Shared discovery health state.
+
+    /**
+     * @brief Deliver one availability transition unless superseded by newer state.
+     *
+     * @param generation Availability generation associated with transition.
+     */
+    inline void notify_availability(const std::uint64_t generation) {
+      std::lock_guard delivery_lock {health_state.callback_mutex};
+      std::function<void(bool)> callback;
+      bool available = false;
+      {
+        std::lock_guard state_lock {health_state.mutex};
+        if (generation != health_state.availability_generation) {
+          return;
+        }
+        callback = health_state.availability_callback;
+        available = health_state.registration == state_t::available && health_state.http_available;
+      }
+      if (callback) {
+        callback(available);
+      }
+    }
+
+    /**
+     * @brief Replace callback invoked when combined discovery availability changes.
+     *
+     * @param callback Callback receiving new combined availability, or empty to disable notifications.
+     */
+    inline void set_availability_callback(std::function<void(bool)> callback) {
+      std::lock_guard delivery_lock {health_state.callback_mutex};
+      std::lock_guard state_lock {health_state.mutex};
+      health_state.availability_callback = std::move(callback);
+    }
+
+    /**
+     * @brief Update platform DNS-SD registration health.
+     *
+     * @param state New registration state.
+     * @param reason_code Stable failure code for unavailable state.
+     * @param reason Human-readable failure description.
+     */
+    inline void set_registration_state(const state_t state, const std::string_view reason_code = {}, const std::string_view reason = {}) {
+      std::uint64_t generation = 0;
+      bool available = false;
+      {
+        std::lock_guard lock {health_state.mutex};
+        const bool was_available = health_state.registration == state_t::available && health_state.http_available;
+        health_state.registration = state;
+        health_state.reason_code = reason_code;
+        health_state.reason = reason;
+        available = health_state.registration == state_t::available && health_state.http_available;
+        if (available != was_available) {
+          generation = ++health_state.availability_generation;
+        }
+      }
+      if (generation != 0) {
+        notify_availability(generation);
+      }
+    }
+
+    /**
+     * @brief Update unauthenticated discovery HTTP listener health.
+     *
+     * @param available Whether `/serverinfo` is accepting connections.
+     */
+    inline void set_http_available(const bool available) {
+      std::uint64_t generation = 0;
+      bool discovery_available = false;
+      {
+        std::lock_guard lock {health_state.mutex};
+        const bool was_available = health_state.registration == state_t::available && health_state.http_available;
+        health_state.http_available = available;
+        discovery_available = health_state.registration == state_t::available && health_state.http_available;
+        if (discovery_available != was_available) {
+          generation = ++health_state.availability_generation;
+        }
+      }
+      if (generation != 0) {
+        notify_availability(generation);
+      }
+    }
+
+    /**
+     * @brief Return combined DNS-SD and HTTP discovery health.
+     *
+     * @return Immutable current health snapshot.
+     */
+    inline health_t health() {
+      std::lock_guard lock {health_state.mutex};
+      health_t result {
+        .available = health_state.registration == state_t::available && health_state.http_available,
+        .registration = health_state.registration,
+        .http_available = health_state.http_available,
+      };
+      if (result.available) {
+        return result;
+      }
+      if (!health_state.http_available) {
+        result.reason_code = "server_unavailable";
+        result.reason = "GameStream discovery HTTP server is not listening";
+      } else if (health_state.registration == state_t::starting) {
+        result.reason_code = "provider_starting";
+        result.reason = "DNS-SD service registration is in progress";
+      } else if (health_state.registration == state_t::unavailable) {
+        result.reason_code = health_state.reason_code.empty() ? "provider_unavailable" : health_state.reason_code;
+        result.reason = health_state.reason.empty() ? "DNS-SD service registration is unavailable" : health_state.reason;
+      } else {
+        result.reason_code = "provider_stopped";
+        result.reason = "DNS-SD service registration is stopped";
+      }
+      return result;
+    }
+
+    /**
+     * @brief Start platform DNS-SD publication for GameStream discovery.
+     *
+     * @return Cleanup handle while publication is active, or null on startup failure.
+     */
     [[nodiscard]] std::unique_ptr<deinit_t> start();
-  }
+  }  // namespace publish
 
   /**
    * @brief Initialize the platform-specific high precision timer.

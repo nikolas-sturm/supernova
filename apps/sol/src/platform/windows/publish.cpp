@@ -11,6 +11,14 @@
 #include <WinDNS.h>
 #include <winerror.h>
 
+// standard includes
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <utility>
+
 // local includes
 #include "misc.h"
 #include "src/config.h"
@@ -18,7 +26,6 @@
 #include "src/network.h"
 #include "src/nvhttp.h"
 #include "src/platform/common.h"
-#include "src/thread_safe.h"
 #include "utf_utils.h"
 
 /**
@@ -127,92 +134,229 @@ extern "C" {
   _FN(_DnsServiceFreeInstance, VOID, (_In_ PDNS_SERVICE_INSTANCE pInstance));
   _FN(_DnsServiceDeRegister, DWORD, (_In_ PDNS_SERVICE_REGISTER_REQUEST pRequest, _Inout_opt_ PDNS_SERVICE_CANCEL pCancel));
   _FN(_DnsServiceRegister, DWORD, (_In_ PDNS_SERVICE_REGISTER_REQUEST pRequest, _Inout_opt_ PDNS_SERVICE_CANCEL pCancel));
+  _FN(_DnsServiceRegisterCancel, DWORD, (_In_ PDNS_SERVICE_CANCEL pCancel));
 } /* extern "C" */
 
 namespace platf::publish {
+  namespace {
+    constexpr auto SERVICE_REQUEST_TIMEOUT = std::chrono::seconds {5};  ///< Maximum wait for a Windows DNS-SD request callback.
+
+    /**
+     * @brief Stable storage and completion state for one asynchronous Windows DNS-SD request.
+     */
+    class service_request_t {
+    public:
+      /** @brief Native action required when publication ownership ends. */
+      enum class stop_action_t {
+        none,  ///< Registration already failed.
+        cancel,  ///< Registration callback is still pending.
+        deregister,  ///< Registration completed successfully.
+      };
+
+      /**
+       * @brief Store asynchronous request completion.
+       *
+       * @param completion_status Native callback status.
+       * @param registration Whether this callback completed registration.
+       * @return True when a late successful registration must be removed.
+       */
+      bool complete(const DWORD completion_status, const bool registration) {
+        std::lock_guard lock {mutex};
+        status = completion_status;
+        completed = true;
+        condition.notify_one();
+        if (!registration) {
+          if (status != ERROR_SUCCESS) {
+            set_registration_state(state_t::unavailable, "deregistration_failed", "Windows DNS-SD service deregistration failed");
+          }
+          return false;
+        }
+        if (stopping) {
+          return status == ERROR_SUCCESS;
+        }
+        if (status == ERROR_SUCCESS) {
+          set_registration_state(state_t::available);
+        } else {
+          set_registration_state(state_t::unavailable, "registration_failed", "Windows DNS-SD service registration failed");
+        }
+        return false;
+      }
+
+      /**
+       * @brief Wait for bounded deregistration request completion.
+       *
+       * @return True when callback completed before timeout.
+       */
+      bool wait() {
+        std::unique_lock lock {mutex};
+        return condition.wait_for(lock, SERVICE_REQUEST_TIMEOUT, [&] {
+          return completed;
+        });
+      }
+
+      /**
+       * @brief Return native callback status.
+       *
+       * @return Windows DNS status supplied to callback.
+       */
+      DWORD completion_status() const {
+        std::lock_guard lock {mutex};
+        return status;
+      }
+
+      /**
+       * @brief Prepare original request for one deregistration attempt.
+       *
+       * @return True for first attempt; otherwise false.
+       */
+      bool begin_deregistration() {
+        std::lock_guard lock {mutex};
+        if (deregistration_started) {
+          return false;
+        }
+        deregistration_started = true;
+        completed = false;
+        status = ERROR_SUCCESS;
+        return true;
+      }
+
+      /**
+       * @brief Mark publication stopped and select required native cleanup.
+       *
+       * @return Cancel for pending registration, deregister for successful registration, or none.
+       */
+      stop_action_t begin_stop() {
+        std::lock_guard lock {mutex};
+        stopping = true;
+        set_registration_state(state_t::stopped);
+        if (!completed) {
+          return stop_action_t::cancel;
+        }
+        return status == ERROR_SUCCESS ? stop_action_t::deregister : stop_action_t::none;
+      }
+
+      mutable std::mutex mutex;  ///< Protects asynchronous completion state.
+      std::condition_variable condition;  ///< Signals callback completion.
+      bool completed {};  ///< Whether callback has run.
+      bool stopping {};  ///< Whether publication ownership has ended.
+      bool deregistration_started {};  ///< Whether deregistration was already requested.
+      DWORD status {};  ///< Native callback status.
+      std::wstring name;  ///< Stable registration instance-name storage.
+      std::wstring host;  ///< Stable registration hostname storage.
+      std::array<PWCHAR, 1> keys {nullptr};  ///< Stable empty TXT key storage.
+      std::array<PWCHAR, 1> values {nullptr};  ///< Stable empty TXT value storage.
+      DNS_SERVICE_INSTANCE instance {};  ///< Stable native registration instance request.
+      DNS_SERVICE_REGISTER_REQUEST request {};  ///< Stable native asynchronous request.
+      DNS_SERVICE_CANCEL cancel {};  ///< Native registration cancellation handle.
+    };
+
+    /**
+     * @brief Callback-owned reference to a pending DNS-SD request.
+     */
+    struct callback_context_t {
+      std::shared_ptr<service_request_t> operation;  ///< Stable request storage.
+      bool registration {};  ///< Whether callback completes registration.
+    };
+
+    /**
+     * @brief Deregister using the original stable registration request.
+     *
+     * @param operation Registration request retained for its full native lifetime.
+     * @param wait Whether to wait for bounded callback completion.
+     * @return True when deregistration started and, when requested, completed successfully.
+     */
+    bool deregister_service(const std::shared_ptr<service_request_t> &operation, bool wait);
+  }  // namespace
+
   /**
    * @brief Handle completion of a Windows DNS-SD registration request.
    *
    * @param status Native status code returned by the platform API.
-   * @param pQueryContext Alarm object signaled when registration completes.
+   * @param pQueryContext Shared request state retained until callback completion.
    * @param pInstance Registered DNS-SD service instance returned by Windows.
-   * @return Callback has no return value; completion is reported through the alarm.
+   * @return Callback has no return value; completion is stored in shared request state.
    */
   VOID WINAPI register_cb(DWORD status, PVOID pQueryContext, PDNS_SERVICE_INSTANCE pInstance) {
-    auto alarm = (safe::alarm_t<PDNS_SERVICE_INSTANCE>::element_type *) pQueryContext;
+    std::unique_ptr<callback_context_t> context {
+      static_cast<callback_context_t *>(pQueryContext),
+    };
 
     if (status) {
       print_status("register_cb()"sv, status);
     }
+    if (pInstance) {
+      _DnsServiceFreeInstance(pInstance);
+    }
 
-    alarm->ring(pInstance);
+    const bool remove_late_registration = context->operation->complete(status, context->registration);
+    if (context->registration && status == ERROR_SUCCESS && !remove_late_registration) {
+      BOOST_LOG(info) << "Registered Sol mDNS service"sv;
+    }
+    if (remove_late_registration) {
+      static_cast<void>(deregister_service(context->operation, false));
+    }
   }
 
-  static int service(bool enable, PDNS_SERVICE_INSTANCE &existing_instance) {
-    auto alarm = safe::make_alarm<PDNS_SERVICE_INSTANCE>();
+  /**
+   * @brief Begin asynchronous Windows DNS-SD registration.
+   *
+   * @return Stable original request while registration is active, or null on failure.
+   */
+  static std::shared_ptr<service_request_t> register_service() {
+    auto operation = std::make_shared<service_request_t>();
+    const auto domain = utf_utils::from_utf8(SERVICE_TYPE_DOMAIN);
+    const auto hostname = platf::get_host_name();
+    operation->name = utf_utils::from_utf8(net::mdns_instance_name(hostname) + '.') + domain;
+    operation->host = utf_utils::from_utf8(hostname + ".local");
+    operation->instance.pszInstanceName = operation->name.data();
+    operation->instance.wPort = net::map_port(nvhttp::PORT_HTTP);
+    operation->instance.pszHostName = operation->host.data();
 
-    std::wstring domain = utf_utils::from_utf8(SERVICE_TYPE_DOMAIN);
+    // Windows otherwise emits an invalid zero-string TXT record rejected by Apple resolvers.
+    operation->instance.dwPropertyCount = 1;
+    operation->instance.keys = operation->keys.data();
+    operation->instance.values = operation->values.data();
 
-    auto hostname = platf::get_host_name();
-    auto name = utf_utils::from_utf8(net::mdns_instance_name(hostname) + '.') + domain;
-    auto host = utf_utils::from_utf8(hostname + ".local");
+    operation->request.Version = DNS_QUERY_REQUEST_VERSION1;
+    operation->request.pQueryContext = new callback_context_t {operation, true};
+    operation->request.pServiceInstance = &operation->instance;
+    operation->request.pRegisterCompletionCallback = register_cb;
 
-    DNS_SERVICE_INSTANCE instance {};
-    instance.pszInstanceName = name.data();
-    instance.wPort = net::map_port(nvhttp::PORT_HTTP);
-    instance.pszHostName = host.data();
+    const auto status = _DnsServiceRegister(&operation->request, &operation->cancel);
+    if (status != DNS_REQUEST_PENDING) {
+      delete static_cast<callback_context_t *>(operation->request.pQueryContext);
+      operation->request.pQueryContext = nullptr;
+      print_status("DnsServiceRegister()"sv, status);
+      return nullptr;
+    }
 
-    // Setting these values ensures Windows mDNS answers comply with RFC 1035.
-    // If these are unset, Windows will send a TXT record that has zero strings,
-    // which is illegal. Setting them to a single empty value causes Windows to
-    // send a single empty string for the TXT record, which is the correct thing
-    // to do when advertising a service without any TXT strings.
-    //
-    // Most clients aren't strictly checking TXT record compliance with RFC 1035,
-    // but Apple's mDNS resolver does and rejects the entire answer if an invalid
-    // TXT record is present.
-    PWCHAR keys[] = {nullptr};
-    PWCHAR values[] = {nullptr};
-    instance.dwPropertyCount = 1;
-    instance.keys = keys;
-    instance.values = values;
+    return operation;
+  }
 
-    DNS_SERVICE_REGISTER_REQUEST req {};
-    req.Version = DNS_QUERY_REQUEST_VERSION1;
-    req.pQueryContext = alarm.get();
-    req.pServiceInstance = enable ? &instance : existing_instance;
-    req.pRegisterCompletionCallback = register_cb;
-
-    DNS_STATUS status {};
-
-    if (enable) {
-      status = _DnsServiceRegister(&req, nullptr);
-      if (status != DNS_REQUEST_PENDING) {
-        print_status("DnsServiceRegister()"sv, status);
-        return -1;
+  namespace {
+    bool deregister_service(const std::shared_ptr<service_request_t> &operation, const bool wait) {
+      if (!operation->begin_deregistration()) {
+        return true;
       }
-    } else {
-      status = _DnsServiceDeRegister(&req, nullptr);
+
+      operation->request.pQueryContext = new callback_context_t {operation, false};
+      const auto status = _DnsServiceDeRegister(&operation->request, nullptr);
       if (status != DNS_REQUEST_PENDING) {
+        delete static_cast<callback_context_t *>(operation->request.pQueryContext);
+        operation->request.pQueryContext = nullptr;
         print_status("DnsServiceDeRegister()"sv, status);
-        return -1;
+        return false;
       }
+      if (!wait) {
+        return true;
+      }
+      if (!operation->wait()) {
+        BOOST_LOG(error) << "Windows DNS-SD deregistration timed out"sv;
+        return false;
+      }
+      return operation->completion_status() == ERROR_SUCCESS;
     }
-
-    alarm->wait();
-
-    auto registered_instance = alarm->status();
-    if (enable) {
-      // Store this instance for later deregistration
-      existing_instance = registered_instance;
-    } else if (registered_instance) {
-      // Deregistration was successful
-      _DnsServiceFreeInstance(registered_instance);
-      existing_instance = nullptr;
-    }
-
-    return registered_instance ? 0 : -1;
-  }
+  }  // namespace
 
   /**
    * @brief Windows DNS-SD registration lifetime for the advertised Sol service.
@@ -220,28 +364,43 @@ namespace platf::publish {
   class mdns_registration_t: public ::platf::deinit_t {
   public:
     mdns_registration_t():
-        existing_instance(nullptr) {
-      if (service(true, existing_instance)) {
+        operation(register_service()) {
+      if (!operation) {
         BOOST_LOG(error) << "Unable to register Sol mDNS service"sv;
+        set_registration_state(state_t::unavailable, "registration_failed", "Windows DNS-SD service registration failed");
         return;
       }
 
-      BOOST_LOG(info) << "Registered Sol mDNS service"sv;
+      BOOST_LOG(info) << "Requested Sol mDNS service registration"sv;
     }
 
     ~mdns_registration_t() override {
-      if (existing_instance) {
-        if (service(false, existing_instance)) {
-          BOOST_LOG(error) << "Unable to unregister Sol mDNS service"sv;
-          return;
+      if (operation) {
+        switch (operation->begin_stop()) {
+          case service_request_t::stop_action_t::cancel:
+            {
+              const auto status = _DnsServiceRegisterCancel(&operation->cancel);
+              if (status != ERROR_SUCCESS && status != ERROR_CANCELLED) {
+                print_status("DnsServiceRegisterCancel()"sv, status);
+              }
+              break;
+            }
+          case service_request_t::stop_action_t::deregister:
+            if (!deregister_service(operation, true)) {
+              BOOST_LOG(error) << "Unable to unregister Sol mDNS service"sv;
+              set_registration_state(state_t::unavailable, "deregistration_failed", "Windows DNS-SD service deregistration failed");
+              return;
+            }
+            BOOST_LOG(info) << "Unregistered Sol mDNS service"sv;
+            break;
+          case service_request_t::stop_action_t::none:
+            break;
         }
-
-        BOOST_LOG(info) << "Unregistered Sol mDNS service"sv;
       }
     }
 
   private:
-    PDNS_SERVICE_INSTANCE existing_instance;
+    std::shared_ptr<service_request_t> operation;  ///< Original request retained for native deregistration.
   };
 
   /**
@@ -258,8 +417,9 @@ namespace platf::publish {
     _DnsServiceFreeInstance = (_DnsServiceFreeInstance_fn) GetProcAddress(handle, "DnsServiceFreeInstance");
     _DnsServiceDeRegister = (_DnsServiceDeRegister_fn) GetProcAddress(handle, "DnsServiceDeRegister");
     _DnsServiceRegister = (_DnsServiceRegister_fn) GetProcAddress(handle, "DnsServiceRegister");
+    _DnsServiceRegisterCancel = (_DnsServiceRegisterCancel_fn) GetProcAddress(handle, "DnsServiceRegisterCancel");
 
-    if (!(_DnsServiceFreeInstance && _DnsServiceDeRegister && _DnsServiceRegister)) {
+    if (!(_DnsServiceFreeInstance && _DnsServiceDeRegister && _DnsServiceRegister && _DnsServiceRegisterCancel)) {
       BOOST_LOG(error) << "mDNS service not available in dnsapi.dll"sv;
       return -1;
     }
@@ -269,13 +429,16 @@ namespace platf::publish {
   }
 
   std::unique_ptr<::platf::deinit_t> start() {
+    set_registration_state(state_t::starting);
     HMODULE handle = LoadLibrary("dnsapi.dll");
 
     if (!handle || load_funcs(handle)) {
       BOOST_LOG(error) << "Couldn't load dnsapi.dll, You'll need to add PC manually from Terra"sv;
+      set_registration_state(state_t::unavailable, "provider_unavailable", "Windows DNS-SD API is unavailable");
       return nullptr;
     }
 
-    return std::make_unique<mdns_registration_t>();
+    auto registration = std::make_unique<mdns_registration_t>();
+    return registration;
   }
 }  // namespace platf::publish

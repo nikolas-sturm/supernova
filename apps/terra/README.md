@@ -217,10 +217,12 @@ Moonlight's PC shortcuts are supported: `Ctrl+Alt+Shift+Q` disconnects, `Z` togg
 16 KiB of validated UTF-8 clipboard text, `D` minimizes, `C` toggles the local cursor in direct mouse
 mode, and `L` locks the pointer to the video area in direct mouse mode. Each shortcut requires the
 full `Ctrl+Alt+Shift` chord, remains local, and releases forwarded modifier state before acting.
-`Ctrl+Alt+Shift+O` opens the stream overlay while the stream has focus and input is captured. On
-Wayland, the stream overlay requires a compositor with wlr layer-shell support; Terra opens a native
-Wayland surface on the compositor's overlay layer above the focused output, including when the SDL
-renderer runs through XWayland. Outside fullscreen, the testing overlay covers the full focused output.
+`Ctrl+Alt+Shift+O` toggles the stream overlay on key press while the stream has focus and input is
+captured. Releasing and pressing `O` again works while the modifiers remain held. Remote input stays
+suspended until the overlay confirms it is hidden and `O` is released. On Wayland, the stream overlay
+requires a compositor with wlr layer-shell support; Terra opens a keyboard-inert native surface on the
+compositor's overlay layer above the focused output, including when the SDL renderer runs through
+XWayland. Outside fullscreen, the testing overlay covers the full focused output.
 
 Wake-on-LAN MAC addresses are accepted only from pinned, mutually authenticated host probes and are
 never exposed to the webview. Terra sends bounded UDP port 9 broadcasts and rate-limits requests.

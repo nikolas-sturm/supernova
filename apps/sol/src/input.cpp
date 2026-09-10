@@ -29,12 +29,12 @@ extern "C" {
 
 // local includes
 #include "config.h"
-#include "terra_api.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
 #include "platform/common.h"
 #include "platform/virtualhid_input.h"
+#include "terra_api.h"
 #include "thread_pool.h"
 #include "utility.h"
 
@@ -269,11 +269,13 @@ namespace input {
      * @param touch_port_event Event carrying the active touch port.
      * @param feedback_queue Queue used for controller feedback.
      * @param permissions Input classes permitted for this client.
+     * @param mouse_mode Mouse-coordinate mode accepted from this stream.
      */
     input_t(
       safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event,
       platf::feedback_queue_t feedback_queue,
-      terra_api::input_permissions_t permissions
+      terra_api::input_permissions_t permissions,
+      const mouse_mode_e mouse_mode
     ):
         shortcutFlags {},
         gamepads(MAX_GAMEPADS),
@@ -281,6 +283,7 @@ namespace input {
         touch_port_event {std::move(touch_port_event)},
         feedback_queue {std::move(feedback_queue)},
         permissions {permissions},
+        mouse_mode {mouse_mode},
         mouse_left_button_timeout {},
         touch_port {{0, 0, 0, 0}, 0, 0, 1.0f, 1.0f, 0, 0},
         accumulated_vscroll_delta {},
@@ -300,6 +303,7 @@ namespace input {
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;  ///< Touch port event.
     platf::feedback_queue_t feedback_queue;  ///< Queue used to deliver controller feedback to the platform backend.
     terra_api::input_permissions_t permissions;  ///< Input classes permitted by paired-client policy.
+    mouse_mode_e mouse_mode;  ///< Mouse-coordinate mode accepted from this stream.
     std::mutex permissions_mutex;  ///< Protects policy replacement and packet authorization on resumed streams.
 
     std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
@@ -1749,10 +1753,12 @@ namespace input {
    * @param magic Validated input packet magic.
    * @return `true` when this packet class may reach host input dispatch.
    */
-  bool input_packet_permitted(const terra_api::input_permissions_t &permissions, const std::uint32_t magic) {
+  bool input_packet_permitted(const terra_api::input_permissions_t &permissions, const mouse_mode_e mouse_mode, const std::uint32_t magic) {
     switch (magic) {
       case MOUSE_MOVE_REL_MAGIC_GEN5:
+        return permissions.mouse && mouse_mode != mouse_mode_e::absolute;
       case MOUSE_MOVE_ABS_MAGIC:
+        return permissions.mouse && mouse_mode != mouse_mode_e::relative;
       case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
       case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5:
       case SCROLL_MAGIC_GEN5:
@@ -2175,7 +2181,7 @@ namespace input {
     }
     {
       std::lock_guard lock {input->permissions_mutex};
-      if (!input_packet_permitted(input->permissions, util::endian::little(header.magic))) {
+      if (!input_packet_permitted(input->permissions, input->mouse_mode, util::endian::little(header.magic))) {
         BOOST_LOG(debug) << "Dropping input packet denied by paired-client policy"sv;
         return;
       }
@@ -2413,7 +2419,7 @@ namespace input {
   /**
    * @brief Allocate and initialize platform input state for a stream.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, const terra_api::input_permissions_t permissions) {
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, const terra_api::input_permissions_t permissions, const mouse_mode_e mouse_mode) {
     std::shared_ptr<input_t> input;
     bool resumed = false;
     {
@@ -2427,7 +2433,8 @@ namespace input {
         input = std::make_shared<input_t>(
           mail->event<input::touch_port_t>(mail::touch_port),
           mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback),
-          permissions
+          permissions,
+          mouse_mode
         );
         state.inputs.try_emplace(std::move(session_id), input);
       }
@@ -2437,6 +2444,7 @@ namespace input {
       {
         std::lock_guard lock {input->permissions_mutex};
         input->permissions = permissions;
+        input->mouse_mode = mouse_mode;
       }
       dispatch_input_task([input, mail = std::move(mail)]() {
         rebind_input(input, mail);

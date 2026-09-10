@@ -15,6 +15,9 @@
 #include <string>
 #include <string_view>
 
+// lib includes
+#include <nlohmann/json.hpp>
+
 /**
  * @brief Versioned Terra extension API primitives.
  * @details Private names use Terra; existing wire and persisted names are retained.
@@ -22,6 +25,16 @@
  */
 namespace terra_api {
   constexpr std::uint32_t API_VERSION = 1;  ///< Highest Terra API version supported by this host.
+
+  /**
+   * @brief Validate required Terra request schema metadata.
+   *
+   * @param value Parsed request body.
+   * @return `true` when body is an object containing unsigned integer schema version one.
+   */
+  inline bool valid_request_schema(const nlohmann::json &value) {
+    return value.is_object() && value.contains("schemaVersion") && value.at("schemaVersion").is_number_unsigned() && value.at("schemaVersion") == API_VERSION;
+  }
 
   constexpr std::array<std::string_view, 10> SCOPES {
     "catalog.read",
@@ -52,16 +65,12 @@ namespace terra_api {
     "discovery-v1",
   };  ///< Stable Terra API capability names, including unavailable features.
 
-  constexpr std::array<std::string_view, 8> CAPABILITIES {
+  constexpr std::array<std::string_view, 4> CAPABILITIES {
     "client-permissions",
     "session-ids",
     "structured-errors",
     "catalog-v2",
-    "events-v1",
-    "profiles-v1",
-    "workspaces-v1",
-    "telemetry-v1",
-  };  ///< Terra API capabilities currently implemented by this host.
+  };  ///< Terra API capabilities not dependent on runtime manager health.
 
   constexpr std::array<std::string_view, 5> INPUT_CLASSES {
     "keyboard",

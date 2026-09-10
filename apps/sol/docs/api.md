@@ -20,9 +20,18 @@ than represented by a zero address.
 
 Sol advertises only capabilities whose complete routes and runtime dependencies are currently
 operational: `client-permissions`, `session-ids`, `structured-errors`, `catalog-v2`, `events-v1`,
-`profiles-v1`, `workspaces-v1`, `telemetry-v1`, and `peripherals-v1` on every supported platform,
-plus `sandboxes-v1` and `displays-v1` on Windows while their providers stay healthy. Incomplete and
-unhealthy provider-backed domains remain listed as unavailable under `features`.
+`telemetry-v1`, and `peripherals-v1` on every supported platform, plus `discovery-v1` while local
+discovery is reachable. Windows additionally advertises `profiles-v1`, `workspaces-v1`,
+`sandboxes-v1`, `virtual-displays-v1`, and `displays-v1` while their complete persistence and
+provider dependencies stay healthy. Incomplete and unhealthy provider-backed domains remain listed
+as unavailable under `features`.
+
+`discovery-v1` uses DNS-SD service type `_nvstream._tcp.local`. Its SRV port is Sol's mapped
+unauthenticated GameStream HTTP port, where clients verify advertisements through `/serverinfo`
+before persisting a host. Sol advertises this capability only after DNS-SD registration is
+established and the HTTP listener is live. Sol requests withdrawal and removes the capability
+before that listener stops; registration failures report a stable reason under
+`features.discovery-v1`.
 
 Deleting a profile that is still referenced by a workspace definition, a launch profile, or
 application metadata returns `resource_busy`; references must be removed first. Host name changes
@@ -131,13 +140,16 @@ session; hidden or absent sessions return `session_not_found`.
 
 ### POST /eclipse/v1/sessions/{id}/disconnect
 
-Requires `session.control`. Disconnects transport streams while leaving host application available
-for GameStream resume.
+Requires `session.control`, `Idempotency-Key`, and body `{"schemaVersion":1}`. Returns a durable
+operation whose successful result contains the disconnected session resource. Disconnects transport
+streams while leaving host application available for GameStream resume.
 
 ### POST /eclipse/v1/sessions/{id}/stop
 
-Requires `session.control`. Stops transport streams, owning host application, session-scoped
-sandboxes, and bound peripheral claims. Cross-client control additionally requires `host.control`.
+Requires `session.control`, `Idempotency-Key`, and body `{"schemaVersion":1}`. Returns a durable
+operation whose successful result contains the stopped session resource. Stops transport streams,
+owning host application, session-scoped sandboxes, and bound peripheral claims. Cross-client control
+additionally requires `host.control`.
 
 ### GET /eclipse/v1/displays
 
@@ -152,10 +164,11 @@ Requires `display.read`. Returns one unified display resource or `display_not_fo
 
 ### PATCH /eclipse/v1/displays/{id}
 
-Requires `display.manage`. Accepts any subset of `enabled`, `primary`, `modeId`, and `hdr` for
-physical displays; `position`, `scale`, and `rotation` are immutable and return `invalid_argument`.
-Virtual display identifiers are forwarded to the virtual-display patch semantics. The response
-contains the resulting `display`; unsupported or unknown modes fail without partial application.
+Requires `display.manage` and strong numeric `If-Match`. Accepts any subset of `enabled`, `primary`,
+`modeId`, and `hdr` for physical displays; `position`, `scale`, and `rotation` are immutable and
+return `invalid_argument`. Virtual display identifiers are forwarded to virtual-display patch
+semantics. The response contains the resulting `display`; unsupported or unknown modes fail without
+partial application.
 
 ### GET /eclipse/v1/display-topology
 
@@ -166,9 +179,21 @@ Requires `display.read`. Returns `{"topology": {"id", "revision", "displays"}}` 
 
 Requires `display.manage` and strong numeric `If-Match` against the topology revision. The body is
 a complete desired topology for listed physical displays. Validation is atomic: unknown displays,
-non-physical entries, disabled outputs, non-zero rotation, multiple primary requests, and
-unsupported modes fail before any host state changes. The response returns the actual applied
+non-physical entries, disabled outputs, changed position or rational scale, non-zero rotation,
+anything other than exactly one listed primary, and unsupported modes fail before any host state
+changes. The response returns the actual applied
 `topology` and affected `displays`. Failed application reverts display configuration.
+
+### Virtual displays
+
+Windows hosts advertise `virtual-displays-v1` only while the MttVDD manager is healthy and report
+maximum managed-display capacity above the provider baseline under `limits.virtualDisplays.maxActive`. `GET /eclipse/v1/virtual-displays`
+and `GET /eclipse/v1/virtual-displays/{id}` require `display.read` and apply owner visibility.
+Create, patch, delete, attach, detach, and adopt routes require `Idempotency-Key`; item mutations also
+require strong numeric `If-Match`. Mutations return HTTP `202` operations. Committed transitions emit
+caller-filtered `virtualDisplay.created`, `virtualDisplay.updated`, or `virtualDisplay.removed`; every
+caller-visible unified inventory change also emits `displays.changed` at its direct-read revision.
+Ended sessions detach persistent virtual displays and remove ephemeral ones.
 
 ### GET /eclipse/v1/peripherals
 
@@ -179,9 +204,11 @@ caller with a monotonic collection revision and `since=<revision>` support.
 
 Requires `peripheral.forward`. Registers a Terra-side device descriptor from `class`,
 `platformId`, `name`, `vendorId`, `productId`, optional `serial`, `capabilities`, and optional
-`reportDescriptorBase64`. This host accepts keyboard and mouse classes with `keyboard.hid`,
-`keyboard.text`, `mouse.hid`, and `mouse.relative` capabilities; other classes return
-`unsupported_configuration`. Returns HTTP 201 with `peripheral`.
+`reportDescriptorBase64`. This host accepts keyboard and mouse classes with fixed boot-protocol
+`keyboard.hid` and `mouse.hid` capabilities. Custom report descriptors and other capabilities
+return `unsupported_configuration`. Host limit is 32 devices, 32 non-terminal claims, 64 KiB per
+WebSocket message, and eight decoded bytes per fixed HID report. Requires `Idempotency-Key` and
+returns an HTTP `202` durable operation whose successful result contains `peripheral`.
 
 ### GET /eclipse/v1/peripherals/{id}
 
@@ -189,7 +216,9 @@ Requires `peripheral.forward`. Returns one visible device or `peripheral_not_fou
 
 ### DELETE /eclipse/v1/peripherals/{id}
 
-Requires `peripheral.forward`. Unregisters the device and releases its active claims.
+Requires `peripheral.forward`, `Idempotency-Key`, strong numeric `If-Match`, and body
+`{"schemaVersion":1}`. Unregisters the device and releases its active claims through an HTTP `202`
+durable operation.
 
 ### GET /eclipse/v1/peripherals/claims
 
@@ -200,13 +229,18 @@ Requires `peripheral.forward`. Returns visible claims with `since=<revision>` su
 Requires `peripheral.forward`. Creates a claim from `deviceId`, `target` (`session`, `workspace`,
 or `sandbox`), `requestedCapabilities`, `exclusive`, and `disconnectPolicy`. Targets must be
 visible to the caller. Unsupported capabilities return `unsupported_configuration`; conflicting
-exclusive claims return `resource_busy`. Returns HTTP 201 with `claim`.
+exclusive claims return `resource_busy`. Claim class must also be enabled in certificate-bound input
+permissions. Requires `Idempotency-Key` and returns an HTTP `202` durable operation. Successful
+operation result includes `claim.channel` with relative `endpoint`, protocol name/version, opaque
+`credential`, and millisecond `expiresAt`. Later claim reads redact channel credentials.
 
 Claims start `pending` and become `active` when the forwarding channel opens. The channel is a
 WebSocket at `wss://host:port/eclipse/v1/peripherals/claims/{claimId}/channel` over the paired
 client TLS connection, authenticated with the `X-Eclipse-Claim-Token` header carrying the claim
-credential. Failed authentication returns a standard HTTP 401 error without establishing a
-WebSocket. Messages follow the `eclipse-peripheral-json` version 1 protocol with `schemaVersion`,
+credential and the certificate belonging to the claim owner. The credential remains valid for five
+minutes after claim creation. Failed authentication returns a standard HTTP 401 error without
+establishing a WebSocket. Clients must request the `eclipse-peripheral-json` subprotocol. Messages
+follow its version 1 protocol with `schemaVersion`,
 monotonic `sequence`, `type`, `deviceId`, and `payload`: the first client message is `claim.open`,
 the host replies `claim.ready` then `device.attached`, client `hid.input` reports carry base64 HID
 boot reports injected for keyboard and mouse classes, and `claim.closed` ends the channel. Malformed
@@ -219,12 +253,14 @@ Requires `peripheral.forward`. Returns one visible claim or `claim_not_found`.
 
 ### DELETE /eclipse/v1/peripherals/claims/{id}
 
-Requires `peripheral.forward`. Releases one claim idempotently and returns
-`{"released": true, "id"}`.
+Requires `peripheral.forward`, `Idempotency-Key`, strong numeric `If-Match`, and body
+`{"schemaVersion":1}`. Releases one claim idempotently through an HTTP `202` durable operation whose
+successful result contains `{"released": true, "id"}`.
 
 Claim lifetime follows its target: session stop, workspace stop, or sandbox deletion release or
 suspend matching claims according to policy, and client revocation releases owned claims. Live
-channels close immediately in every case.
+channels close immediately in every case. Device revisions advance with associated claim lifecycle
+changes so `activeClaimId`, `updatedAt`, events, and deletion preconditions remain consistent.
 
 ### GET /eclipse/v1/sandboxes
 

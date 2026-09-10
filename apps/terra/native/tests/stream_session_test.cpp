@@ -31,8 +31,11 @@ unsigned int connectivityResult = 0;
 int connectivityTests = 0;
 int motionStateCallbacks = 0;
 int ledCallbacks = 0;
-int overlayResumes = 0;
+int overlayCloses = 0;
+int overlayHiddenAcknowledgements = 0;
 terra::VideoRenderer::OverlayListener savedOverlayListener;
+terra::VideoRenderer::OverlayCaptureListener savedOverlayCaptureListener;
+terra::StreamOverlayState lastInitialOverlayState;
 terra::StreamSession* cancelBeforeFirstStage = nullptr;
 
 void expect(bool condition, const char* message) {
@@ -127,16 +130,24 @@ namespace terra {
 
 struct VideoRenderer::Impl {};
 VideoRenderer::VideoRenderer(StreamSettings settings, StatusListener, CloseListener,
-                               std::shared_ptr<StreamStatistics>, OverlayListener overlayListener)
+                               std::shared_ptr<StreamStatistics>, OverlayListener overlayListener,
+                               OverlayCaptureListener overlayCaptureListener,
+                               StreamOverlayState overlayState)
     : impl_(std::make_unique<Impl>()) {
     lastRendererDisplay = settings.displayIndex;
     savedOverlayListener = std::move(overlayListener);
+    savedOverlayCaptureListener = std::move(overlayCaptureListener);
+    lastInitialOverlayState = overlayState;
 }
 VideoRenderer::~VideoRenderer() = default;
 void VideoRenderer::initialize(int, int, int, int) {}
 void VideoRenderer::setInputEnabled(bool) {}
 void VideoRenderer::setHdrMode(bool) {}
-void VideoRenderer::resumeOverlay() { ++overlayResumes; }
+void VideoRenderer::closeOverlay(std::uint64_t) { ++overlayCloses; }
+void VideoRenderer::acknowledgeOverlayHidden(std::uint64_t revision) {
+    ++overlayHiddenAcknowledgements;
+    if (savedOverlayCaptureListener) savedOverlayCaptureListener(revision, false);
+}
 void VideoRenderer::setGamepadRumble(std::uint16_t, std::uint16_t, std::uint16_t) {}
 void VideoRenderer::setGamepadTriggerRumble(std::uint16_t, std::uint16_t, std::uint16_t) {}
 void VideoRenderer::setGamepadMotionEventState(std::uint16_t, std::uint8_t, std::uint16_t) {
@@ -279,14 +290,20 @@ int main() {
                 "Video renderer callback setup failed.");
         expect(static_cast<bool>(savedOverlayListener),
                "Stream overlay callback was not installed on video renderer.");
-        savedOverlayListener({.x = -100, .y = 40, .width = 1280, .height = 720,
+        savedOverlayListener({.revision = 3, .visible = true,
+                              .x = -100, .y = 40, .width = 1280, .height = 720,
                               .scaleFactor = 1.25, .wayland = true, .fullscreen = true});
-        expect(overlayBounds && overlayBounds->x == -100 && overlayBounds->width == 1280 &&
+        expect(overlayBounds && overlayBounds->revision == 3 && overlayBounds->visible &&
+                   overlayBounds->x == -100 && overlayBounds->width == 1280 &&
                    overlayBounds->scaleFactor == 1.25 && overlayBounds->wayland &&
                    overlayBounds->fullscreen,
-               "Stream overlay bounds did not reach session listener.");
-        session.resumeOverlay();
-        expect(overlayResumes == 1, "Stream overlay resume did not reach video renderer.");
+               "Stream overlay state did not reach session listener.");
+        session.closeOverlay(3);
+        expect(overlayBounds && overlayBounds->revision == 4 && !overlayBounds->visible,
+               "Session did not publish hidden state before queueing renderer close.");
+        session.acknowledgeOverlayHidden(4);
+        expect(overlayCloses == 1 && overlayHiddenAcknowledgements == 1,
+               "Stream overlay commands did not reach video renderer.");
         expect(savedCallbacks.setMotionEventState != nullptr &&
                    savedCallbacks.setControllerLED != nullptr,
                "Advanced controller feedback callbacks were not registered.");
@@ -355,11 +372,22 @@ int main() {
         expect(savedVideoCallbacks.setup(VIDEO_FORMAT_H264, 1280, 720, 60, nullptr, 0) == DR_OK,
                "Display recovery renderer setup failed.");
         nextRecoveryDisplay = 1;
+        savedOverlayListener({.revision = 7, .visible = true});
         forceVideoRecovery.store(true);
         DECODE_UNIT unit{};
         static_cast<void>(savedVideoCallbacks.submitDecodeUnit(&unit));
         expect(lastRendererDisplay == 1,
                "Renderer recovery did not preserve runtime display migration.");
+        expect(lastInitialOverlayState.revision == 7 && lastInitialOverlayState.visible &&
+                   lastInitialOverlayState.captureSuspended,
+               "Renderer recovery did not preserve active overlay capture suspension.");
+        savedOverlayListener({.revision = 8, .visible = false});
+        session.acknowledgeOverlayHidden(8);
+        forceVideoRecovery.store(true);
+        static_cast<void>(savedVideoCallbacks.submitDecodeUnit(&unit));
+        expect(lastInitialOverlayState.revision == 8 && !lastInitialOverlayState.visible &&
+                   !lastInitialOverlayState.captureSuspended,
+               "Renderer recovery retained capture suspension after matching hidden acknowledgement.");
         session.stop();
     }
 

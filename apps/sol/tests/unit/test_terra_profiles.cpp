@@ -3,6 +3,9 @@
  * @brief Tests for standalone Terra profile storage and validation.
  */
 
+// standard includes
+#include <memory>
+
 // lib includes
 #include <gtest/gtest.h>
 
@@ -10,11 +13,11 @@
 #include <src/terra_profiles.h>
 
 namespace {
+  using nlohmann::json;
   using terra::profiles::actor_t;
   using terra::profiles::callbacks_t;
   using terra::profiles::manager_t;
   using terra::profiles::status_t;
-  using nlohmann::json;
 
   constexpr auto CLIENT = "10000000-0000-4000-8000-000000000001";
   constexpr auto PROFILE = "20000000-0000-4000-8000-000000000002";
@@ -78,6 +81,20 @@ namespace {
     EXPECT_FALSE(saved.empty());
   }
 
+  TEST(TerraProfiles, RestartDoesNotReuseCollectionRevision) {
+    std::string saved;
+    manager_t manager(callbacks(&saved));
+    const auto before = manager.list(admin()).collection_revision;
+    ASSERT_EQ(manager.create(admin(), {{"type", "stream"}, {"name", "Desk"}, {"shared", true}, {"configuration", stream()}}).status, status_t::success);
+
+    auto cb = callbacks();
+    cb.load = [&saved] {
+      return std::optional {saved};
+    };
+    manager_t restarted(std::move(cb));
+    EXPECT_GT(restarted.list(admin()).collection_revision, before);
+  }
+
   TEST(TerraProfiles, RejectsUnknownInvalidAndUnsupportedConfiguration) {
     auto cb = callbacks();
     cb.provider_supports = [](const auto &, const auto &) {
@@ -125,26 +142,43 @@ namespace {
 
   TEST(TerraProfiles, FailedWriteRollsBackAndBusyBlocksDelete) {
     auto cb = callbacks();
+    cb.load = [] {
+      return std::optional<std::string> {};
+    };
+    auto saves = std::make_shared<unsigned>(0);
+    cb.save = [saves](const auto &) {
+      return (*saves)++ == 0;
+    };
+    manager_t manager(std::move(cb));
+    EXPECT_EQ(manager.create(admin(), {{"type", "stream"}, {"name", "x"}, {"shared", true}, {"configuration", stream()}}).status, status_t::persistence);
+    EXPECT_EQ(manager.availability(), status_t::success);
+    EXPECT_EQ(manager.get(admin(), PROFILE).status, status_t::not_found);
+  }
+
+  TEST(TerraProfiles, InitialSaveFailureIsUnavailable) {
+    auto cb = callbacks();
+    cb.load = [] {
+      return std::optional<std::string> {};
+    };
     cb.save = [](const auto &) {
       return false;
     };
     manager_t manager(std::move(cb));
-    EXPECT_EQ(manager.create(admin(), {{"type", "stream"}, {"name", "x"}, {"shared", true}, {"configuration", stream()}}).status, status_t::persistence);
-    EXPECT_EQ(manager.get(admin(), PROFILE).status, status_t::not_found);
+    EXPECT_EQ(manager.availability(), status_t::unavailable);
   }
 
-  TEST(TerraProfiles, RecoversValidRecordsAndIsolatesMalformedOptionalRecord) {
+  TEST(TerraProfiles, MalformedRecordFailsWholeDocumentClosed) {
     auto cb = callbacks();
     cb.load = [] {
       return std::optional<std::string>(json({{"version", 1}, {"revision", 7}, {"profiles", {json({{"bad", true}}), json({{"id", PROFILE}, {"type", "stream"}, {"name", "ok"}, {"ownerClientUuid", CLIENT}, {"shared", true}, {"revision", 3}, {"configuration", stream()}})}}}).dump());
     };
     manager_t manager(std::move(cb));
-    EXPECT_EQ(manager.availability(), status_t::success);
-    EXPECT_EQ(manager.list(admin()).profiles.size(), 1);
-    EXPECT_EQ(manager.list(admin()).collection_revision, 7);
+    EXPECT_EQ(manager.availability(), status_t::unavailable);
+    EXPECT_TRUE(manager.list(admin()).profiles.empty());
+    EXPECT_EQ(manager.list(admin()).collection_revision, 1);
   }
 
-  TEST(TerraProfiles, PersistedRecordsRequireExactTypedFieldsAndFirstDuplicateWins) {
+  TEST(TerraProfiles, PersistedRecordsRequireExactTypedFieldsAndUniqueIds) {
     auto valid = json({{"id", PROFILE}, {"type", "stream"}, {"name", "first"}, {"ownerClientUuid", CLIENT}, {"shared", true}, {"revision", 3}, {"configuration", stream()}});
     auto duplicate = valid;
     duplicate["name"] = "second";
@@ -165,9 +199,8 @@ namespace {
       return std::optional<std::string>(json({{"version", 1}, {"revision", 9}, {"profiles", records}}).dump());
     };
     manager_t manager(std::move(cb));
-    const auto listed = manager.list(admin());
-    ASSERT_EQ(listed.profiles.size(), 1);
-    EXPECT_EQ(listed.profiles.front().name, "first");
+    EXPECT_EQ(manager.availability(), status_t::unavailable);
+    EXPECT_TRUE(manager.list(admin()).profiles.empty());
   }
 
   TEST(TerraProfiles, CanonicalSandboxNormalizerRejectsUnlistedEnvironmentValue) {
@@ -225,6 +258,19 @@ namespace {
     EXPECT_EQ(manager.adopt(admin(), PROFILE, 1).status, status_t::success);
     EXPECT_EQ(manager.get(admin(), PROFILE).status, status_t::success);
     EXPECT_EQ(manager.adopt(admin(), PROFILE, 2).status, status_t::resource_busy);
+  }
+
+  TEST(TerraProfiles, AdoptionRevalidatesCurrentProviderSupport) {
+    auto cb = callbacks();
+    bool supported = true;
+    cb.provider_supports = [&](const auto &, const auto &) {
+      return supported;
+    };
+    manager_t manager(std::move(cb));
+    ASSERT_EQ(manager.create(admin(), {{"type", "stream"}, {"name", "shared"}, {"shared", true}, {"configuration", stream()}}).status, status_t::success);
+    ASSERT_EQ(manager.revoke_owner(CLIENT).status, status_t::success);
+    supported = false;
+    EXPECT_EQ(manager.adopt(admin(), PROFILE, 2).status, status_t::unsupported);
   }
 
   TEST(TerraProfiles, MutationsMaskProfilesOwnedByAnotherClient) {

@@ -67,6 +67,19 @@ namespace terra_operations {
   };
 
   /**
+   * @brief Bind an item mutation fingerprint to its resource and expected revision.
+   *
+   * Internal fields prevent one idempotency key from replaying a response across
+   * distinct route targets without changing the request passed to its manager.
+   *
+   * @param body Validated request body.
+   * @param target_id Canonical route resource UUID.
+   * @param revision Expected resource revision.
+   * @return Canonical operation-store request fingerprint.
+   */
+  nlohmann::json item_request_body(nlohmann::json body, std::string_view target_id, std::uint64_t revision);
+
+  /**
    * @brief Caller-provided storage, time, and identity services.
    */
   struct callbacks_t {
@@ -100,6 +113,12 @@ namespace terra_operations {
     store_t(store_t &&) = delete;  ///< Moving a synchronized store is unsupported.
     store_t &operator=(store_t &&) = delete;  ///< Move assignment is unsupported.
 
+    /** @brief Return whether durable operation state is trustworthy and writable. @return True while operations may execute. */
+    [[nodiscard]] bool available() const;
+
+    /** @brief Retry persistence after a write failure. Structural load failures remain unavailable. @return True when store is available after the probe. */
+    bool reprobe();
+
     /**
      * @brief Submit an operation under an idempotency scope.
      *
@@ -111,6 +130,21 @@ namespace terra_operations {
      * @return Submission outcome and stored values.
      */
     submission_t submit(const std::string &client_uuid, const std::string &action, const std::string &idempotency_key, const nlohmann::json &body, const std::function<nlohmann::json(const operation_t &)> &response_builder);
+
+    /**
+     * @brief Replay an existing operation before mutable resource lookup.
+     *
+     * @param client_uuid Canonical client UUID.
+     * @param action_prefix Required action prefix.
+     * @param action_suffix Required action suffix.
+     * @param idempotency_key Client-provided idempotency key.
+     * @param body Canonical request body.
+     * @return Equivalent replay when a key and body match; otherwise no value so exact action handling can decide conflicts.
+     */
+    std::optional<submission_t> replay(const std::string &client_uuid, std::string_view action_prefix, std::string_view action_suffix, const std::string &idempotency_key, const nlohmann::json &body) const;
+
+    /** @brief Replay one exact action before mutable resource lookup. @param client_uuid Canonical client UUID. @param action Exact action. @param idempotency_key Client-provided key. @param body Canonical request body. @return Replay or conflict, otherwise no value. */
+    std::optional<submission_t> replay_exact(const std::string &client_uuid, std::string_view action, const std::string &idempotency_key, const nlohmann::json &body) const;
 
     /**
      * @brief Transition an operation to a valid next state.

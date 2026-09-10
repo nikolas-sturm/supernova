@@ -38,7 +38,7 @@ describe('Terra rename contracts', () => {
       expect(command?.replaceAll('\\', '/')).toContain('/extensions/terra-core/bin/terra-core')
     }
     const events = [...bridge.matchAll(/const \w+Event = '(terra\.[^']+)'/g)]
-    expect(events).toHaveLength(9)
+    expect(events).toHaveLength(10)
     for (const [, event] of events) expect(core).toContain(`"${event}"`)
   })
 

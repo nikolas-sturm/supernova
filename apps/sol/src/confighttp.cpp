@@ -1783,6 +1783,7 @@ namespace confighttp {
         {"name", pairing.name},
         {"address", pairing.address},
         {"platform", pairing.platform},
+        {"explicit_policy", pairing.explicit_policy},
         {"requested_scopes", pairing.requested_scopes},
         {"requested_inputs", pairing.requested_inputs},
       });

@@ -84,7 +84,7 @@ namespace {
           reason = capable ? "" : "unenforceable";
           return capable;
         },
-        [&](const launch_request_t &request, error_t &error) -> std::optional<launch_result_t> {
+        [&](const launch_request_t &request, terra_sandboxes::error_t &error) -> std::optional<launch_result_t> {
           ++launch_calls;
           order.push_back("launch");
           launched_request = request;
@@ -97,7 +97,7 @@ namespace {
         [&](const std::string &, const bool) {
           ++terminate_calls;
           const bool succeeds = terminate_succeeds && terminate_calls != terminate_fail_on_call;
-          return termination_t {succeeds, succeeds ? std::optional<int> {0} : std::nullopt, succeeds ? std::nullopt : std::optional<error_t> {{"terminate_failed", "failed"}}};
+          return termination_t {succeeds, succeeds ? std::optional<int> {0} : std::nullopt, succeeds ? std::nullopt : std::optional<terra_sandboxes::error_t> {{"terminate_failed", "failed"}}};
         },
         [&](const std::string &) {
           return reconciliation;
@@ -410,7 +410,7 @@ TEST(TerraSandboxesTest, DeleteSaveFailureRetainsDeletingIntentAndDisablesManage
   EXPECT_EQ(nlohmann::json::parse(*fake.document)["resources"][0]["state"], "deleting");
 }
 
-TEST(TerraSandboxesTest, PartialTwoResourceRevocationPersistsProgressAndFailsClosed) {
+TEST(TerraSandboxesTest, PartialTwoResourceRevocationPersistsProgressForRetry) {
   fake_t fake;
   manager_t manager {fake.callbacks()};
   ASSERT_EQ(manager.create(OWNER, creation(true)).status, status_t::success);
@@ -419,7 +419,7 @@ TEST(TerraSandboxesTest, PartialTwoResourceRevocationPersistsProgressAndFailsClo
   ASSERT_EQ(manager.start(SANDBOX_2, 1).status, status_t::success);
   fake.terminate_fail_on_call = 2;
   EXPECT_EQ(manager.revoke_owner(OWNER), status_t::provider_error);
-  EXPECT_FALSE(manager.available());
+  EXPECT_TRUE(manager.available());
   const auto first = manager.get(SANDBOX);
   const auto second = manager.get(SANDBOX_2);
   ASSERT_TRUE(first);
@@ -431,6 +431,19 @@ TEST(TerraSandboxesTest, PartialTwoResourceRevocationPersistsProgressAndFailsClo
   const auto persisted = nlohmann::json::parse(*fake.document);
   EXPECT_EQ(persisted["resources"][0]["state"], "stopped");
   EXPECT_EQ(persisted["resources"][1]["state"], "failed");
+}
+
+TEST(TerraSandboxesTest, SelectiveRevocationRetainsAuthorizedResources) {
+  fake_t fake;
+  manager_t manager {fake.callbacks()};
+  ASSERT_EQ(manager.create(OWNER, creation(true)).status, status_t::success);
+  const auto stale_revision = manager.list().revision;
+  ASSERT_EQ(manager.create(OWNER, creation(true)).status, status_t::success);
+  EXPECT_EQ(manager.revoke_unauthorized(OWNER, {SANDBOX_2}, stale_revision), status_t::conflict);
+  EXPECT_EQ(manager.get(SANDBOX)->owner_client_uuid, OWNER);
+  ASSERT_EQ(manager.revoke_unauthorized(OWNER, {SANDBOX_2}, manager.list().revision), status_t::success);
+  EXPECT_FALSE(manager.get(SANDBOX)->owner_client_uuid);
+  EXPECT_EQ(manager.get(SANDBOX_2)->owner_client_uuid, OWNER);
 }
 
 TEST(TerraSandboxesTest, ReconcilesPersistentAndCleansEphemeralOnRestart) {

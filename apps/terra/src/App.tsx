@@ -34,8 +34,10 @@ import {
   applyUiDisplayMode,
   cancelCoreSession,
   configureCoreDiscovery,
+  controlCoreLogicalSession,
   launchCoreApp,
   loadCoreApps,
+  loadCoreResource,
   pairCoreHost,
   refreshCoreHost,
   removeCoreHost,
@@ -145,6 +147,8 @@ export function App() {
   const pairing = useClientStore((state) => state.pairing)
   const library = useClientStore((state) => state.library)
   const session = useClientStore((state) => state.session)
+  const logicalSessionsByHost = useClientStore((state) => state.logicalSessionsByHost)
+  const telemetryByHost = useClientStore((state) => state.telemetryByHost)
   const appMode = useClientStore((state) => state.appMode)
   const settings = useClientStore((state) => state.settingsByMode[state.appMode])
   const setAppMode = useClientStore((state) => state.setAppMode)
@@ -158,6 +162,7 @@ export function App() {
   const setLibrary = useClientStore((state) => state.setLibrary)
   const setArtwork = useClientStore((state) => state.setArtwork)
   const setSession = useClientStore((state) => state.setSession)
+  const setSolResource = useClientStore((state) => state.setSolResource)
   const [showAddHost, setShowAddHost] = useState(false)
   const [selectedHostId, setSelectedHostId] = useState<string>()
   const [libraryQuery, setLibraryQuery] = useState('')
@@ -184,8 +189,18 @@ export function App() {
         onApps: setLibrary,
         onArtwork: setArtwork,
         onSession: setSession,
+        onSolResource: setSolResource,
       }),
-    [setArtwork, setBridge, setHostError, setHosts, setLibrary, setSession, updatePairing],
+    [
+      setArtwork,
+      setBridge,
+      setHostError,
+      setHosts,
+      setLibrary,
+      setSession,
+      setSolResource,
+      updatePairing,
+    ],
   )
 
   useEffect(() => {
@@ -215,6 +230,21 @@ export function App() {
       })
     }
   }, [hosts, library.hostId, selectedHostId, setHostError])
+
+  useEffect(() => {
+    const host = hosts.find((candidate) => candidate.id === selectedHostId)
+    if (bridge.state !== 'ready' || host?.status !== 'online' || host.apiVersion !== 1) return
+    if (host.apiScopes?.includes('session.control')) {
+      void loadCoreResource(host.id, 'sessions').catch(() => {
+        setHostError('Terra could not load Sol logical sessions.')
+      })
+    }
+    if (host.apiScopes?.includes('telemetry.read')) {
+      void loadCoreResource(host.id, 'telemetry').catch(() => {
+        setHostError('Terra could not load Sol telemetry.')
+      })
+    }
+  }, [bridge.state, hosts, selectedHostId, setHostError])
 
   async function handleAddHost(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -246,7 +276,7 @@ export function App() {
     const pin = (randomValue % 10000).toString().padStart(4, '0')
     startPairing(hostId, pin)
     try {
-      await pairCoreHost(hostId, pin)
+      await pairCoreHost(hostId, pin, appMode)
     } catch (error) {
       updatePairing({
         hostId,
@@ -298,10 +328,31 @@ export function App() {
     }
   }
 
+  async function handleLogicalSession(
+    hostId: string,
+    sessionId: string,
+    action: 'disconnect' | 'stop',
+  ) {
+    setHostError(undefined)
+    try {
+      await controlCoreLogicalSession(hostId, sessionId, action)
+    } catch (error) {
+      setHostError(
+        error instanceof Error ? error.message : `Native core could not ${action} session.`,
+      )
+    }
+  }
+
   const onlineCount = hosts.filter((host) => host.status === 'online').length
   const pairingHost = pairing ? hosts.find((host) => host.id === pairing.hostId) : undefined
   const selectedHost = hosts.find((host) => host.id === selectedHostId)
   const selectedApps = library.hostId === selectedHostId ? library.apps : []
+  const logicalSessions = Object.entries(logicalSessionsByHost).flatMap(([hostId, sessions]) =>
+    sessions
+      .filter((logicalSession) => !['stopped', 'failed'].includes(logicalSession.state))
+      .map((logicalSession) => ({ hostId, session: logicalSession })),
+  )
+  const selectedTelemetry = selectedHostId ? telemetryByHost[selectedHostId] : undefined
   const activeSession = session?.hostId === selectedHostId ? session : undefined
   const sessionHost = session ? hosts.find((host) => host.id === session.hostId) : undefined
   const settingsView = activeView === 'stream-settings' || activeView === 'workstation-settings'
@@ -498,11 +549,88 @@ export function App() {
             <div className={styles.sectionHeading}>
               <div>
                 <p className={styles.eyebrow}>NATIVE STREAM CORE</p>
-                <h2>Current session</h2>
+                <h2>Logical sessions</h2>
               </div>
-              <span>{session && session.state !== 'stopped' ? '01 ACTIVE' : '00 ACTIVE'}</span>
+              <span>{logicalSessions.length.toString().padStart(2, '0')} ACTIVE</span>
             </div>
-            {session && session.state !== 'stopped' ? (
+            {hostError && <p className={styles.hostError}>{hostError}</p>}
+            {logicalSessions.length > 0 ? (
+              <div className={styles.logicalSessionGrid}>
+                {logicalSessions.map(({ hostId, session: logicalSession }) => {
+                  const host = hosts.find((candidate) => candidate.id === hostId)
+                  const app =
+                    library.hostId === hostId
+                      ? library.apps.find(
+                          (candidate) =>
+                            candidate.uuid === logicalSession.appUuid ||
+                            candidate.id === logicalSession.legacyAppId,
+                        )
+                      : undefined
+                  const telemetry = telemetryByHost[hostId]?.sessions.find(
+                    (sample) => sample.sessionId === logicalSession.id,
+                  )
+                  return (
+                    <article className={styles.logicalSessionCard} key={logicalSession.id}>
+                      <header>
+                        <span className={styles.hostState}>{logicalSession.state}</span>
+                        <code>REV {logicalSession.revision}</code>
+                      </header>
+                      <h3>{app?.name || `Application ${logicalSession.legacyAppId}`}</h3>
+                      <p>{host?.serverName || host?.name || 'Sol host'}</p>
+                      <dl>
+                        <div>
+                          <dt>Output</dt>
+                          <dd>
+                            {logicalSession.width} × {logicalSession.height} /{' '}
+                            {logicalSession.refreshRate} Hz
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Encoder</dt>
+                          <dd>{telemetry?.codec ?? 'Awaiting sample'}</dd>
+                        </div>
+                        <div>
+                          <dt>Bitrate</dt>
+                          <dd>
+                            {telemetry?.bitrateKbps == null
+                              ? '—'
+                              : `${(telemetry.bitrateKbps / 1000).toFixed(1)} Mbps`}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Encode</dt>
+                          <dd>
+                            {telemetry?.encodeLatencyMs == null
+                              ? '—'
+                              : `${telemetry.encodeLatencyMs.toFixed(1)} ms`}
+                          </dd>
+                        </div>
+                      </dl>
+                      <footer>
+                        {logicalSession.state !== 'disconnected' && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void handleLogicalSession(hostId, logicalSession.id, 'disconnect')
+                            }
+                          >
+                            Disconnect
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void handleLogicalSession(hostId, logicalSession.id, 'stop')
+                          }
+                        >
+                          <Square size={13} /> Stop app
+                        </button>
+                      </footer>
+                    </article>
+                  )
+                })}
+              </div>
+            ) : session && session.state !== 'stopped' ? (
               <div className={`${styles.sessionBanner} ${styles[session.state]}`}>
                 <div>
                   <span>{session.state}</span>
@@ -532,6 +660,28 @@ export function App() {
                   <p>Launch or resume an application from Game Library.</p>
                 </div>
               </div>
+            )}
+            {selectedTelemetry && (
+              <section className={styles.telemetryPanel} aria-label="Selected host telemetry">
+                <span>{selectedTelemetry.host.healthy ? 'HOST HEALTHY' : 'HOST DEGRADED'}</span>
+                <strong>{selectedTelemetry.host.encoderCodec ?? 'Encoder idle'}</strong>
+                <code>
+                  {selectedTelemetry.host.captureFps == null
+                    ? 'No active capture'
+                    : `${selectedTelemetry.host.captureFps.toFixed(1)} FPS capture`}
+                  {selectedTelemetry.host.encoderLatencyMs == null
+                    ? ''
+                    : ` / ${selectedTelemetry.host.encoderLatencyMs.toFixed(1)} ms encode`}
+                </code>
+                <button
+                  type="button"
+                  onClick={() =>
+                    selectedHostId && void loadCoreResource(selectedHostId, 'telemetry')
+                  }
+                >
+                  <RefreshCw size={13} /> Refresh sample
+                </button>
+              </section>
             )}
           </section>
         ) : activeView === 'game-library' ? (
@@ -720,7 +870,14 @@ export function App() {
                                 <div className={styles.gameMeta}>
                                   <div>
                                     <h3>{app.name || `Application ${app.id}`}</h3>
-                                    <p>{app.appCollectorGame ? 'GAME' : 'DESKTOP APP'}</p>
+                                    <p>
+                                      {app.kind && app.kind !== 'unknown'
+                                        ? app.kind.toUpperCase()
+                                        : app.appCollectorGame
+                                          ? 'GAME'
+                                          : 'DESKTOP APP'}
+                                      {app.updateAvailable ? ' · UPDATE' : ''}
+                                    </p>
                                   </div>
                                   <button
                                     type="button"
@@ -948,6 +1105,12 @@ export function App() {
                         <small>
                           {host.serverName}
                           {host.appVersion ? ` / ${host.appVersion}` : ''}
+                        </small>
+                      )}
+                      {host.apiVersion === 1 && (
+                        <small>
+                          SOL API V1 / {host.apiScopes?.length ?? 0} SCOPE
+                          {host.apiScopes?.length === 1 ? '' : 'S'}
                         </small>
                       )}
                       {host.error && <p className={styles.probeError}>{host.error}</p>}

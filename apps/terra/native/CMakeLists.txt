@@ -7,7 +7,7 @@ include(CTest)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -412,6 +412,16 @@ if(BUILD_TESTING)
     target_compile_options(terra-stream-statistics-test PRIVATE -Wall -Wextra -Wpedantic)
   endif()
   add_test(NAME stream-statistics COMMAND terra-stream-statistics-test)
+
+  add_executable(terra-sse-decoder-test tests/sse_decoder_test.cpp)
+  target_include_directories(terra-sse-decoder-test PRIVATE src)
+  target_link_libraries(terra-sse-decoder-test PRIVATE nlohmann_json::nlohmann_json)
+  if(MSVC)
+    target_compile_options(terra-sse-decoder-test PRIVATE /W4 /permissive- /EHsc)
+  else()
+    target_compile_options(terra-sse-decoder-test PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+  add_test(NAME sse-decoder COMMAND terra-sse-decoder-test)
 
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TERRA_ENABLE_LINUX_VIDEO)
     add_executable(

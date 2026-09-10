@@ -1,4 +1,4 @@
-import { app, events, init, storage } from '@neutralinojs/lib'
+import { app, events, init, window as neutralinoWindow, storage } from '@neutralinojs/lib'
 import {
   Gamepad2,
   Info,
@@ -23,6 +23,7 @@ import {
   isStreamOverlayShortcut,
   type OverlayCloseAction,
   overlayClosedStorageKey,
+  overlayHiddenStorageKey,
   overlayReadyStorageKey,
   overlayRequestStorageKey,
   overlayStatisticsStorageKey,
@@ -56,7 +57,7 @@ export function StreamOverlay() {
   const [closeError, setCloseError] = useState(false)
   const requestRef = useRef<StoredOverlayRequest | undefined>(undefined)
   const exitingRef = useRef(false)
-  const readyRef = useRef(false)
+  const readyRevisionRef = useRef<string | undefined>(undefined)
   const route = /^\/stream-overlay\/([^/]+)$/.exec(window.location.pathname)
   const expectedRequestId = route?.[1] ? decodeURIComponent(route[1]) : undefined
   const nativeBridge = window.TERRA_OVERLAY_NATIVE
@@ -76,11 +77,25 @@ export function StreamOverlay() {
             overlayClosedStorageKey,
             JSON.stringify({ schemaVersion: 1, requestId: current.requestId, action }),
           )
+          exitingRef.current = false
+          setCloseError(false)
+          return
         } catch {
           exitingRef.current = false
           setCloseError(true)
           return
         }
+      }
+      if (current) {
+        await neutralinoWindow.hide()
+        await storage.setData(
+          overlayHiddenStorageKey,
+          JSON.stringify({
+            schemaVersion: 1,
+            requestId: current.requestId,
+            revision: current.revision,
+          }),
+        )
       }
       await app.exit()
     },
@@ -136,7 +151,7 @@ export function StreamOverlay() {
       if (!isStreamOverlayShortcut(event)) return
       event.preventDefault()
       event.stopPropagation()
-      void exitOverlay(true)
+      if (!event.repeat) void exitOverlay(true)
     }
 
     if (nativeBridge) {
@@ -152,7 +167,7 @@ export function StreamOverlay() {
             setLastStatisticsAt(0)
           }
           requestRef.current = result.data
-          readyRef.current = true
+          readyRevisionRef.current = result.data.revision
           setRequest(result.data)
         }
         window.addEventListener('terra-overlay-request', handleRequest)
@@ -179,7 +194,7 @@ export function StreamOverlay() {
           setLastStatisticsAt(0)
         }
         requestRef.current = result.data
-        readyRef.current = true
+        readyRevisionRef.current = result.data.revision
         setRequest(result.data)
         window.addEventListener('keydown', handleKeyDown, true)
         return () => window.removeEventListener('keydown', handleKeyDown, true)
@@ -195,7 +210,10 @@ export function StreamOverlay() {
       neutralinoInitialized = true
     }
 
+    let refreshing = false
     const refresh = async () => {
+      if (refreshing) return
+      refreshing = true
       try {
         const result = storedOverlayRequestSchema.safeParse(
           JSON.parse(await storage.getData(overlayRequestStorageKey)),
@@ -205,16 +223,44 @@ export function StreamOverlay() {
           await exitOverlay(false)
           return
         }
+        if (
+          requestRef.current &&
+          BigInt(result.data.revision) <= BigInt(requestRef.current.revision)
+        ) {
+          return
+        }
         if (!result.data.visible) {
+          requestRef.current = result.data
           await exitOverlay(false)
           return
         }
-        if (!readyRef.current) {
+        const previousBounds = requestRef.current?.bounds
+        if (
+          previousBounds &&
+          (previousBounds.x !== result.data.bounds.x || previousBounds.y !== result.data.bounds.y)
+        ) {
+          await neutralinoWindow.move(result.data.bounds.x, result.data.bounds.y)
+        }
+        if (
+          previousBounds &&
+          (previousBounds.width !== result.data.bounds.width ||
+            previousBounds.height !== result.data.bounds.height)
+        ) {
+          await neutralinoWindow.setSize({
+            width: result.data.bounds.width,
+            height: result.data.bounds.height,
+          })
+        }
+        if (readyRevisionRef.current !== result.data.revision) {
           await storage.setData(
             overlayReadyStorageKey,
-            JSON.stringify({ schemaVersion: 1, requestId: result.data.requestId }),
+            JSON.stringify({
+              schemaVersion: 1,
+              requestId: result.data.requestId,
+              revision: result.data.revision,
+            }),
           )
-          readyRef.current = true
+          readyRevisionRef.current = result.data.revision
         }
         if (requestRef.current?.requestId !== result.data.requestId) {
           setStatistics([])
@@ -224,6 +270,8 @@ export function StreamOverlay() {
         setRequest(result.data)
       } catch {
         // Parent writes request before creating child; retry handles startup races.
+      } finally {
+        refreshing = false
       }
     }
 

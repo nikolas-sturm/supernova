@@ -290,17 +290,7 @@ namespace terra::windows::display {
   }
 
   std::string_view kind_name(const Kind kind) {
-    switch (kind) {
-      case Kind::Internal:
-        return "internal";
-      case Kind::External:
-        return "external";
-      case Kind::Virtual:
-        return "virtual";
-      case Kind::Unknown:
-        return "unknown";
-    }
-    return "unknown";
+    return kind == Kind::Virtual ? "virtual" : "physical";
   }
 
   nlohmann::json to_json(const Mode &mode) {

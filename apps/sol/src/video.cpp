@@ -33,6 +33,8 @@ extern "C" {
 #include "logging.h"
 #include "nvenc/nvenc_encoder.h"
 #include "platform/common.h"
+#include "rtsp.h"
+#include "stream.h"
 #include "sync.h"
 #include "video.h"
 
@@ -657,6 +659,7 @@ namespace video {
   struct capture_ctx_t {
     img_event_t images;  ///< Queue of captured images waiting for encode.
     config_t config;  ///< Stream or encoder configuration captured for the worker.
+    std::shared_ptr<stream::capture_telemetry_t> telemetry;  ///< Lifetime-safe capture counters.
   };
 
   /**
@@ -1445,6 +1448,13 @@ namespace video {
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
   std::array<bool, 3> last_encoder_probe_supported_yuv444_for_codec = {};  ///< YUV444 support discovered for each probed codec.
+  std::mutex capture_display_mutex;  ///< Protects selected capture display identity.
+  std::string selected_capture_display;  ///< Platform display selected by active capture pipeline.
+
+  std::string capture_display_name() {
+    std::lock_guard lock {capture_display_mutex};
+    return selected_capture_display;
+  }
 
   /**
    * @brief Recreate a display capture object after a capture failure.
@@ -1460,6 +1470,8 @@ namespace video {
       disp.reset();
       disp = platf::display(type, display_name, config);
       if (disp) {
+        std::lock_guard lock {capture_display_mutex};
+        selected_capture_display = display_name;
         break;
       }
 
@@ -1475,9 +1487,9 @@ namespace video {
    * @param display_names The list of display names to repopulate.
    * @param current_display_index The current display index or -1 if not yet known.
    */
-  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index) {
+  void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index, const std::string_view requested_output_name = {}) {
     // It is possible that the output name may be empty even if it wasn't before (device disconnected) or vice-versa
-    const auto output_name {display_device::map_output_name(config::video.output_name)};
+    const auto output_name {display_device::map_output_name(requested_output_name.empty() ? config::video.output_name : std::string {requested_output_name})};
     std::string current_display_name;
 
     // If we have a current display index, let's start with that
@@ -1493,6 +1505,7 @@ namespace video {
     if (display_names.empty() && !old_display_names.empty()) {
       BOOST_LOG(error) << "No displays were found after reenumeration!"sv;
       display_names = std::move(old_display_names);
+      current_display_index = -1;
       return;
     } else if (display_names.empty()) {
       display_names.emplace_back(output_name);
@@ -1500,6 +1513,12 @@ namespace video {
 
     // We now have a new display name list, so reset the index back to 0
     current_display_index = 0;
+
+    if (!requested_output_name.empty()) {
+      const auto requested_display = std::ranges::find(display_names, output_name);
+      current_display_index = requested_display == display_names.end() ? -1 : static_cast<int>(std::distance(display_names.begin(), requested_display));
+      return;
+    }
 
     // If we had a name previously, let's try to find it in the new list
     if (!current_display_name.empty()) {
@@ -1563,8 +1582,16 @@ namespace video {
     // get the most up-to-date list available monitors
     std::vector<std::string> display_names;
     int display_p = -1;
-    refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+    refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, capture_ctxs.front().config.output_name);
+    if (display_p < 0 || display_p >= static_cast<int>(display_names.size())) {
+      BOOST_LOG(error) << "Requested capture display is unavailable"sv;
+      return;
+    }
     auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+    if (disp) {
+      std::lock_guard lock {capture_display_mutex};
+      selected_capture_display = display_names[display_p];
+    }
     if (!disp) {
       return;
     }
@@ -1682,8 +1709,14 @@ namespace video {
             continue;
           }
 
+          capture_ctx->telemetry->events.fetch_add(1, std::memory_order_relaxed);
+
           if (frame_captured) {
-            capture_ctx->images->raise(img);
+            capture_ctx->telemetry->captured_frames.fetch_add(1, std::memory_order_relaxed);
+            const auto dropped = capture_ctx->images->raise(img);
+            capture_ctx->telemetry->queue_depth.store(capture_ctx->images->size(), std::memory_order_relaxed);
+            capture_ctx->telemetry->queue_drops.fetch_add(dropped, std::memory_order_relaxed);
+            capture_ctx->telemetry->dropped_frames.fetch_add(dropped, std::memory_order_relaxed);
           }
 
           ++capture_ctx;
@@ -1694,7 +1727,21 @@ namespace video {
         }
 
         while (capture_ctx_queue->peek()) {
-          capture_ctxs.emplace_back(std::move(*capture_ctx_queue->pop()));
+          auto capture_ctx = std::move(*capture_ctx_queue->pop());
+          if (capture_ctxs.empty()) {
+            capture_ctxs.emplace_back(std::move(capture_ctx));
+            artificial_reinit = true;
+            return false;
+          }
+          std::vector<std::string> requested_displays;
+          int requested_display = -1;
+          refresh_displays(encoder.platform_formats->dev_type, requested_displays, requested_display, capture_ctx.config.output_name);
+          if (requested_display < 0 || requested_display >= static_cast<int>(requested_displays.size()) || requested_displays[requested_display] != display_names[display_p]) {
+            BOOST_LOG(error) << "Concurrent streams requesting different displays are unsupported"sv;
+            capture_ctx.images->stop();
+          } else {
+            capture_ctxs.emplace_back(std::move(capture_ctx));
+          }
         }
 
         if (switch_display_event->peek()) {
@@ -1752,7 +1799,11 @@ namespace video {
               disp.reset();
 
               // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, capture_ctxs.front().config.output_name);
+              if (display_p < 0 || display_p >= static_cast<int>(display_names.size())) {
+                BOOST_LOG(error) << "Requested capture display is unavailable after reinitialization"sv;
+                return;
+              }
 
               // Process any pending display switch with the new list of displays
               if (switch_display_event->peek()) {
@@ -1864,6 +1915,7 @@ namespace video {
 
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
+      stream::session::record_encoded_frame(*static_cast<stream::session_t *>(channel_data));
       packets->raise(std::move(packet));
     }
 
@@ -1895,6 +1947,7 @@ namespace video {
     packet->channel_data = channel_data;
     packet->after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
     packet->frame_timestamp = frame_timestamp;
+    stream::session::record_encoded_frame(*static_cast<stream::session_t *>(channel_data));
     packets->raise(std::move(packet));
 
     return 0;
@@ -2443,12 +2496,16 @@ namespace video {
       }
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
+      bool captured_frame = false;
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
+          stream::session::record_capture_queue(*static_cast<stream::session_t *>(channel_data), images->size(), 0);
+          captured_frame = true;
           frame_timestamp = img->frame_timestamp;
           if (session->convert(*img)) {
+            stream::session::record_dropped_frame(*static_cast<stream::session_t *>(channel_data));
             BOOST_LOG(error) << "Could not convert image"sv;
             return;
           }
@@ -2471,11 +2528,16 @@ namespace video {
         break;
       }
 
+      const auto encode_started = std::chrono::steady_clock::now();
+      stream::session::record_capture_latency(*static_cast<stream::session_t *>(channel_data), frame_timestamp ? std::optional {encode_started - *frame_timestamp} : std::nullopt);
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
+        if (captured_frame) {
+          stream::session::record_dropped_frame(*static_cast<stream::session_t *>(channel_data));
+        }
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
       }
-
+      stream::session::record_encode_latency(*static_cast<stream::session_t *>(channel_data), std::chrono::steady_clock::now() - encode_started);
       session->request_normal_frame();
 
       // While streaming check to see if the mouse is present and enable Mouse Keys to force the cursor to appear
@@ -2676,7 +2738,11 @@ namespace video {
 
     while (encode_session_ctx_queue.running()) {
       // Refresh display names since a display removal might have caused the reinitialization
-      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, synced_session_ctxs.front()->config.output_name);
+      if (display_p < 0 || display_p >= static_cast<int>(display_names.size())) {
+        BOOST_LOG(error) << "Requested capture display is unavailable"sv;
+        return encode_e::error;
+      }
 
       // Process any pending display switch with the new list of displays
       if (switch_display_event->peek()) {
@@ -2718,6 +2784,16 @@ namespace video {
             return false;
           }
 
+          std::vector<std::string> requested_displays;
+          int requested_display = -1;
+          refresh_displays(encoder.platform_formats->dev_type, requested_displays, requested_display, encode_session_ctx->config.output_name);
+          if (requested_display < 0 || requested_display >= static_cast<int>(requested_displays.size()) || requested_displays[requested_display] != display_names[display_p]) {
+            BOOST_LOG(error) << "Concurrent streams requesting different displays are unsupported"sv;
+            encode_session_ctx->shutdown_event->raise(true);
+            encode_session_ctx->join_event->raise(true);
+            continue;
+          }
+
           synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*encode_session_ctx)));
 
           auto encode_session = make_synced_session(disp.get(), encoder, *img, *synced_session_ctxs.back());
@@ -2752,7 +2828,12 @@ namespace video {
             ctx->idr_events->pop();
           }
 
+          auto &stream_session = *static_cast<stream::session_t *>(ctx->channel_data);
+          if (frame_captured) {
+            stream::session::record_captured_frame(stream_session);
+          }
           if (frame_captured && pos->session->convert(*img)) {
+            stream::session::record_dropped_frame(stream_session);
             BOOST_LOG(error) << "Could not convert image"sv;
             ctx->shutdown_event->raise(true);
 
@@ -2764,12 +2845,18 @@ namespace video {
             frame_timestamp = img->frame_timestamp;
           }
 
+          const auto encode_started = std::chrono::steady_clock::now();
+          stream::session::record_capture_latency(stream_session, frame_timestamp ? std::optional {encode_started - *frame_timestamp} : std::nullopt);
           if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp)) {
+            if (frame_captured) {
+              stream::session::record_dropped_frame(stream_session);
+            }
             BOOST_LOG(error) << "Could not encode video packet"sv;
             ctx->shutdown_event->raise(true);
 
             continue;
           }
+          stream::session::record_encode_latency(stream_session, std::chrono::steady_clock::now() - encode_started);
 
           pos->session->request_normal_frame();
 
@@ -2861,7 +2948,7 @@ namespace video {
       return;
     }
 
-    ref->capture_ctx_queue->raise(capture_ctx_t {images, config});
+    ref->capture_ctx_queue->raise(capture_ctx_t {images, config, stream::session::capture_telemetry(*static_cast<stream::session_t *>(channel_data))});
 
     if (!ref->capture_ctx_queue->running()) {
       return;

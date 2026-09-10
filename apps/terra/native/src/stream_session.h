@@ -12,6 +12,7 @@
 
 #include "gamestream_client.h"
 #include "stream_settings.h"
+#include "video_renderer.h"
 
 extern "C" {
 #include <Limelight.h>
@@ -37,7 +38,6 @@ struct StreamSessionEvent {
     std::string message;
 };
 
-struct StreamWindowBounds;
 struct StreamStatisticsSample;
 
 class StreamSession {
@@ -60,10 +60,17 @@ public:
     void start();
     void requestStop();
     void stop();
-    void resumeOverlay();
+    void closeOverlay(std::uint64_t revision);
+    void acknowledgeOverlayHidden(std::uint64_t revision);
     [[nodiscard]] bool stopRequested() const noexcept;
 
 private:
+    struct OverlayState {
+        std::uint64_t revision = 0;
+        bool visible = false;
+        bool captureSuspended = false;
+    };
+
     class ActiveLease {
     public:
         ActiveLease() = default;
@@ -135,6 +142,7 @@ private:
     std::atomic_bool terminated_{false};
     std::atomic_bool hdrMode_{false};
     std::mutex videoMutex_;
+    std::mutex overlayStateMutex_;
     std::mutex audioMutex_;
     std::mutex startupFailureMutex_;
     std::mutex statusMutex_;
@@ -148,6 +156,8 @@ private:
     std::optional<int> videoDisplayOverride_;
     std::chrono::steady_clock::time_point videoRecoveryWindow_{};
     bool inputEnabled_ = false;
+    OverlayState overlayState_;
+    StreamWindowBounds overlayBounds_;
     std::unique_ptr<class VideoRenderer> video_;
     std::unique_ptr<class AudioRenderer> audio_;
     OPUS_MULTISTREAM_CONFIGURATION audioConfig_{};

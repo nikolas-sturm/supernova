@@ -561,8 +561,35 @@ namespace stream {
     int fps;  ///< Negotiated refresh rate.
     bool hdr;  ///< Whether HDR was requested.
     terra_api::input_permissions_t input_permissions;  ///< Input classes permitted for this stream.
+    input::mouse_mode_e profile_mouse_mode {input::mouse_mode_e::any};  ///< Stream-profile mouse-coordinate mode.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
+    std::uint64_t telemetry_generation {1};  ///< Counter generation retained in snapshots.
+    std::shared_ptr<capture_telemetry_t> capture_telemetry {std::make_shared<capture_telemetry_t>()};  ///< Lifetime-safe counters shared with capture provider.
+    std::atomic_uint64_t encoded_frames {};  ///< Frames successfully produced by encoder.
+    std::atomic_uint64_t transmitted_frames {};  ///< Frames sent to client.
+    std::atomic_uint64_t video_bytes {};  ///< Video payload bytes sent to client.
+    std::atomic_uint64_t audio_bytes {};  ///< Audio payload bytes sent to client.
+    std::atomic_uint64_t control_bytes {};  ///< Control transport bytes received from client.
+    std::atomic_uint64_t input_bytes {};  ///< Authenticated input plaintext bytes received from client.
+    std::atomic_uint16_t capture_latency_tenths_ms {};  ///< Latest capture frame age plus one, or zero when unsampled.
+    std::atomic_uint16_t encode_latency_tenths_ms {};  ///< Latest encoder duration plus one, or zero when unsampled.
+    std::mutex telemetry_mutex;  ///< Protects interval sampler state.
+    std::chrono::steady_clock::time_point telemetry_sample_time {std::chrono::steady_clock::now()};  ///< Previous interval boundary.
+    std::uint64_t sampled_capture_events {};  ///< Capture callback counter at previous boundary.
+    std::uint64_t sampled_captured_frames {};  ///< Captured-frame counter at previous boundary.
+    std::uint64_t sampled_encoded_frames {};  ///< Encoded-frame counter at previous boundary.
+    std::uint64_t sampled_transmitted_frames {};  ///< Transmitted-frame counter at previous boundary.
+    std::uint64_t sampled_video_bytes {};  ///< Video-byte counter at previous boundary.
+    std::uint64_t sampled_audio_bytes {};  ///< Audio-byte counter at previous boundary.
+    bool interval_sampled {};  ///< Whether cached interval rates are valid.
+    bool interval_capture_active {};  ///< Whether capture provider reported during cached interval.
+    bool interval_audio_active {};  ///< Whether audio bytes advanced during cached interval.
+    double interval_capture_fps {};  ///< Cached capture rate.
+    double interval_encode_fps {};  ///< Cached encode rate.
+    double interval_transmit_fps {};  ///< Cached transmit rate.
+    int interval_bitrate_kbps {};  ///< Cached transmitted video bitrate.
+    rtsp_stream::display_restore_e display_restore {rtsp_stream::display_restore_e::host_default};  ///< Applied display-profile restoration trigger.
 
     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
     safe::signal_t controlEnd;  ///< Signal raised when the control channel exits.
@@ -778,6 +805,7 @@ namespace stream {
             net::packet_t packet {event.packet};
             auto message = parse_control_packet(*packet);
             if (message) {
+              session->control_bytes.fetch_add(packet->dataLength, std::memory_order_relaxed);
               call(message->first, session, message->second, false);
             }
           }
@@ -1185,7 +1213,12 @@ namespace stream {
     });
 
     server->map(packetTypes[IDX_LOSS_STATS], [&](session_t *session, const std::string_view &payload) {
-      int32_t *stats = (int32_t *) payload.data();
+      if (payload.size() < 4 * sizeof(std::int32_t)) {
+        BOOST_LOG(warning) << "Control: Runt loss statistics packet"sv;
+        return;
+      }
+      std::array<std::int32_t, 4> stats;
+      std::memcpy(stats.data(), payload.data(), sizeof(stats));
       auto count = stats[0];
       std::chrono::milliseconds t {stats[1]};
 
@@ -1207,7 +1240,12 @@ namespace stream {
     });
 
     server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
-      auto frames = (std::int64_t *) payload.data();
+      if (payload.size() < 2 * sizeof(std::int64_t)) {
+        BOOST_LOG(warning) << "Control: Runt reference-frame packet"sv;
+        return;
+      }
+      std::array<std::int64_t, 2> frames;
+      std::memcpy(frames.data(), payload.data(), sizeof(frames));
       auto firstFrame = frames[0];
       auto lastFrame = frames[1];
 
@@ -1222,7 +1260,17 @@ namespace stream {
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_INPUT_DATA]"sv;
 
-      auto tagged_cipher_length = util::endian::big(*(int32_t *) payload.data());
+      if (payload.size() < sizeof(std::int32_t)) {
+        BOOST_LOG(warning) << "Control: Runt input packet"sv;
+        return;
+      }
+      std::int32_t encoded_length;
+      std::memcpy(&encoded_length, payload.data(), sizeof(encoded_length));
+      auto tagged_cipher_length = util::endian::big(encoded_length);
+      if (tagged_cipher_length < 0 || static_cast<std::size_t>(tagged_cipher_length) > payload.size() - sizeof(tagged_cipher_length)) {
+        BOOST_LOG(warning) << "Control: Invalid input ciphertext length"sv;
+        return;
+      }
       std::string_view tagged_cipher {payload.data() + sizeof(tagged_cipher_length), (size_t) tagged_cipher_length};
 
       std::vector<uint8_t> plaintext;
@@ -1239,27 +1287,34 @@ namespace stream {
       }
 
       if (tagged_cipher_length >= 16 + iv.size()) {
-        std::copy(payload.end() - 16, payload.end(), std::begin(iv));
+        std::copy(tagged_cipher.end() - 16, tagged_cipher.end(), std::begin(iv));
       }
 
+      session->input_bytes.fetch_add(plaintext.size(), std::memory_order_relaxed);
       input::passthrough(session->input, std::move(plaintext));
     });
 
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_ENCRYPTED]"sv;
 
-      auto header = (control_encrypted_p) (payload.data() - 2);
+      if (payload.size() < sizeof(std::uint16_t) + sizeof(std::uint32_t)) {
+        BOOST_LOG(warning) << "Control: Runt encrypted packet"sv;
+        return;
+      }
+      std::uint16_t encoded_length;
+      std::uint32_t encoded_seq;
+      std::memcpy(&encoded_length, payload.data(), sizeof(encoded_length));
+      std::memcpy(&encoded_seq, payload.data() + sizeof(encoded_length), sizeof(encoded_seq));
+      const auto length = util::endian::little(encoded_length);
+      const auto seq = util::endian::little(encoded_seq);
 
-      auto length = util::endian::little(header->length);
-      auto seq = util::endian::little(header->seq);
-
-      if (length < (16 + 4 + 4)) {
+      if (length < (crypto::cipher::tag_size + sizeof(encoded_seq) + 4) || length > payload.size() - sizeof(encoded_length)) {
         BOOST_LOG(warning) << "Control: Runt packet"sv;
         return;
       }
 
-      auto tagged_cipher_length = length - 4;
-      std::string_view tagged_cipher {(char *) header->payload(), (size_t) tagged_cipher_length};
+      const auto tagged_cipher_length = length - sizeof(encoded_seq);
+      std::string_view tagged_cipher {payload.data() + sizeof(encoded_length) + sizeof(encoded_seq), tagged_cipher_length};
 
       auto &cipher = session->control.cipher;
       auto &iv = session->control.incoming_iv;
@@ -1293,7 +1348,13 @@ namespace stream {
         return;
       }
 
-      auto type = *(std::uint16_t *) plaintext.data();
+      if (plaintext.size() < 4) {
+        BOOST_LOG(warning) << "Control: Runt encrypted plaintext"sv;
+        return;
+      }
+
+      std::uint16_t type;
+      std::memcpy(&type, plaintext.data(), sizeof(type));
       std::string_view next_payload {(char *) plaintext.data() + 4, plaintext.size() - 4};
 
       if (type == packetTypes[IDX_ENCRYPTED]) {
@@ -1305,6 +1366,7 @@ namespace stream {
       // IDX_INPUT_DATA callback will attempt to decrypt unencrypted data, therefore we need pass it directly
       if (type == packetTypes[IDX_INPUT_DATA]) {
         plaintext.erase(std::begin(plaintext), std::begin(plaintext) + 4);
+        session->input_bytes.fetch_add(plaintext.size(), std::memory_order_relaxed);
         input::passthrough(session->input, std::move(plaintext));
       } else {
         server->call(type, session, next_payload, true);
@@ -1384,7 +1446,7 @@ namespace stream {
       }
 
       // Don't break until any pending sessions either expire or connect
-      if (proc::proc.running() == 0 && !has_session_awaiting_peer) {
+      if (!proc::runtime_running() && !has_session_awaiting_peer) {
         BOOST_LOG(info) << "Process terminated"sv;
         break;
       }
@@ -1606,6 +1668,7 @@ namespace stream {
       }
 
       auto fecPercentage = config::stream.fec_percentage;
+      const auto encoded_payload_size = payload.size();
 
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
@@ -1686,6 +1749,7 @@ namespace stream {
         size_t ratecontrol_group_packets_sent = 0;
 
         auto blockIndex = 0;
+        bool frame_sent = true;
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
           auto packets = (current_payload.size() + (blocksize - 1)) / blocksize;
 
@@ -1814,7 +1878,7 @@ namespace stream {
                     session->localAddress,
                   };
 
-                  platf::send(send_info);
+                  frame_sent = platf::send(send_info) && frame_sent;
                 }
               }
               frame_send_batch_latency_logger.second_point_now_and_log();
@@ -1843,6 +1907,10 @@ namespace stream {
         });
 
         session->video.lowseq = lowseq;
+        if (frame_sent) {
+          session->transmitted_frames.fetch_add(1, std::memory_order_relaxed);
+          session->video_bytes.fetch_add(encoded_payload_size, std::memory_order_relaxed);
+        }
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);
@@ -1922,7 +1990,9 @@ namespace stream {
           session->audio.peer.port(),
           session->localAddress,
         };
-        platf::send(send_info);
+        if (platf::send(send_info)) {
+          session->audio_bytes.fetch_add(static_cast<std::uint64_t>(bytes), std::memory_order_relaxed);
+        }
 
         auto &fec_packet = session->audio.fec_packet;
         // initialize the FEC header at the beginning of the FEC block
@@ -2189,6 +2259,14 @@ namespace stream {
 
   namespace session {
     std::atomic_uint running_sessions;  ///< Running sessions.
+    std::recursive_mutex &display_restore_mutex = proc::runtime_mutex();  ///< Protects cross-session display restoration policy.
+    unsigned active_display_restore_policies {};  ///< Policies used by current active session group.
+    bool deferred_display_restore {};  ///< Whether runtime termination must restore host display state.
+
+    /** @brief Return bit representing one display restoration policy. */
+    unsigned display_restore_bit(const rtsp_stream::display_restore_e policy) {
+      return 1U << static_cast<unsigned>(policy);
+    }
 
     /**
      * @brief Platform handle returned from stream setup.
@@ -2202,6 +2280,71 @@ namespace stream {
      */
     const std::string &client_cert(session_t &session) {
       return session.client_cert;
+    }
+
+    std::shared_ptr<capture_telemetry_t> capture_telemetry(session_t &session) {
+      return session.capture_telemetry;
+    }
+
+    void record_captured_frame(session_t &session) {
+      session.capture_telemetry->captured_frames.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void record_encoded_frame(session_t &session) {
+      session.encoded_frames.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void record_dropped_frame(session_t &session, const std::uint64_t count) {
+      session.capture_telemetry->dropped_frames.fetch_add(count, std::memory_order_relaxed);
+    }
+
+    void record_capture_queue(session_t &session, const std::uint64_t depth, const std::uint64_t dropped) {
+      session.capture_telemetry->queue_depth.store(depth, std::memory_order_relaxed);
+      session.capture_telemetry->queue_drops.fetch_add(dropped, std::memory_order_relaxed);
+      record_dropped_frame(session, dropped);
+    }
+
+    void record_capture_latency(session_t &session, const std::optional<std::chrono::steady_clock::duration> latency) {
+      if (!latency) {
+        session.capture_latency_tenths_ms.store(0, std::memory_order_relaxed);
+        return;
+      }
+      const auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(*latency).count();
+      session.capture_latency_tenths_ms.store(static_cast<std::uint16_t>(std::clamp<std::int64_t>((microseconds + 50) / 100, 0, std::numeric_limits<std::uint16_t>::max() - 1) + 1), std::memory_order_relaxed);
+    }
+
+    void record_encode_latency(session_t &session, const std::chrono::steady_clock::duration latency) {
+      const auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(latency).count();
+      session.encode_latency_tenths_ms.store(static_cast<std::uint16_t>(std::clamp<std::int64_t>((microseconds + 50) / 100, 0, std::numeric_limits<std::uint16_t>::max() - 1) + 1), std::memory_order_relaxed);
+    }
+
+    void sample_telemetry(session_t &session) {
+      const auto capture_events = session.capture_telemetry->events.load(std::memory_order_relaxed);
+      const auto captured_frames = session.capture_telemetry->captured_frames.load(std::memory_order_relaxed);
+      const auto encoded_frames = session.encoded_frames.load(std::memory_order_relaxed);
+      const auto transmitted_frames = session.transmitted_frames.load(std::memory_order_relaxed);
+      const auto video_bytes = session.video_bytes.load(std::memory_order_relaxed);
+      const auto audio_bytes = session.audio_bytes.load(std::memory_order_relaxed);
+      const auto now = std::chrono::steady_clock::now();
+      std::lock_guard telemetry_lock {session.telemetry_mutex};
+      const auto elapsed_seconds = std::chrono::duration<double>(now - session.telemetry_sample_time).count();
+      if (elapsed_seconds < 0.25) {
+        return;
+      }
+      session.interval_capture_fps = (captured_frames - session.sampled_captured_frames) / elapsed_seconds;
+      session.interval_encode_fps = (encoded_frames - session.sampled_encoded_frames) / elapsed_seconds;
+      session.interval_transmit_fps = (transmitted_frames - session.sampled_transmitted_frames) / elapsed_seconds;
+      session.interval_bitrate_kbps = static_cast<int>(((video_bytes - session.sampled_video_bytes) * 8.0) / (elapsed_seconds * 1000.0));
+      session.interval_capture_active = capture_events > session.sampled_capture_events;
+      session.interval_audio_active = audio_bytes > session.sampled_audio_bytes;
+      session.sampled_capture_events = capture_events;
+      session.sampled_captured_frames = captured_frames;
+      session.sampled_encoded_frames = encoded_frames;
+      session.sampled_transmitted_frames = transmitted_frames;
+      session.sampled_video_bytes = video_bytes;
+      session.sampled_audio_bytes = audio_bytes;
+      session.telemetry_sample_time = now;
+      session.interval_sampled = true;
     }
 
     rtsp_stream::session_info_t snapshot(session_t &session) {
@@ -2218,6 +2361,14 @@ namespace stream {
         }
         return "unknown";
       }();
+      const auto captured_frames = session.capture_telemetry->captured_frames.load(std::memory_order_relaxed);
+      const auto encoded_frames = session.encoded_frames.load(std::memory_order_relaxed);
+      const auto transmitted_frames = session.transmitted_frames.load(std::memory_order_relaxed);
+      const auto video_bytes = session.video_bytes.load(std::memory_order_relaxed);
+      const auto audio_bytes = session.audio_bytes.load(std::memory_order_relaxed);
+      const auto capture_latency = session.capture_latency_tenths_ms.load(std::memory_order_relaxed);
+      const auto encode_latency = session.encode_latency_tenths_ms.load(std::memory_order_relaxed);
+      std::lock_guard telemetry_lock {session.telemetry_mutex};
       return {
         .id = session.session_id,
         .client_uuid = session.client_uuid,
@@ -2229,6 +2380,31 @@ namespace stream {
         .height = session.height,
         .fps = session.fps,
         .hdr = session.hdr,
+        .telemetry_generation = session.telemetry_generation,
+        .codec = session.config.monitor.videoFormat == 0 ? "h264" : session.config.monitor.videoFormat == 1 ? "hevc" :
+                                                                  session.config.monitor.videoFormat == 2   ? "av1" :
+                                                                                                              "unknown",
+        .bitrate_kbps = session.interval_bitrate_kbps,
+        .captured_frames = captured_frames,
+        .encoded_frames = encoded_frames,
+        .dropped_frames = session.capture_telemetry->dropped_frames.load(std::memory_order_relaxed),
+        .transmitted_frames = transmitted_frames,
+        .video_bytes = video_bytes,
+        .audio_bytes = audio_bytes,
+        .control_bytes = session.control_bytes.load(std::memory_order_relaxed),
+        .input_bytes = session.input_bytes.load(std::memory_order_relaxed),
+        .queue_depth = session.capture_telemetry->queue_depth.load(std::memory_order_relaxed),
+        .queue_drops = session.capture_telemetry->queue_drops.load(std::memory_order_relaxed),
+        .interval_sampled = session.interval_sampled,
+        .capture_active = session.interval_capture_active,
+        .audio_active = session.interval_audio_active,
+        .capture_latency_sampled = capture_latency != 0,
+        .encode_latency_sampled = encode_latency != 0,
+        .capture_fps = session.interval_capture_fps,
+        .encode_fps = session.interval_encode_fps,
+        .transmit_fps = session.interval_transmit_fps,
+        .capture_latency_ms = capture_latency == 0 ? 0.0 : (capture_latency - 1) / 10.0,
+        .encode_latency_ms = encode_latency == 0 ? 0.0 : (encode_latency - 1) / 10.0,
       };
     }
 
@@ -2274,20 +2450,29 @@ namespace stream {
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
 
-      // If this is the last session, invoke the platform callbacks
-      if (--running_sessions == 0) {
-        bool revert_display_config {config::video.dd.config_revert_on_disconnect};
-        if (proc::proc.running()) {
+      std::unique_lock restore_lock {display_restore_mutex};
+      const bool last_session = --running_sessions == 0;
+      const auto restore_policies = active_display_restore_policies;
+      if (last_session) {
+        active_display_restore_policies = 0;
+        const bool runtime_running = proc::runtime_running();
+        const bool always = restore_policies & display_restore_bit(rtsp_stream::display_restore_e::always);
+        const bool on_stop = restore_policies & display_restore_bit(rtsp_stream::display_restore_e::on_stop);
+        const bool host_default = restore_policies & display_restore_bit(rtsp_stream::display_restore_e::host_default);
+        const bool revert_display_config = always || (!runtime_running && (deferred_display_restore || on_stop || host_default)) || (host_default && config::video.dd.config_revert_on_disconnect);
+        if (runtime_running && !revert_display_config && (on_stop || host_default)) {
+          deferred_display_restore = true;
+        }
+        if (runtime_running) {
 #if defined SOL_TRAY && SOL_TRAY >= 1
           system_tray::update_tray_pausing(proc::proc.get_last_run_app_name());
 #endif
         } else {
-          // We have no app running and also no clients anymore.
-          revert_display_config = true;
           input::terminate_gamepads();
         }
 
         if (revert_display_config) {
+          deferred_display_restore = false;
           display_device::revert_configuration();
         }
 
@@ -2297,11 +2482,20 @@ namespace stream {
       BOOST_LOG(debug) << "Session ended"sv;
     }
 
+    void runtime_stopped() {
+      std::lock_guard restore_lock {display_restore_mutex};
+      if (running_sessions == 0 && deferred_display_restore && !proc::runtime_running()) {
+        deferred_display_restore = false;
+        input::terminate_gamepads();
+        display_device::revert_configuration();
+      }
+    }
+
     /**
      * @brief Start the audio, video, and control workers for a streaming session.
      */
     int start(session_t &session, const std::string &addr_string) {
-      session.input = input::alloc(session.mail, session.input_session_id, session.input_permissions);
+      session.input = input::alloc(session.mail, session.input_session_id, session.input_permissions, session.profile_mouse_mode);
 
       session.broadcast_ref = broadcast.ref();
       if (!session.broadcast_ref) {
@@ -2326,18 +2520,23 @@ namespace stream {
 
       session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
 
+      {
+        std::lock_guard restore_lock {display_restore_mutex};
+        active_display_restore_policies |= display_restore_bit(session.display_restore);
+        const auto previous_running_sessions = running_sessions++;
+        // If this is the first session, invoke the platform callbacks
+        if (previous_running_sessions == 0) {
+          platf::streaming_will_start();
+#if defined SOL_TRAY && SOL_TRAY >= 1
+          system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
+#endif
+        }
+      }
+
       session.audioThread = std::jthread {audioThread, &session};
       session.videoThread = std::jthread {videoThread, &session};
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
-
-      // If this is the first session, invoke the platform callbacks
-      if (++running_sessions == 1) {
-        platf::streaming_will_start();
-#if defined SOL_TRAY && SOL_TRAY >= 1
-        system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
-#endif
-      }
 
       return 0;
     }
@@ -2357,13 +2556,16 @@ namespace stream {
       session->app_uuid = launch_session.app_uuid;
       session->legacy_app_id = launch_session.appid;
       session->started_at = std::chrono::system_clock::now();
-      session->width = launch_session.width;
-      session->height = launch_session.height;
-      session->fps = launch_session.fps;
-      session->hdr = launch_session.enable_hdr;
+      session->width = config.monitor.width;
+      session->height = config.monitor.height;
+      session->fps = config.monitor.framerate;
+      session->hdr = config.monitor.dynamicRange != 0;
       session->input_permissions = launch_session.input_permissions;
+      session->profile_mouse_mode = launch_session.profile_mouse_mode;
       session->client_cert = launch_session.client_cert;
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
+      session->telemetry_generation = launch_session.telemetry_generation;
+      session->display_restore = launch_session.display_restore;
 
       session->config = config;
 

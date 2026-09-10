@@ -11,6 +11,8 @@ describe('clientStore mode profiles', () => {
         gaming: { ...defaultSettingsByMode.gaming },
         workstation: { ...defaultSettingsByMode.workstation },
       },
+      logicalSessionsByHost: {},
+      telemetryByHost: {},
     })
   })
 
@@ -71,5 +73,35 @@ describe('clientStore mode profiles', () => {
     expect(useClientStore.getState().settingsByMode.workstation).toEqual(
       defaultSettingsByMode.workstation,
     )
+  })
+
+  it('applies logical session updates and removal events', () => {
+    const session = {
+      id: '11111111-1111-4111-8111-111111111111',
+      appUuid: '22222222-2222-4222-8222-222222222222',
+      legacyAppId: 7,
+      state: 'running' as const,
+      stateReason: 'streaming',
+      startedAt: 1,
+      updatedAt: 2,
+      width: 1920,
+      height: 1080,
+      refreshRate: 60,
+      hdr: false,
+      revision: 1,
+    }
+    useClientStore.getState().setSolResource({
+      hostId: 'host-1',
+      resource: 'event',
+      payload: { type: 'session.created', data: session },
+    })
+    expect(useClientStore.getState().logicalSessionsByHost['host-1']).toEqual([session])
+
+    useClientStore.getState().setSolResource({
+      hostId: 'host-1',
+      resource: 'event',
+      payload: { type: 'session.removed', data: { id: session.id } },
+    })
+    expect(useClientStore.getState().logicalSessionsByHost['host-1']).toEqual([])
   })
 })

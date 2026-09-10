@@ -12,6 +12,9 @@
     #define NOMINMAX
   #endif
   #include <windows.h>
+#else
+  #include <fcntl.h>
+  #include <unistd.h>
 #endif
 
 // local includes
@@ -88,12 +91,37 @@ namespace file_handler {
     }
 
     std::error_code error;
-    if (std::filesystem::exists(destination, error) && !error) {
+    const auto destination_exists = std::filesystem::exists(destination, error);
+    if (error) {
+      std::error_code ignored;
+      std::filesystem::remove(temporary, ignored);
+      return -1;
+    }
+    if (destination_exists) {
       const auto permissions = std::filesystem::status(destination, error).permissions();
       if (!error) {
         std::filesystem::permissions(temporary, permissions, error);
       }
+      if (error) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return -1;
+      }
     }
+
+#ifndef _WIN32
+    const auto temporary_native = temporary.c_str();
+    const auto temporary_fd = open(temporary_native, O_RDONLY | O_CLOEXEC);
+    if (temporary_fd < 0 || fsync(temporary_fd) != 0) {
+      if (temporary_fd >= 0) {
+        close(temporary_fd);
+      }
+      std::error_code ignored;
+      std::filesystem::remove(temporary, ignored);
+      return -1;
+    }
+    close(temporary_fd);
+#endif
 
 #ifdef _WIN32
     const auto temporary_wide = temporary.wstring();
@@ -108,6 +136,16 @@ namespace file_handler {
       std::filesystem::remove(temporary, error);
       return -1;
     }
+    const auto parent = destination.parent_path().empty() ? std::filesystem::path {"."} : destination.parent_path();
+    const auto parent_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (parent_fd < 0) {
+      BOOST_LOG(warning) << "Atomic file replacement committed, but parent directory could not be opened for synchronization: " << parent;
+      return 0;
+    }
+    if (fsync(parent_fd) != 0) {
+      BOOST_LOG(warning) << "Atomic file replacement committed, but parent directory synchronization failed: " << parent;
+    }
+    close(parent_fd);
 #endif
     return 0;
   }

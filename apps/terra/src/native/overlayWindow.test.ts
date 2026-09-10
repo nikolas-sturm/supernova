@@ -4,6 +4,7 @@ import {
   overlayReadyStorageKey,
   overlayRequestStorageKey,
   overlayStatisticsStorageKey,
+  type StreamOverlayRequest,
   storedOverlayRequestSchema,
 } from '../overlay/overlayProtocol'
 
@@ -14,6 +15,8 @@ const neutralino = vi.hoisted(() => {
     data,
     eventHandlers,
     create: vi.fn((_url: string, _options?: unknown) => Promise.resolve()),
+    move: vi.fn((_x: number, _y: number) => Promise.resolve()),
+    setSize: vi.fn((_options: { width: number; height: number }) => Promise.resolve()),
     eventsOn: vi.fn((name: string, handler: (event: CustomEvent<unknown>) => void) => {
       eventHandlers.set(name, handler)
       return Promise.resolve()
@@ -21,7 +24,19 @@ const neutralino = vi.hoisted(() => {
     spawnProcess: vi.fn((_command: string, _options?: unknown) =>
       Promise.resolve({ id: 1, pid: 1 }),
     ),
-    updateSpawnedProcess: vi.fn(() => Promise.resolve()),
+    updateSpawnedProcess: vi.fn((id: number, action: string, input?: string) => {
+      if (action === 'stdIn' && input?.startsWith('HIDE ')) {
+        const revision = input.trim().split(' ')[1]
+        queueMicrotask(() =>
+          eventHandlers.get('spawnedProcess')?.(
+            new CustomEvent('spawnedProcess', {
+              detail: { id, action: 'stdOut', data: `TERRA_OVERLAY_HIDDEN ${revision}\n` },
+            }),
+          ),
+        )
+      }
+      return Promise.resolve()
+    }),
     getData: vi.fn((key: string) =>
       data.has(key)
         ? Promise.resolve(data.get(key) as string)
@@ -33,6 +48,24 @@ const neutralino = vi.hoisted(() => {
     }),
     setData: vi.fn((key: string, value: string) => {
       data.set(key, value)
+      if (key === 'terra_stream_overlay_request') {
+        const request = JSON.parse(value) as {
+          requestId?: string
+          revision?: string
+          visible?: boolean
+          wayland?: boolean
+        }
+        if (!request.visible && !request.wayland && request.requestId && request.revision) {
+          data.set(
+            'terra_stream_overlay_hidden',
+            JSON.stringify({
+              schemaVersion: 1,
+              requestId: request.requestId,
+              revision: request.revision,
+            }),
+          )
+        }
+      }
       return Promise.resolve()
     }),
   }
@@ -49,16 +82,34 @@ vi.mock('@neutralinojs/lib', () => ({
     spawnProcess: neutralino.spawnProcess,
     updateSpawnedProcess: neutralino.updateSpawnedProcess,
   },
-  window: { create: neutralino.create },
+  window: { create: neutralino.create, move: neutralino.move, setSize: neutralino.setSize },
 }))
 
 import {
+  openStreamOverlay as applyStreamOverlay,
   dismissStreamOverlay,
-  openStreamOverlay,
   prewarmStreamOverlay,
   stopStreamOverlayPrewarm,
   updateStreamOverlayStatistics,
 } from './overlayWindow'
+
+let overlayRevision = 0
+function openStreamOverlay(
+  request: Omit<StreamOverlayRequest, 'revision' | 'visible'> &
+    Partial<Pick<StreamOverlayRequest, 'revision' | 'visible'>>,
+  onClosed: (action: 'resume' | 'disconnect' | 'quit') => Promise<void>,
+  onPresented?: (revision: string, visible: boolean) => Promise<void>,
+) {
+  return applyStreamOverlay(
+    {
+      ...request,
+      revision: request.revision ?? String(++overlayRevision),
+      visible: request.visible ?? true,
+    },
+    onClosed,
+    onPresented,
+  )
+}
 
 function statistics(hostId = 'host-1', sequence = 1) {
   return {
@@ -101,6 +152,7 @@ describe('overlayWindow', () => {
   })
 
   beforeEach(() => {
+    overlayRevision = 0
     Object.defineProperties(window, {
       NL_ARGS: {
         configurable: true,
@@ -128,7 +180,7 @@ describe('overlayWindow', () => {
     expect(neutralino.create).not.toHaveBeenCalled()
     expect(neutralino.spawnProcess).toHaveBeenCalledWith(
       expect.stringContaining(
-        "'/opt/app/extensions/terra-core/bin/terra-wayland-overlay' 'http://localhost:",
+        "'/opt/app/extensions/terra-core/bin/terra-wayland-overlay' '1' 'http://localhost:",
       ),
     )
     expect(neutralino.spawnProcess.mock.calls[0]?.[0]).toContain('/stream-overlay/')
@@ -189,14 +241,15 @@ describe('overlayWindow', () => {
     )
     neutralino.eventHandlers.get('spawnedProcess')?.(
       new CustomEvent('spawnedProcess', {
-        detail: { id: 1, action: 'stdOut', data: 'TERRA_OVERLAY_CLOSED\n' },
+        detail: {
+          id: 1,
+          action: 'stdOut',
+          data: 'TERRA_OVERLAY_HIDDEN 1\nTERRA_OVERLAY_CLOSED resume\n',
+        },
       }),
     )
 
     await vi.waitFor(() => expect(onClosed).toHaveBeenCalledOnce())
-    await vi.waitFor(() =>
-      expect(neutralino.updateSpawnedProcess).toHaveBeenCalledWith(1, 'stdIn', 'HIDE\n'),
-    )
     await openStreamOverlay(
       {
         schemaVersion: 1,
@@ -217,9 +270,9 @@ describe('overlayWindow', () => {
       'stdIn',
       expect.stringMatching(/^SHOW .+\n$/),
     )
-    expect(neutralino.updateSpawnedProcess).toHaveBeenCalledTimes(3)
+    expect(neutralino.updateSpawnedProcess).toHaveBeenCalledTimes(2)
     expect(neutralino.updateSpawnedProcess).toHaveBeenNthCalledWith(
-      3,
+      2,
       1,
       'stdIn',
       expect.stringMatching(/^SHOW .+\n$/),
@@ -249,6 +302,42 @@ describe('overlayWindow', () => {
     )
 
     await vi.waitFor(() => expect(onClosed).toHaveBeenCalledOnce())
+  })
+
+  it('retains Wayland hidden proof after standalone helper exits', async () => {
+    const onClosed = vi.fn(() => Promise.resolve())
+    const onPresented = vi.fn(() => Promise.resolve())
+    const visible = {
+      schemaVersion: 1 as const,
+      hostId: 'host-1',
+      appId: 7,
+      appName: 'Portal',
+      generation: '4',
+      revision: '1',
+      visible: true,
+      bounds: { x: 0, y: 0, width: 1280, height: 720, scaleFactor: 1 },
+      wayland: true,
+      fullscreen: true,
+    }
+    await applyStreamOverlay(visible, onClosed, onPresented)
+
+    neutralino.eventHandlers.get('spawnedProcess')?.(
+      new CustomEvent('spawnedProcess', {
+        detail: {
+          id: 1,
+          action: 'stdOut',
+          data: 'TERRA_OVERLAY_HIDDEN 1\nTERRA_OVERLAY_CLOSED resume\n',
+        },
+      }),
+    )
+    neutralino.eventHandlers.get('spawnedProcess')?.(
+      new CustomEvent('spawnedProcess', { detail: { id: 1, action: 'exit', data: 0 } }),
+    )
+    await vi.waitFor(() => expect(onClosed).toHaveBeenCalledOnce())
+
+    await applyStreamOverlay({ ...visible, revision: '2', visible: false }, onClosed, onPresented)
+
+    expect(onPresented).toHaveBeenCalledWith('2', false)
   })
 
   it('keeps Wayland helper open after its ready signal', async () => {
@@ -282,7 +371,7 @@ describe('overlayWindow', () => {
     }
   })
 
-  it('closes overlay if stream geometry changes', async () => {
+  it('updates an active overlay without interpreting the request as a toggle', async () => {
     const onClosed = vi.fn(() => Promise.resolve())
     const active = {
       schemaVersion: 1 as const,
@@ -295,14 +384,19 @@ describe('overlayWindow', () => {
     await openStreamOverlay(active, onClosed)
 
     await openStreamOverlay(
-      { ...active, bounds: { ...active.bounds, width: 1200 } },
+      active,
       vi.fn(() => Promise.resolve()),
     )
 
-    expect(onClosed).toHaveBeenCalledOnce()
+    expect(onClosed).not.toHaveBeenCalled()
+    expect(
+      storedOverlayRequestSchema.parse(
+        JSON.parse(neutralino.data.get(overlayRequestStorageKey) ?? ''),
+      ),
+    ).toMatchObject({ revision: '2', visible: true })
   })
 
-  it('terminates a delayed Wayland child after its request is dismissed', async () => {
+  it('hides a delayed Wayland child before opening its replacement', async () => {
     let resolveSpawn: ((child: { id: number; pid: number }) => void) | undefined
     neutralino.spawnProcess.mockImplementationOnce(
       () =>
@@ -324,9 +418,9 @@ describe('overlayWindow', () => {
       vi.fn(() => Promise.resolve()),
     )
     await vi.waitFor(() => expect(resolveSpawn).toBeTypeOf('function'))
-    await dismissStreamOverlay()
+    const dismissal = dismissStreamOverlay()
 
-    await openStreamOverlay(
+    const secondOpen = openStreamOverlay(
       {
         schemaVersion: 1,
         hostId: 'host-2',
@@ -338,9 +432,9 @@ describe('overlayWindow', () => {
       vi.fn(() => Promise.resolve()),
     )
     resolveSpawn?.({ id: 9, pid: 9 })
-    await firstOpen
+    await Promise.all([firstOpen, dismissal, secondOpen])
 
-    expect(neutralino.updateSpawnedProcess).toHaveBeenCalledWith(9, 'exit')
+    expect(neutralino.updateSpawnedProcess).toHaveBeenCalledWith(9, 'stdIn', 'HIDE 1\n')
     expect(neutralino.create).toHaveBeenCalledOnce()
   })
 
@@ -378,7 +472,7 @@ describe('overlayWindow', () => {
     )
     neutralino.data.set(
       overlayReadyStorageKey,
-      JSON.stringify({ schemaVersion: 1, requestId: stored.requestId }),
+      JSON.stringify({ schemaVersion: 1, requestId: stored.requestId, revision: stored.revision }),
     )
     neutralino.data.set(
       overlayClosedStorageKey,
@@ -386,6 +480,13 @@ describe('overlayWindow', () => {
     )
 
     await vi.waitFor(() => expect(onClosed).toHaveBeenCalledOnce())
+    const onPresented = vi.fn(() => Promise.resolve())
+    await openStreamOverlay(
+      { ...stored, revision: String(Number(stored.revision) + 1), visible: false },
+      onClosed,
+      onPresented,
+    )
+    expect(onPresented).toHaveBeenCalledWith('2', false)
     expect(
       storedOverlayRequestSchema.parse(
         JSON.parse(neutralino.data.get(overlayRequestStorageKey) ?? ''),
@@ -490,9 +591,9 @@ describe('overlayWindow', () => {
       vi.fn(() => Promise.resolve()),
     )
     await vi.waitFor(() => expect(finishFirstCreate).toBeTypeOf('function'))
-    await dismissStreamOverlay()
+    const dismissal = dismissStreamOverlay()
 
-    await openStreamOverlay(
+    const secondOpen = openStreamOverlay(
       {
         schemaVersion: 1,
         hostId: 'host-2',
@@ -504,7 +605,7 @@ describe('overlayWindow', () => {
       vi.fn(() => Promise.resolve()),
     )
     finishFirstCreate?.()
-    await firstOpen
+    await Promise.all([firstOpen, dismissal, secondOpen])
 
     const current = storedOverlayRequestSchema.parse(
       JSON.parse(neutralino.data.get(overlayRequestStorageKey) ?? ''),

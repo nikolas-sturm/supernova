@@ -7,14 +7,18 @@
 
 // standard includes
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <filesystem>
 #include <format>
 #include <functional>
 #include <future>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -39,14 +43,6 @@
 // local includes
 #include "config.h"
 #include "display_device.h"
-#include "terra_assets.h"
-#include "terra_events.h"
-#include "terra_operations.h"
-#include "terra_peripherals.h"
-#include "terra_profiles.h"
-#include "terra_sandboxes.h"
-#include "terra_virtual_display.h"
-#include "terra_workspaces.h"
 #include "file_handler.h"
 #include "globals.h"
 #include "httpcommon.h"
@@ -57,6 +53,14 @@
 #include "process.h"
 #include "rtsp.h"
 #include "system_tray.h"
+#include "terra_assets.h"
+#include "terra_events.h"
+#include "terra_operations.h"
+#include "terra_peripherals.h"
+#include "terra_profiles.h"
+#include "terra_sandboxes.h"
+#include "terra_virtual_display.h"
+#include "terra_workspaces.h"
 #include "utility.h"
 #include "uuid.h"
 #include "video.h"
@@ -78,6 +82,13 @@ namespace nvhttp {
 
   crypto::cert_chain_t cert_chain;  ///< Enabled paired-client certificates accepted by Sol's GameStream HTTPS server.
   std::mutex client_auth_mutex;  ///< Serializes paired-client state and certificate authorization changes.
+  std::recursive_mutex terra_revocation_mutex;  ///< Serializes authorization mutation with destructive owner cleanup.
+  std::array<std::recursive_mutex, 256> terra_client_mutation_mutexes;  ///< Serializes each client's mutations with policy replacement.
+
+  /** @brief Return stable striped mutation lock for one client identity. */
+  std::recursive_mutex &terra_client_mutation_mutex(const std::string_view client_uuid) {
+    return terra_client_mutation_mutexes[std::hash<std::string_view> {}(client_uuid) % terra_client_mutation_mutexes.size()];
+  }
 
   /**
    * @brief HTTPS server backend that adds Sol's client-certificate verification.
@@ -206,11 +217,31 @@ namespace nvhttp {
     terra_api::client_permissions_t permissions;  ///< Permission snapshot used by requests on this connection.
   };
 
+  enum terra_revocation_domain_e : std::uint32_t {
+    terra_revoke_full_identity = 1U << 0,  ///< Ignore current policy and revoke every owned resource.
+    terra_revoke_profiles = 1U << 1,  ///< Reconcile profile ownership.
+    terra_revoke_workspaces = 1U << 2,  ///< Reconcile workspace ownership.
+    terra_revoke_sandboxes = 1U << 3,  ///< Reconcile sandbox ownership.
+    terra_revoke_virtual_displays = 1U << 4,  ///< Reconcile virtual-display ownership.
+    terra_revoke_peripherals = 1U << 5,  ///< Reconcile peripheral devices and claims.
+  };
+
+  constexpr std::uint32_t TERRA_REVOCATION_DOMAINS = terra_revoke_profiles | terra_revoke_workspaces | terra_revoke_sandboxes | terra_revoke_virtual_displays | terra_revoke_peripherals;  ///< Every independently retryable resource domain.
+  constexpr std::uint32_t TERRA_FULL_REVOCATION = terra_revoke_full_identity | TERRA_REVOCATION_DOMAINS;  ///< Complete identity cleanup marker.
+
+  /** @brief Persisted cleanup work and generation used to reject stale retry completion. */
+  struct terra_pending_revocation_t {
+    std::uint32_t domains {};  ///< Resource domains still requiring cleanup.
+    std::uint64_t generation {};  ///< Incremented whenever policy queues cleanup.
+    bool operator==(const terra_pending_revocation_t &) const = default;  ///< Compare retry generation and work.
+  };
+
   /**
    * @brief Persisted pairing data for one Moonlight client.
    */
   struct client_t {
     std::vector<named_cert_t> named_devices;  ///< Persisted Moonlight clients allowed to pair or reconnect.
+    std::map<std::string, terra_pending_revocation_t, std::less<>> pending_revocations;  ///< Owner UUIDs mapped to independently retryable cleanup work.
   };
 
   // uniqueID, session
@@ -249,6 +280,17 @@ namespace nvhttp {
     std::string stream_profile_id;  ///< Resolved stream-profile UUID, empty when none.
     std::string launch_profile_id;  ///< Resolved launch-profile UUID, empty when none.
     std::string sandbox_profile_id;  ///< Resolved sandbox-profile UUID, empty when none.
+    std::optional<nlohmann::json> display_configuration;  ///< Workspace start-time display override.
+    std::optional<nlohmann::json> stream_configuration;  ///< Workspace start-time stream override.
+    std::optional<nlohmann::json> launch_configuration;  ///< Workspace start-time launch override.
+  };
+
+  /** @brief Completed result from one deferred Terra mutation. */
+  struct terra_operation_completion_t {
+    bool succeeded {};  ///< Whether operation reached `succeeded`.
+    std::optional<std::string> resource_id;  ///< Created or changed resource UUID.
+    nlohmann::json result;  ///< Success result document.
+    nlohmann::json error;  ///< Structured failure document.
   };
 
   /**
@@ -262,12 +304,69 @@ namespace nvhttp {
     std::uint64_t revision = 1;  ///< Monotonic session-resource revision.
     std::int64_t updated_at = 0;  ///< Last published transition in Unix milliseconds.
     std::optional<std::int64_t> terminal_since;  ///< Retention start for terminal sessions.
+    std::optional<rtsp_stream::session_info_t> retained_snapshot;  ///< Last complete resource fields used during terminal retention.
+    std::optional<std::string> display_id;  ///< Last display resource associated with session runtime.
+    std::vector<std::string> peripheral_claim_ids;  ///< Sorted non-terminal claims associated with session runtime.
     bool announced = false;  ///< Whether session.created has been published.
   };
 
   std::mutex terra_session_tracking_mutex;  ///< Protects published session tracking state.
+  std::mutex terra_session_event_mutex;  ///< Serializes session revision transitions with event publication.
   std::map<std::string, terra_session_tracking_t> terra_session_tracking;  ///< Published session resources keyed by session UUID.
   std::uint64_t terra_session_collection_revision = 0;  ///< Monotonic sessions-collection revision.
+
+  /**
+   * @brief Caller-visible revision state shared by filtered resource collections.
+   */
+  struct terra_projection_revisions_t {
+    struct projection_t {
+      std::string fingerprint;  ///< Canonical caller-visible snapshot fingerprint.
+      std::uint64_t revision = 0;  ///< Monotonic revision for this caller/domain projection.
+    };
+
+    std::mutex mutex;  ///< Protects projection state.
+    std::map<std::string, projection_t, std::less<>> values;  ///< Projection by domain and caller UUID.
+  } terra_projection_revisions;
+
+  /**
+   * @brief Advance one caller-visible collection revision only when its snapshot changes.
+   *
+   * @param domain Stable collection domain.
+   * @param caller_uuid Paired-client UUID defining visibility projection.
+   * @param fingerprint Canonical visible snapshot serialization.
+   * @return Current caller-visible collection revision.
+   */
+  std::uint64_t terra_projection_revision(const std::string_view domain, const std::string_view caller_uuid, std::string fingerprint) {
+    std::lock_guard lock {terra_projection_revisions.mutex};
+    auto &projection = terra_projection_revisions.values[std::string {domain} + '\0' + std::string {caller_uuid}];
+    if (projection.revision == 0) {
+      projection.revision = std::max<std::uint64_t>(1, std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+      projection.fingerprint = std::move(fingerprint);
+    } else if (projection.fingerprint != fingerprint) {
+      projection.fingerprint = std::move(fingerprint);
+      ++projection.revision;
+    }
+    return projection.revision;
+  }
+
+  /**
+   * @brief Process-lifetime revision state for caller-visible catalog projections.
+   */
+  struct terra_catalog_revision_t {
+    /** @brief State for one caller-visible catalog projection. */
+    struct projection_t {
+      std::string fingerprint;  ///< Canonical visible-resource fingerprint.
+      std::uint64_t revision = 0;  ///< Monotonic caller-visible revision.
+      std::uint64_t published_revision = 0;  ///< Last revision published to caller.
+    };
+
+    std::mutex mutex;  ///< Protects caller projection state.
+    std::map<std::string, projection_t, std::less<>> projections;  ///< Projection state by caller UUID.
+  } terra_catalog_revision;  ///< Caller-projected Catalog V2 revision state.
+
+  std::atomic_uint64_t terra_catalog_change_generation = 0;  ///< Non-process catalog mutations awaiting projection events.
+  std::atomic_uint64_t terra_catalog_process_revision = 0;  ///< Last process-catalog revision included in change generation.
+
   std::chrono::steady_clock::time_point terra_start_time = std::chrono::steady_clock::now();  ///< Host uptime reference for telemetry.
   std::unique_ptr<terra_events::hub_t> terra_event_hub;  ///< Per-client SSE replay and delivery hub.
   std::mutex terra_event_stream_mutex;  ///< Protects owned SSE worker threads.
@@ -276,19 +375,37 @@ namespace nvhttp {
   thread_pool_util::ThreadPool terra_operation_pool;  ///< Dedicated worker pool for durable Terra operations, isolated from the shared task pool.
   std::unique_ptr<terra::profiles::manager_t> terra_profile_manager;  ///< Persistent profiles-v1 resource manager.
   std::unique_ptr<terra_peripherals::manager_t> terra_peripheral_manager;  ///< Peripheral device registry and claim manager.
-  std::uint64_t terra_peripheral_collection_revision = 0;  ///< Monotonic peripherals collection revision.
-  std::mutex terra_peripheral_revision_mutex;  ///< Protects the peripherals collection revision.
+  std::map<std::string, std::uint64_t, std::less<>> terra_peripheral_collection_revisions;  ///< Monotonic peripheral revisions by owner projection; empty key is administrative.
+  std::mutex terra_peripheral_revision_mutex;  ///< Protects peripheral projection revisions.
+  std::map<std::string, std::uint64_t, std::less<>> terra_peripheral_published_revisions;  ///< Last event revision published by resource UUID.
+  std::mutex terra_peripheral_publication_mutex;  ///< Serializes peripheral resource event revision checks and publication.
+  std::mutex terra_peripheral_transaction_mutex;  ///< Serializes peripheral mutation commits with event publication.
+  std::mutex terra_target_transaction_mutex;  ///< Serializes target binding with target-end cleanup.
   std::unique_ptr<terra_workspaces::manager_t> terra_workspace_manager;  ///< Persistent workspaces-v1 lifecycle manager.
 #ifdef _WIN32
   std::unique_ptr<terra_virtual_display::manager_t> terra_virtual_display_manager;  ///< MttVDD virtual-display lifecycle manager.
   std::unique_ptr<terra_sandboxes::manager_t> terra_sandbox_manager;  ///< Persistent sandboxes-v1 lifecycle manager.
-  void revoke_terra_profiles(const std::string &owner, const std::optional<terra_api::client_permissions_t> &permissions = std::nullopt);
-  void revoke_terra_sandboxes(const std::string &owner);
-  void revoke_terra_workspaces(const std::string &owner);
+  bool revoke_terra_profiles(const std::string &owner, const std::optional<terra_api::client_permissions_t> &permissions = std::nullopt);
+  bool revoke_terra_sandboxes(const std::string &owner, const std::optional<terra_api::client_permissions_t> &permissions = std::nullopt);
+  bool revoke_terra_workspaces(const std::string &owner, const std::optional<terra_api::client_permissions_t> &permissions = std::nullopt);
   bool terra_workspace_visible(const verified_client_t &client, const terra_workspaces::resource_t &workspace, bool lifecycle);
+  bool terra_sandbox_visible(const verified_client_t &client, const terra_sandboxes::resource_t &sandbox);
 #endif
 
 #ifdef _WIN32
+  /**
+   * @brief Check that a JSON object contains no fields outside an allowlist.
+   *
+   * @param value JSON object to inspect.
+   * @param fields Allowed field names.
+   * @return `true` when every present field is allowed.
+   */
+  bool terra_fields_allowed(const nlohmann::json &value, const std::initializer_list<std::string_view> fields) {
+    return value.is_object() && std::ranges::all_of(value.items(), [&](const auto &item) {
+             return std::ranges::contains(fields, item.key());
+           });
+  }
+
   /**
    * @brief Process-lifetime revision state for physical display snapshots.
    */
@@ -302,19 +419,32 @@ namespace nvhttp {
    * @brief Process-lifetime revision state for the unified display inventory.
    */
   struct terra_unified_display_revision_t {
-    std::mutex mutex;  ///< Protects combined revision inputs.
-    std::pair<std::uint64_t, std::uint64_t> inputs {};  ///< Last observed physical and virtual revisions.
-    std::uint64_t revision = 0;  ///< Monotonic unified collection revision.
+    /** @brief One caller's direct-read and event publication state. */
+    struct projection_t {
+      std::string fingerprint;  ///< Last caller-visible inventory fingerprint.
+      std::uint64_t revision = 0;  ///< Current caller-visible collection revision.
+      std::uint64_t published_revision = 0;  ///< Last revision published through `displays.changed`.
+    };
+
+    std::mutex mutex;  ///< Protects caller projection state.
+    std::map<std::string, projection_t, std::less<>> projections;  ///< Projection state by caller UUID.
   } terra_unified_display_revision;  ///< Shared unified display revision state.
 
   /**
    * @brief Process-lifetime state for the display topology resource.
    */
   struct terra_topology_state_t {
-    std::mutex mutex;  ///< Protects fingerprint and revision.
-    std::string fingerprint;  ///< Canonical JSON fingerprint of last topology snapshot.
-    std::uint64_t revision = 0;  ///< Monotonic topology revision.
-  } terra_topology_state;  ///< Shared display topology revision state.
+    std::mutex mutex;  ///< Protects caller projection state.
+    std::map<std::string, std::pair<std::string, std::uint64_t>, std::less<>> projections;  ///< Fingerprint and monotonic revision by caller UUID.
+  } terra_topology_state;  ///< Caller-projected display topology revision state.
+
+  /**
+   * @brief Process-lifetime revision state for virtual-display list projections.
+   */
+  struct terra_virtual_display_revision_t {
+    std::mutex mutex;  ///< Protects caller projection state.
+    std::map<std::string, std::pair<std::string, std::uint64_t>, std::less<>> projections;  ///< Fingerprint and monotonic revision by caller UUID.
+  } terra_virtual_display_revision;  ///< Caller-projected virtual-display revision state.
 #endif
 
   /**
@@ -331,29 +461,69 @@ namespace nvhttp {
   using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SolHTTPS>::Request>;
 
   std::optional<std::string> terra_header(const req_https_t &request, std::string_view name);
+  void send_terra_error(const resp_https_t &response, SimpleWeb::StatusCode status, std::string_view code, std::string_view message, nlohmann::json details = {});
+  bool terra_require_canonical_uuid(const resp_https_t &response, std::string_view id, std::string_view resource_name);
   nlohmann::json terra_session_json(const rtsp_stream::session_info_t &session, const terra_session_tracking_t *tracking = nullptr);
+  std::string terra_operational_capabilities_csv();
+
+  /**
+   * @brief Convert current paired-client policy to profile actor context.
+   *
+   * @param client Current client identity and permissions.
+   * @return Profile manager actor.
+   */
+  terra::profiles::actor_t terra_profile_actor(const verified_client_t &client) {
+    return {
+      client.uuid,
+      {client.permissions.scopes.begin(), client.permissions.scopes.end()},
+      {client.permissions.allowed_apps.begin(), client.permissions.allowed_apps.end()},
+    };
+  }
+
   std::optional<terra_session_binding_t> terra_resolve_launch_references(const verified_client_t &client, const proc::ctx_t &app, const args_t &args, const terra_workspaces::resource_t *workspace, std::string_view *error_code, std::string &error_message);
+  std::optional<terra_session_tracking_t> terra_session_tracking_for(const std::string &session_id);
+  bool terra_apply_launch_profiles(const verified_client_t &client, const terra_session_binding_t &binding, rtsp_stream::launch_session_t &session, std::string &error_message);
+#ifdef _WIN32
+  bool terra_apply_launch_display_profile(const verified_client_t &client, const terra_session_binding_t &binding, rtsp_stream::launch_session_t &session, std::string &error_message);
+  bool terra_sandbox_launch_profile_supported(const terra::profiles::profile_t &profile, const std::string &app_uuid, const std::string &sandbox_profile_id);
+#endif
   bool terra_launch_direct_sandbox(const verified_client_t &client, const proc::ctx_t &app, terra_session_binding_t &binding, std::string &error_message);
-  void terra_destroy_sandbox_by_id(const std::string &sandbox_id);
-  void terra_destroy_session_sandbox(const terra_session_binding_t &binding);
+  bool terra_destroy_sandbox_by_id(const std::string &sandbox_id);
+  bool terra_destroy_session_sandbox(const terra_session_binding_t &binding);
   void terra_unregister_session(const std::string &session_id);
+  terra_operation_completion_t terra_mutate_session(const verified_client_t &client, const std::string &session_id, bool stop);
   bool terra_json_contains_string(const nlohmann::json &values, const std::string &value);
-  void publish_terra_sandbox_event(const std::string &type, const terra_sandboxes::resource_t &sandbox, nlohmann::json data, const std::string &owner);
-  void publish_terra_peripheral_event(const std::string &type, nlohmann::json data);
-  void terra_bump_peripheral_revision();
-  std::vector<rtsp_stream::session_info_t> terra_session_snapshots();
+  void publish_terra_sandbox_event(const std::string &type, const terra_sandboxes::resource_t &sandbox, nlohmann::json data, const std::string &owner, const std::optional<terra_sandboxes::resource_t> &previous = std::nullopt);
+  void publish_terra_peripheral_event(const std::string &type, nlohmann::json data, std::string_view owner_uuid);
+  void publish_terra_peripheral_claim_changes(const std::vector<terra_peripherals::claim_t> &claims);
+  void publish_terra_peripheral_owner_revocation(const terra_peripherals::owner_revocation_t &revoked);
+  void transition_terra_peripheral_target(const std::string &target_type, const std::string &target_id, bool release);
+  terra_peripherals::owner_revocation_t revoke_terra_peripheral_owner(const std::string &owner_uuid, const std::vector<std::string> &device_classes = {});
+  std::vector<terra_peripherals::claim_t> expire_terra_peripheral_credentials();
+  void terra_bump_peripheral_revision(std::string_view owner_uuid);
+  std::vector<rtsp_stream::session_info_t> terra_session_snapshots(bool include_retained = true);
+  std::optional<std::string> terra_session_display_id(const rtsp_stream::session_info_t &session, const terra_session_tracking_t *tracking);
+  std::vector<std::string> terra_session_peripheral_claim_ids(const rtsp_stream::session_info_t &session, const terra_session_tracking_t *tracking);
 #ifdef _WIN32
   std::optional<std::pair<std::uint64_t, nlohmann::json>> terra_display_snapshot();
+  bool terra_virtual_visible(const verified_client_t &client, const terra_virtual_display::resource_t &resource);
+  std::optional<terra_virtual_display::patch_t> terra_virtual_patch(const nlohmann::json &value);
 #endif
   nlohmann::json terra_telemetry_session_json(const rtsp_stream::session_info_t &session, const terra_session_tracking_t *tracking);
-  nlohmann::json terra_telemetry_document(const std::string &owner_filter = {});
+  nlohmann::json terra_telemetry_document(const verified_client_t *client = nullptr);
   void terra_patch_virtual_display(resp_https_t response, req_https_t request);
   std::optional<std::uint64_t> terra_if_match(const req_https_t &request);
+  std::optional<std::uint64_t> terra_require_if_match(const resp_https_t &response, const req_https_t &request, std::uint64_t current_revision, std::string_view resource_name);
   std::optional<nlohmann::json> terra_request_json(const resp_https_t &response, const req_https_t &request);
-  std::optional<std::pair<std::uint64_t, nlohmann::json>> terra_unified_displays();
-  nlohmann::json terra_topology_document(nlohmann::json displays);
+  std::optional<nlohmann::json> terra_empty_request_json(const resp_https_t &response, const req_https_t &request, std::string_view action_name);
+  bool terra_canonical_uuid(const std::string &value);
+  std::optional<std::pair<std::uint64_t, nlohmann::json>> terra_unified_displays(const verified_client_t *client = nullptr);
+  nlohmann::json terra_topology_document(nlohmann::json displays, const verified_client_t *client = nullptr);
   namespace asio = boost::asio;
   void terra_close_peripheral_channel(const std::string &claim_id);
+  void terra_close_target_channels(const std::string &target_type, const std::string &target_id);
+  void terra_close_owner_channels(const std::string &owner_uuid);
+  void terra_close_all_peripheral_channels();
   void terra_peripheral_channel_upgrade(std::unique_ptr<SolHTTPS> &socket, std::shared_ptr<SimpleWeb::ServerBase<SolHTTPS>::Request> request);
   /**
    * @brief Shared HTTP response object passed to redirect and discovery handlers.
@@ -411,23 +581,38 @@ namespace nvhttp {
    * @return Immutable identity snapshot, or no value after revocation or expiry.
    */
   std::optional<verified_client_t> verified_client(const req_https_t &request) {
-    std::optional<verified_client_t> result;
+    const auto connection = endpoint_key(request->remote_endpoint());
     std::string expired_owner;
     {
       std::lock_guard lock {client_auth_mutex};
-      const auto client = verified_clients.find(endpoint_key(request->remote_endpoint()));
+      const auto client = verified_clients.find(connection);
       if (client == verified_clients.end()) {
         return std::nullopt;
       }
-      if (permissions_expired(client->second.permissions)) {
-        expired_owner = client->second.uuid;
-        verified_clients.erase(client);
-      } else {
-        result = client->second;
+      if (!permissions_expired(client->second.permissions)) {
+        return client->second;
       }
+      expired_owner = client->second.uuid;
+    }
+    std::lock_guard client_mutation_lock {terra_client_mutation_mutex(expired_owner)};
+    std::lock_guard revocation_lock {terra_revocation_mutex};
+    {
+      std::lock_guard lock {client_auth_mutex};
+      const auto client = verified_clients.find(connection);
+      if (client == verified_clients.end()) {
+        return std::nullopt;
+      }
+      if (!permissions_expired(client->second.permissions)) {
+        return client->second;
+      }
+      verified_clients.erase(client);
     }
     if (!expired_owner.empty() && terra_event_hub) {
-      terra_event_hub->disconnect_client(expired_owner);
+      terra_event_hub->reset_client(expired_owner);
+    }
+    if (!expired_owner.empty() && terra_peripheral_manager) {
+      static_cast<void>(revoke_terra_peripheral_owner(expired_owner));
+      terra_close_owner_channels(expired_owner);
     }
 #ifdef _WIN32
     if (!expired_owner.empty() && terra_virtual_display_manager) {
@@ -439,7 +624,7 @@ namespace nvhttp {
       revoke_terra_workspaces(expired_owner);
     }
 #endif
-    return result;
+    return std::nullopt;
   }
 
   /**
@@ -519,6 +704,15 @@ namespace nvhttp {
       named_cert_nodes.push_back(std::make_pair(""s, named_cert_node));
     }
     root.add_child("root.named_devices"s, named_cert_nodes);
+    pt::ptree revocation_nodes;
+    for (const auto &[owner_uuid, pending] : client.pending_revocations) {
+      pt::ptree revocation_node;
+      revocation_node.put("uuid", owner_uuid);
+      revocation_node.put("domains", pending.domains);
+      revocation_node.put("generation", pending.generation);
+      revocation_nodes.push_back(std::make_pair(""s, revocation_node));
+    }
+    root.add_child("root.eclipse_pending_revocations"s, revocation_nodes);
 
     try {
       std::ostringstream serialized;
@@ -577,7 +771,7 @@ namespace nvhttp {
       if (!owner_uuid.empty() && client.uuid != owner_uuid && !client.permissions.scopes.contains("host.control")) {
         continue;
       }
-      if (std::ranges::any_of(app_uuids, [&](const auto &app_uuid) {
+      if (!(scope == "session.control" && client.permissions.scopes.contains("host.control")) && std::ranges::any_of(app_uuids, [&](const auto &app_uuid) {
             return !client.permissions.allowed_apps.empty() && !client.permissions.allowed_apps.contains(app_uuid);
           })) {
         continue;
@@ -588,22 +782,67 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Publish one event after applying current client policy projection.
-   *
+   * @brief Publish one event to an explicit caller projection.
    * @param event Event payload.
-   * @param scope Required event scope.
-   * @param owner_uuid Optional owner visibility restriction.
-   * @param app_uuids Associated application UUIDs.
+   * @param recipients Recipient client UUIDs.
    */
-  void publish_terra_event(terra_events::event_t event, const std::string_view scope = {}, const std::string_view owner_uuid = {}, const std::vector<std::string> &app_uuids = {}) {
+  void publish_terra_event_to(terra_events::event_t event, const std::vector<std::string> &recipients) {
     if (!terra_event_hub) {
       return;
     }
     try {
-      terra_event_hub->publish(std::move(event), terra_event_recipients(scope, owner_uuid, app_uuids));
+      terra_event_hub->publish(std::move(event), recipients);
     } catch (const std::exception &exception) {
       BOOST_LOG(error) << "Terra event publication failed: " << exception.what();
     }
+  }
+
+  /**
+   * @brief Contain event projection failures so committed mutations still complete.
+   * @tparam Projection Callable projection type.
+   * @param domain Domain name used for diagnostics.
+   * @param projection Projection and publication work.
+   */
+  template<class Projection>
+  void publish_terra_projection(const std::string_view domain, Projection projection) {
+    try {
+      std::invoke(std::move(projection));
+    } catch (const std::exception &exception) {
+      BOOST_LOG(error) << "Terra " << domain << " event projection failed: " << exception.what();
+    }
+  }
+
+  /**
+   * @brief Publish one event after applying current client policy projection.
+   * @param event Event payload.
+   * @param scope Required event scope.
+   * @param owner_uuid Optional resource owner restriction.
+   * @param app_uuids Application associations subject to caller allowlists.
+   */
+  void publish_terra_event(terra_events::event_t event, const std::string_view scope = {}, const std::string_view owner_uuid = {}, const std::vector<std::string> &app_uuids = {}) {
+    publish_terra_event_to(std::move(event), terra_event_recipients(scope, owner_uuid, app_uuids));
+  }
+
+  /**
+   * @brief Publish a removal tombstone to clients excluded by a visibility-changing mutation.
+   * @param type Removal event type.
+   * @param resource_id Removed resource UUID.
+   * @param revision Last resource revision visible to removed recipients.
+   * @param previous_recipients Recipients before mutation.
+   * @param current_recipients Recipients after mutation.
+   */
+  void publish_terra_visibility_loss(const std::string_view type, const std::string &resource_id, const std::uint64_t revision, const std::vector<std::string> &previous_recipients, const std::vector<std::string> &current_recipients) {
+    if (!terra_event_hub) {
+      return;
+    }
+    std::vector<std::string> removed;
+    std::ranges::copy_if(previous_recipients, std::back_inserter(removed), [&](const auto &recipient) {
+      return !std::ranges::contains(current_recipients, recipient);
+    });
+    if (removed.empty()) {
+      return;
+    }
+    publish_terra_event_to({std::string {type}, resource_id, revision, {{"id", resource_id}, {"revision", revision}}}, removed);
   }
 
   /**
@@ -630,6 +869,9 @@ namespace nvhttp {
     }
     if (action.starts_with("peripheral.")) {
       return "peripheral.forward";
+    }
+    if (action.starts_with("session.")) {
+      return "session.control";
     }
     if (action.starts_with("display.")) {
       return "display.manage";
@@ -790,6 +1032,21 @@ namespace nvhttp {
           }
         }
         client.named_devices.emplace_back(named_cert);
+      }
+    }
+    if (const auto pending = root.get_child_optional("eclipse_pending_revocations")) {
+      for (const auto &[_, entry] : *pending) {
+        auto owner_uuid = entry.get<std::string>("uuid", "");
+        std::ranges::transform(owner_uuid, owner_uuid.begin(), [](const unsigned char character) {
+          return static_cast<char>(std::tolower(character));
+        });
+        if (uuid_util::is_valid(owner_uuid)) {
+          const auto legacy_full_identity = entry.get_optional<bool>("full_identity");
+          client.pending_revocations[std::move(owner_uuid)] = {
+            entry.get<std::uint32_t>("domains", legacy_full_identity && !*legacy_full_identity ? TERRA_REVOCATION_DOMAINS : TERRA_FULL_REVOCATION),
+            entry.get<std::uint64_t>("generation", 1),
+          };
+        }
       }
     }
 
@@ -1066,6 +1323,7 @@ namespace nvhttp {
         .name = sess->async_insert_pin.device_name,
         .address = sess->async_insert_pin.address,
         .platform = sess->client.platform,
+        .explicit_policy = sess->client.requested_terra_permissions,
         .requested_scopes = std::move(requested_scopes),
         .requested_inputs = std::move(requested_inputs),
       });
@@ -1362,6 +1620,39 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Determine whether a request path belongs to Terra API namespace.
+   *
+   * @param path Absolute HTTP request path.
+   * @return True for API root or descendants, excluding prefix lookalikes.
+   */
+  bool terra_api_path(const std::string_view path) {
+    return path == "/eclipse/v1" || path.starts_with("/eclipse/v1/");
+  }
+
+  /**
+   * @brief Return protocol-appropriate fallback error for an HTTPS request.
+   *
+   * @param server HTTPS server containing registered route patterns.
+   * @param response HTTPS response object.
+   * @param request Unmatched HTTPS request.
+   */
+  void terra_or_legacy_not_found(const https_server_t &server, const resp_https_t &response, const req_https_t &request) {
+    if (!terra_api_path(request->path)) {
+      not_found<SolHTTPS>(response, request);
+      return;
+    }
+    const bool known_path = std::ranges::any_of(server.resource, [&](const auto &route) {
+      SimpleWeb::regex::smatch match;
+      return SimpleWeb::regex::regex_match(request->path, match, route.first);
+    });
+    if (known_path) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_method_not_allowed, "method_not_allowed", "HTTP method is not supported for this Terra resource");
+    } else {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "route_not_found", "Terra route does not exist");
+    }
+  }
+
+  /**
    * @brief Dispatch the top-level GameStream pairing request by phase.
    *
    * @param response HTTP response object to populate.
@@ -1612,7 +1903,7 @@ namespace nvhttp {
         tree.put("root.mac", mac_address);
       }
       tree.put("root.EclipseApiVersion", terra_api::API_VERSION);
-      tree.put("root.EclipseCapabilities", terra_api::capabilities_csv());
+      tree.put("root.EclipseCapabilities", terra_operational_capabilities_csv());
       tree.put("root.EclipseApiPort", net::map_port(PORT_HTTPS));
     } else {
       tree.put("root.mac", "00:00:00:00:00:00");
@@ -1811,23 +2102,8 @@ namespace nvhttp {
       return;
     }
 
-    constexpr std::array terra_resource_arguments {
-      "eclipseDisplayProfileId",
-      "eclipseStreamProfileId",
-      "eclipseLaunchProfileId",
-      "eclipseSandboxProfileId",
-    };
-    if (terra_v1 && std::ranges::any_of(terra_resource_arguments, [&](const auto argument) {
-          return !get_arg(args, argument, "").empty();
-        })) {
-      tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 503);
-      tree.put("root.<xmlattr>.status_message", "Requested Terra resource provider is unavailable");
-      return;
-    }
-
-#ifdef _WIN32
     std::optional<terra_workspaces::resource_t> terra_workspace;
+#ifdef _WIN32
     if (terra_v1) {
       const auto workspace_id = get_arg(args, "eclipseWorkspaceId", "");
       if (!workspace_id.empty()) {
@@ -1847,8 +2123,8 @@ namespace nvhttp {
 #ifdef _WIN32
     application_prelaunched = terra_workspace && terra_workspace->sandbox_id.has_value();
 #endif
-    auto current_appid = proc::proc.running();
-    if (current_appid > 0) {
+    std::lock_guard runtime_lock {proc::runtime_mutex()};
+    if (proc::runtime_running()) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message", "An app is already running on this host");
@@ -1861,6 +2137,12 @@ namespace nvhttp {
 
     terra_session_binding_t binding;
     if (terra_v1) {
+      if (app == catalog.apps.end()) {
+        tree.put("root.gamesession", 0);
+        tree.put("root.<xmlattr>.status_code", 404);
+        tree.put("root.<xmlattr>.status_message", "Application does not exist");
+        return;
+      }
       std::string_view reference_error_code = "invalid_argument";
       std::string reference_error_message;
       const auto resolved = terra_resolve_launch_references(*client, *app, args, terra_workspace ? &*terra_workspace : nullptr, &reference_error_code, reference_error_message);
@@ -1873,6 +2155,13 @@ namespace nvhttp {
         return;
       }
       binding = *resolved;
+      if (!terra_apply_launch_profiles(*client, binding, *launch_session, reference_error_message)) {
+        tree.put("root.gamesession", 0);
+        tree.put("root.<xmlattr>.status_code", 422);
+        tree.put("root.<xmlattr>.status_message", reference_error_message);
+        return;
+      }
+      host_audio = launch_session->host_audio;
       std::string sandbox_error;
       if (!terra_workspace && !terra_launch_direct_sandbox(*client, *app, binding, sandbox_error)) {
         tree.put("root.gamesession", 0);
@@ -1892,7 +2181,21 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
+#ifdef _WIN32
+      std::string display_error;
+      if (terra_v1 && !terra_apply_launch_display_profile(*client, binding, *launch_session, display_error)) {
+        tree.put("root.<xmlattr>.status_code", 422);
+        tree.put("root.<xmlattr>.status_message", display_error);
+        tree.put("root.gamesession", 0);
+        terra_destroy_session_sandbox(binding);
+        return;
+      }
+      if (!terra_v1 || (binding.display_profile_id.empty() && !binding.display_configuration)) {
+        display_device::configure_display(config::video, *launch_session);
+      }
+#else
       display_device::configure_display(config::video, *launch_session);
+#endif
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1907,6 +2210,16 @@ namespace nvhttp {
         }
 
         return;
+      }
+      if (terra_v1) {
+        std::string profile_error;
+        if (!terra_apply_launch_profiles(*client, binding, *launch_session, profile_error)) {
+          tree.put("root.<xmlattr>.status_code", 422);
+          tree.put("root.<xmlattr>.status_message", profile_error);
+          tree.put("root.gamesession", 0);
+          terra_destroy_session_sandbox(binding);
+          return;
+        }
       }
     }
 
@@ -1976,9 +2289,11 @@ namespace nvhttp {
     }
 #endif
 
+    nlohmann::json created_resource;
+    std::unique_lock<std::mutex> session_event_lock;
     if (terra_v1) {
       const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-      nlohmann::json created_resource;
+      session_event_lock = std::unique_lock {terra_session_event_mutex};
       {
         std::lock_guard lock {terra_session_tracking_mutex};
         auto &entry = terra_session_tracking[launch_session->session_id];
@@ -1992,23 +2307,22 @@ namespace nvhttp {
           entry.announced = true;
           ++terra_session_collection_revision;
         }
-        created_resource = terra_session_json(
-          {
-            .id = launch_session->session_id,
-            .client_uuid = client->uuid,
-            .app_uuid = launch_session->app_uuid,
-            .legacy_app_id = launch_session->appid,
-            .state = "preparing",
-            .started_at = std::chrono::system_clock::now(),
-            .width = launch_session->width,
-            .height = launch_session->height,
-            .fps = launch_session->fps,
-            .hdr = launch_session->enable_hdr,
-          },
-          &entry
-        );
+        const rtsp_stream::session_info_t preparing {
+          .id = launch_session->session_id,
+          .client_uuid = client->uuid,
+          .app_uuid = launch_session->app_uuid,
+          .legacy_app_id = launch_session->appid,
+          .state = "preparing",
+          .started_at = std::chrono::system_clock::now(),
+          .width = launch_session->width,
+          .height = launch_session->height,
+          .fps = launch_session->fps,
+          .hdr = launch_session->enable_hdr,
+        };
+        entry.display_id = terra_session_display_id(preparing, &entry);
+        entry.peripheral_claim_ids = terra_session_peripheral_claim_ids(preparing, &entry);
+        created_resource = terra_session_json(preparing, &entry);
       }
-      publish_terra_event({"session.created", launch_session->session_id, 1, std::move(created_resource)}, "session.control", client->uuid, {launch_session->app_uuid});
     }
     if (!rtsp_stream::launch_session_raise(launch_session)) {
       tree.put("root.resume", 0);
@@ -2032,6 +2346,10 @@ namespace nvhttp {
       }
 #endif
       return;
+    }
+    if (terra_v1) {
+      publish_terra_event({"session.created", launch_session->session_id, 1, std::move(created_resource)}, "session.control", client->uuid, {launch_session->app_uuid});
+      session_event_lock.unlock();
     }
 
     tree.put("root.<xmlattr>.status_code", 200);
@@ -2064,6 +2382,7 @@ namespace nvhttp {
     print_req<SolHTTPS>(request);
 
     pt::ptree tree;
+    bool revert_display_configuration {false};
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -2074,6 +2393,9 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
+      if (revert_display_configuration) {
+        display_device::revert_configuration();
+      }
     });
 
     const auto client = verified_client(request);
@@ -2084,8 +2406,8 @@ namespace nvhttp {
       return;
     }
 
-    auto current_appid = proc::proc.running();
-    if (current_appid == 0) {
+    const auto current_appid = proc::proc.running();
+    if (current_appid == 0 && !proc::runtime_running()) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 503);
       tree.put("root.<xmlattr>.status_message", "No running app to resume");
@@ -2136,12 +2458,33 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "Client certificate is not allowed to resume this application");
       return;
     }
+    const auto tracking = logical_session_id.empty() ? std::nullopt : terra_session_tracking_for(logical_session_id);
+    if (tracking && !tracking->binding.launch_profile_id.empty()) {
+      const auto profile = terra_profile_manager ? terra_profile_manager->get(terra_profile_actor(*client), tracking->binding.launch_profile_id).profile : std::nullopt;
+      if (!profile || profile->configuration.at("resumePolicy") == "deny") {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 409);
+        tree.put("root.<xmlattr>.status_message", "Launch profile does not permit session resume");
+        return;
+      }
+    }
     const auto launch_session = make_launch_session(host_audio, args, *client, std::move(logical_session_id));
     if (!logical_app_uuid.empty()) {
       launch_session->app_uuid = std::move(logical_app_uuid);
     }
     if (!logical_client_uuid.empty()) {
       launch_session->client_uuid = std::move(logical_client_uuid);
+    }
+    if (tracking) {
+      launch_session->telemetry_generation = tracking->retained_snapshot ? tracking->retained_snapshot->telemetry_generation + 1 : 2;
+      std::string profile_error;
+      if (!terra_apply_launch_profiles(*client, tracking->binding, *launch_session, profile_error)) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 422);
+        tree.put("root.<xmlattr>.status_message", profile_error);
+        return;
+      }
+      host_audio = launch_session->host_audio;
     }
     {
       std::lock_guard lock {logical_session_mutex};
@@ -2161,10 +2504,24 @@ namespace nvhttp {
     }
 
     if (no_active_sessions) {
+      revert_display_configuration = true;
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
+#ifdef _WIN32
+      std::string display_error;
+      if (tracking && !terra_apply_launch_display_profile(*client, tracking->binding, *launch_session, display_error)) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 422);
+        tree.put("root.<xmlattr>.status_message", display_error);
+        return;
+      }
+      if (!tracking || (tracking->binding.display_profile_id.empty() && !tracking->binding.display_configuration)) {
+        display_device::configure_display(config::video, *launch_session);
+      }
+#else
       display_device::configure_display(config::video, *launch_session);
+#endif
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -2176,6 +2533,15 @@ namespace nvhttp {
         tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");
 
         return;
+      }
+      if (tracking) {
+        std::string profile_error;
+        if (!terra_apply_launch_profiles(*client, tracking->binding, *launch_session, profile_error)) {
+          tree.put("root.resume", 0);
+          tree.put("root.<xmlattr>.status_code", 422);
+          tree.put("root.<xmlattr>.status_message", profile_error);
+          return;
+        }
       }
     }
 
@@ -2196,6 +2562,7 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "Another stream launch is already pending");
       return;
     }
+    revert_display_configuration = false;
 
     tree.put("root.<xmlattr>.status_code", 200);
     tree.put(
@@ -2236,6 +2603,23 @@ namespace nvhttp {
       tree.put("root.cancel", 0);
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "Client certificate lacks host.control permission");
+      return;
+    }
+
+    std::string terra_session_id;
+    {
+      std::lock_guard lock {logical_session_mutex};
+      if (logical_session) {
+        terra_session_id = logical_session->id;
+      }
+    }
+    if (!terra_session_id.empty() && !terra_session_tracking_for(terra_session_id)) {
+      terra_session_id.clear();
+    }
+    if (!terra_session_id.empty() && !terra_mutate_session(*client, terra_session_id, true).succeeded) {
+      tree.put("root.cancel", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Application resources could not be stopped");
       return;
     }
 
@@ -2281,6 +2665,52 @@ namespace nvhttp {
     response->close_connection_after_response = true;
   }
 
+  /** @brief Request-local context for structured Terra mutation auditing. */
+  struct terra_mutation_audit_context_t {
+    std::string client_uuid;  ///< Authenticated client UUID, or empty before authentication.
+    std::string action;  ///< HTTP method and resource path.
+    std::optional<std::string> target_uuid;  ///< Route target UUID when present.
+    bool recorded {};  ///< Whether response outcome was already recorded.
+  };
+
+  thread_local std::optional<terra_mutation_audit_context_t> terra_mutation_audit_context;  ///< Mutation currently executing on this request thread.
+
+  /** @brief Write one structured mutation audit record. */
+  void audit_terra_mutation(const std::string_view client_uuid, const std::string_view action, const std::optional<std::string> &target_uuid, const std::string_view result, const std::optional<int> http_status = std::nullopt) {
+    const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    BOOST_LOG(info) << "Audit: " << nlohmann::json({{"clientUuid", client_uuid.empty() ? nlohmann::json(nullptr) : nlohmann::json(client_uuid)}, {"action", action}, {"targetUuid", target_uuid ? nlohmann::json(*target_uuid) : nlohmann::json(nullptr)}, {"result", result}, {"httpStatus", http_status ? nlohmann::json(*http_status) : nlohmann::json(nullptr)}, {"timestamp", timestamp}}).dump();
+  }
+
+  /** @brief Begin request-local auditing when request mutates Terra state. */
+  void begin_terra_mutation_audit(const req_https_t &request) {
+    terra_mutation_audit_context.reset();
+    if (request->method != "POST" && request->method != "PUT" && request->method != "PATCH" && request->method != "DELETE") {
+      return;
+    }
+    terra_mutation_audit_context = terra_mutation_audit_context_t {
+      .client_uuid = {},
+      .action = std::format("{} {}", request->method, request->path),
+      .target_uuid = request->path_match.size() > 1 ? std::optional<std::string> {request->path_match[1].str()} : std::nullopt,
+    };
+  }
+
+  /**
+   * @brief Wrap one Terra mutation handler in request-local audit scope.
+   * @tparam Handler HTTPS route handler type.
+   * @param handler Route handler.
+   * @return Wrapped route handler.
+   */
+  template<class Handler>
+  auto audited_terra_mutation(Handler handler) {
+    return [handler = std::move(handler)](const resp_https_t &response, const req_https_t &request) mutable {
+      begin_terra_mutation_audit(request);
+      auto cleanup = util::fail_guard([]() {
+        terra_mutation_audit_context.reset();
+      });
+      std::invoke(handler, response, request);
+    };
+  }
+
   /**
    * @brief Send a versioned Terra JSON response.
    *
@@ -2289,6 +2719,13 @@ namespace nvhttp {
    * @param body JSON response body.
    */
   void send_terra_response(const resp_https_t &response, const SimpleWeb::StatusCode status, nlohmann::json body) {
+    if (terra_mutation_audit_context && !terra_mutation_audit_context->recorded) {
+      const auto error = body.find("error");
+      const auto result = error != body.end() && error->is_object() ? error->value("code", "error") : status == SimpleWeb::StatusCode::success_accepted ? "accepted" :
+                                                                                                                                                          "success";
+      audit_terra_mutation(terra_mutation_audit_context->client_uuid, terra_mutation_audit_context->action, terra_mutation_audit_context->target_uuid, result, static_cast<int>(status));
+      terra_mutation_audit_context->recorded = true;
+    }
     body["schemaVersion"] = terra_api::API_VERSION;
     const SimpleWeb::CaseInsensitiveMultimap headers {
       {"Content-Type", "application/json"},
@@ -2306,7 +2743,7 @@ namespace nvhttp {
    * @param code Stable machine-readable error code.
    * @param message Human-readable error description.
    */
-  void send_terra_error(const resp_https_t &response, const SimpleWeb::StatusCode status, const std::string_view code, const std::string_view message, nlohmann::json details = {}) {
+  void send_terra_error(const resp_https_t &response, const SimpleWeb::StatusCode status, const std::string_view code, const std::string_view message, nlohmann::json details) {
     nlohmann::json error {
       {"code", code},
       {"message", message},
@@ -2315,8 +2752,8 @@ namespace nvhttp {
       error["details"] = std::move(details);
     }
     send_terra_response(response, status, {
-                                              {"error", std::move(error)},
-                                            });
+                                            {"error", std::move(error)},
+                                          });
   }
 
   /**
@@ -2332,6 +2769,9 @@ namespace nvhttp {
     if (!client) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_unauthorized, "authentication_required", "Reconnect using an enabled paired client certificate");
       return std::nullopt;
+    }
+    if (terra_mutation_audit_context) {
+      terra_mutation_audit_context->client_uuid = client->uuid;
     }
     if (!scope.empty() && !scope_allowed(*client, scope)) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", std::format("Client certificate lacks {} permission", scope));
@@ -2448,6 +2888,96 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Explain first unavailable provider required by workspace orchestration.
+   *
+   * @return Empty text when every workspace dependency is operational.
+   */
+  std::string_view terra_workspace_unavailable_reason() {
+#ifdef _WIN32
+    if (!terra_operation_store || !terra_operation_store->available()) {
+      return "Operation persistence manager is unavailable";
+    }
+    if (!terra_workspace_manager || !terra_workspace_manager->available()) {
+      return "Workspace persistence manager is unavailable";
+    }
+    if (!terra_profile_manager || terra_profile_manager->availability() != terra::profiles::status_t::success) {
+      return "Profile persistence manager is unavailable";
+    }
+    if (!terra_virtual_display_manager || !terra_virtual_display_manager->available()) {
+      return "Virtual display manager is unavailable";
+    }
+    if (!terra_sandbox_manager || !terra_sandbox_manager->available() || !terra::windows::sandbox::health().available) {
+      return "Sandbox provider is unavailable";
+    }
+    if (!terra_peripheral_manager) {
+      return "Peripheral forwarding manager is unavailable";
+    }
+    if (!terra_display_snapshot()) {
+      return "Windows display inventory is unavailable";
+    }
+    return {};
+#else
+    return "Workspace orchestration is unavailable on this platform";
+#endif
+  }
+
+  /**
+   * @brief Return capabilities backed by currently operational managers and providers.
+   *
+   * @param discovery_available Whether local DNS-SD discovery is operational.
+   * @return Capability names in stable protocol order.
+   */
+  std::vector<std::string_view> terra_operational_capabilities(const bool discovery_available) {
+    std::vector<std::string_view> capabilities {terra_api::CAPABILITIES.begin(), terra_api::CAPABILITIES.end()};
+    if (terra_event_hub) {
+      capabilities.emplace_back("events-v1");
+    }
+    capabilities.emplace_back("telemetry-v1");
+#ifdef _WIN32
+    if (terra_operation_store && terra_operation_store->available() && terra_profile_manager && terra_profile_manager->availability() == terra::profiles::status_t::success) {
+      capabilities.emplace_back("profiles-v1");
+    }
+    if (terra_workspace_unavailable_reason().empty()) {
+      capabilities.emplace_back("workspaces-v1");
+    }
+    if (terra_operation_store && terra_operation_store->available() && terra_sandbox_manager && terra_sandbox_manager->available() && terra::windows::sandbox::health().available) {
+      capabilities.emplace_back("sandboxes-v1");
+    }
+    if (terra_operation_store && terra_operation_store->available() && terra_virtual_display_manager && terra_virtual_display_manager->available()) {
+      capabilities.emplace_back("virtual-displays-v1");
+    }
+#endif
+    if (terra_operation_store && terra_operation_store->available() && terra_peripheral_manager) {
+      capabilities.emplace_back("peripherals-v1");
+    }
+#ifdef _WIN32
+    if (terra_display_snapshot()) {
+      capabilities.emplace_back("displays-v1");
+    }
+#endif
+    if (discovery_available) {
+      capabilities.emplace_back("discovery-v1");
+    }
+    return capabilities;
+  }
+
+  /**
+   * @brief Serialize operational capabilities for authenticated server information.
+   *
+   * @return Comma-separated capability names in protocol order.
+   */
+  std::string terra_operational_capabilities_csv() {
+    std::string result;
+    for (const auto capability : terra_operational_capabilities(platf::publish::health().available)) {
+      if (!result.empty()) {
+        result += ',';
+      }
+      result += capability;
+    }
+    return result;
+  }
+
+  /**
    * @brief Build authenticated Terra capability and discovery metadata.
    *
    * @param client_uuid Stable paired-client UUID.
@@ -2474,44 +3004,100 @@ namespace nvhttp {
     const std::string_view host_version,
     const bool wake_available
   ) {
+    const auto discovery_health = platf::publish::health();
+    const auto operational_capabilities = terra_operational_capabilities(discovery_health.available);
+    const bool operations_available = terra_operation_store && terra_operation_store->available();
     nlohmann::json capabilities = nlohmann::json::array();
-    for (const auto capability : terra_api::CAPABILITIES) {
+    for (const auto capability : operational_capabilities) {
       capabilities.emplace_back(capability);
     }
 
     nlohmann::json features = nlohmann::json::object();
     for (const auto capability : terra_api::KNOWN_CAPABILITIES) {
-      const bool available = std::ranges::find(terra_api::CAPABILITIES, capability) != terra_api::CAPABILITIES.end();
+      const bool available = std::ranges::find(operational_capabilities, capability) != operational_capabilities.end();
       features[capability] = {{"available", available}};
       if (!available) {
         features[capability]["reasonCode"] = "not_implemented";
         features[capability]["reason"] = "Capability is not implemented by this Sol build";
       }
     }
+    features["discovery-v1"] = {
+      {"available", discovery_health.available},
+      {"protocol", "dns-sd"},
+      {"protocolVersion", 1},
+      {"serviceType", std::format("{}.local", platf::SERVICE_TYPE)},
+      {"verificationPath", "/serverinfo"},
+    };
+    if (!discovery_health.available) {
+      features["discovery-v1"]["reasonCode"] = discovery_health.reason_code;
+      features["discovery-v1"]["reason"] = discovery_health.reason;
+    }
+    if (!terra_event_hub) {
+      features["events-v1"]["reasonCode"] = "provider_unavailable";
+      features["events-v1"]["reason"] = "Event journal failed to start";
+    }
 #ifdef _WIN32
-    const auto sandbox_health = terra::windows::sandbox::health();
-    if (sandbox_health.available) {
-      capabilities.emplace_back("sandboxes-v1");
+    if (!operations_available || !terra_profile_manager || terra_profile_manager->availability() != terra::profiles::status_t::success) {
+      features["profiles-v1"]["reasonCode"] = "provider_unavailable";
+      features["profiles-v1"]["reason"] = operations_available ? "Profile persistence manager is unavailable" : "Operation persistence manager is unavailable";
+    }
+    if (const auto reason = terra_workspace_unavailable_reason(); !reason.empty()) {
+      features["workspaces-v1"]["reasonCode"] = "provider_unavailable";
+      features["workspaces-v1"]["reason"] = reason;
+    }
+    if (std::ranges::find(operational_capabilities, "sandboxes-v1") != operational_capabilities.end()) {
       features["sandboxes-v1"] = {{"available", true}};
+    } else if (!operations_available) {
+      features["sandboxes-v1"]["reasonCode"] = "provider_unavailable";
+      features["sandboxes-v1"]["reason"] = "Operation persistence manager is unavailable";
     } else {
+      const auto sandbox_health = terra::windows::sandbox::health();
       features["sandboxes-v1"]["reasonCode"] = sandbox_health.reason_code;
       features["sandboxes-v1"]["reason"] = sandbox_health.reason;
     }
 #endif
-    if (terra_peripheral_manager) {
-      capabilities.emplace_back("peripherals-v1");
-      features["peripherals-v1"] = {{"available", true}};
+    if (operations_available && terra_peripheral_manager) {
+      features["peripherals-v1"] = {
+        {"available", true},
+        {"classes", terra_peripherals::SUPPORTED_CLASSES},
+        {"capabilities", terra_peripherals::SUPPORTED_CAPABILITIES},
+        {"protocol", "eclipse-peripheral-json"},
+        {"protocolVersion", 1},
+      };
     } else {
       features["peripherals-v1"]["reasonCode"] = "provider_unavailable";
-      features["peripherals-v1"]["reason"] = "Peripheral forwarding manager failed to start";
+      features["peripherals-v1"]["reason"] = operations_available ? "Peripheral forwarding manager failed to start" : "Operation persistence manager is unavailable";
     }
 #ifdef _WIN32
-    capabilities.emplace_back("displays-v1");
-    features["displays-v1"] = {{"available", true}};
+    if (std::ranges::find(operational_capabilities, "displays-v1") == operational_capabilities.end()) {
+      features["displays-v1"]["reasonCode"] = "provider_unavailable";
+      features["displays-v1"]["reason"] = "Windows display inventory is unavailable";
+    }
+    if (operations_available && terra_virtual_display_manager && terra_virtual_display_manager->available()) {
+      features["virtual-displays-v1"] = {{"available", true}};
+    } else {
+      features["virtual-displays-v1"]["reasonCode"] = "provider_unavailable";
+      features["virtual-displays-v1"]["reason"] = operations_available ? "MttVDD virtual display manager is unavailable" : "Operation persistence manager is unavailable";
+    }
 #endif
 
     const bool sandboxes_operational = features.value("sandboxes-v1", nlohmann::json::object()).value("available", false);
-    const bool peripherals_operational = terra_peripheral_manager != nullptr;
+    const bool peripherals_operational = features.value("peripherals-v1", nlohmann::json::object()).value("available", false);
+    const bool virtual_displays_operational = features.value("virtual-displays-v1", nlohmann::json::object()).value("available", false);
+    const bool displays_operational = features.value("displays-v1", nlohmann::json::object()).value("available", false);
+    const bool workspaces_operational = features.value("workspaces-v1", nlohmann::json::object()).value("available", false);
+    std::uint32_t virtual_display_limit = 0;
+    std::uint32_t display_limit = 0;
+#ifdef _WIN32
+    if (virtual_displays_operational && terra_virtual_display_manager && terra_virtual_display_manager->available()) {
+      virtual_display_limit = terra_virtual_display_manager->max_active();
+    }
+    if (displays_operational) {
+      if (const auto displays = terra_display_snapshot()) {
+        display_limit = static_cast<std::uint32_t>(displays->second.size());
+      }
+    }
+#endif
     return {
       {"apiVersion", terra_api::API_VERSION},
       {"capabilities", std::move(capabilities)},
@@ -2532,15 +3118,15 @@ namespace nvhttp {
       {"features", std::move(features)},
       {"limits", {
                    {"sessions", {{"maxActive", 1}}},
-                   {"displays", {{"maxManaged", 0}}},
-                   {"virtualDisplays", {{"maxActive", 0}}},
-                   {"workspaces", {{"maxActive", 1}}},
-                   {"sandboxes", {{"maxActive", sandboxes_operational ? 4 : 0}}},
+                   {"displays", {{"maxManaged", display_limit}}},
+                   {"virtualDisplays", {{"maxActive", virtual_display_limit}}},
+                   {"workspaces", {{"maxActive", workspaces_operational ? 1 : 0}}},
+                   {"sandboxes", {{"maxActive", sandboxes_operational ? nlohmann::json(nullptr) : nlohmann::json(0)}}},
                    {"peripherals", {
-                                     {"maxDevices", peripherals_operational ? 32 : 0},
-                                     {"maxClaims", peripherals_operational ? 32 : 0},
-                                     {"maxMessageBytes", peripherals_operational ? 65536 : 0},
-                                     {"maxPayloadBytes", peripherals_operational ? 49152 : 0},
+                                     {"maxDevices", peripherals_operational ? terra_peripherals::MAX_DEVICES : 0},
+                                     {"maxClaims", peripherals_operational ? terra_peripherals::MAX_CLAIMS : 0},
+                                     {"maxMessageBytes", peripherals_operational ? terra_peripherals::MAX_MESSAGE_BYTES : 0},
+                                     {"maxPayloadBytes", peripherals_operational ? terra_peripherals::MAX_PAYLOAD_BYTES : 0},
                                    }},
                  }},
     };
@@ -2550,9 +3136,10 @@ namespace nvhttp {
    * @brief Convert configured application metadata to Terra Catalog V2 JSON.
    *
    * @param app Runtime application context.
+   * @param client Optional caller used to resolve readable profile references.
    * @return Stable application resource.
    */
-  nlohmann::json terra_app_json(const proc::ctx_t &app) {
+  nlohmann::json terra_app_json(const proc::ctx_t &app, const verified_client_t *client = nullptr) {
     const auto &metadata = app.terra_metadata;
     const auto kind = metadata.value("kind", "unknown");
     static const std::set<std::string, std::less<>> kinds {"game", "desktop", "tool", "workspace", "unknown"};
@@ -2585,6 +3172,14 @@ namespace nvhttp {
     };
     static const std::set<std::string, std::less<>> input_classes {"keyboard", "mouse", "controller", "touch", "pen"};
 
+    const auto readable_profile = [&](const std::string &id, const std::string_view type) -> std::optional<terra::profiles::profile_t> {
+      if (!client || !terra_profile_manager || !terra_canonical_uuid(id)) {
+        return std::nullopt;
+      }
+      const auto result = terra_profile_manager->get(terra_profile_actor(*client), id);
+      return result.profile && result.profile->type == type ? result.profile : std::nullopt;
+    };
+
     nlohmann::json launch_profiles = nlohmann::json::array();
     std::set<std::string, std::less<>> launch_profile_ids;
     bool has_default_launch_profile = false;
@@ -2593,13 +3188,23 @@ namespace nvhttp {
         const auto id = profile.at("id").get<std::string>();
         const auto name = profile.at("name").get<std::string>();
         const auto is_default = profile.at("default").get<bool>();
-        if (!profile.is_object() || !uuid_util::is_valid(id) || name.empty() || !launch_profile_ids.emplace(id).second || (is_default && has_default_launch_profile)) {
+        const auto stored = readable_profile(id, "launch");
+        if (!profile.is_object() || !uuid_util::is_valid(id) || name.empty() || (client && (!stored || stored->configuration.at("appUuid") != app.uuid)) || !launch_profile_ids.emplace(id).second || (is_default && has_default_launch_profile)) {
           continue;
         }
         has_default_launch_profile = has_default_launch_profile || is_default;
         launch_profiles.push_back({{"id", id}, {"name", name}, {"default", is_default}});
       } catch (const std::exception &) {}
     }
+
+    const auto resolve_reference = [&](const char *key, const std::string_view type) -> nlohmann::json {
+      const auto id = metadata.value(key, "");
+      const auto profile = readable_profile(id, type);
+      if (!profile || (type == "sandbox" && !terra_json_contains_string(profile->configuration.at("allowedAppUuids"), app.uuid))) {
+        return nullptr;
+      }
+      return id;
+    };
 
     nlohmann::json assets = nlohmann::json::object();
     const auto image_path = proc::validate_app_image_path(app.image_path);
@@ -2632,9 +3237,9 @@ namespace nvhttp {
       {"inputRequirements", unique_strings(metadata.value("inputRequirements", nlohmann::json::array()), &input_classes)},
       {"launchProfiles", std::move(launch_profiles)},
       {"assets", std::move(assets)},
-      {"displayProfileId", nullptr},
-      {"streamProfileId", nullptr},
-      {"sandboxProfileId", nullptr},
+      {"displayProfileId", resolve_reference("displayProfileId", "display")},
+      {"streamProfileId", resolve_reference("streamProfileId", "stream")},
+      {"sandboxProfileId", resolve_reference("sandboxProfileId", "sandbox")},
     };
   }
 
@@ -2651,9 +3256,12 @@ namespace nvhttp {
     }
     const auto app_uuid = request->path_match[1].str();
     const auto asset_id = request->path_match[2].str();
+    if (!terra_require_canonical_uuid(response, app_uuid, "Application")) {
+      return;
+    }
     const auto catalog = proc::catalog_snapshot();
     const auto app = std::ranges::find(catalog.apps, app_uuid, &proc::ctx_t::uuid);
-    if (!uuid_util::is_valid(app_uuid) || app == catalog.apps.end() || !app_allowed(*client, app_uuid)) {
+    if (app == catalog.apps.end() || !app_allowed(*client, app_uuid)) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "asset_not_found", "Asset does not exist or is not visible to this client");
       return;
     }
@@ -2669,7 +3277,7 @@ namespace nvhttp {
 
     std::ifstream stream {asset->path, std::ios::binary};
     if (!stream) {
-      send_terra_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, "host_failure", "Asset became unavailable while opening it");
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "asset_not_found", "Asset does not exist or is not visible to this client");
       return;
     }
     const SimpleWeb::CaseInsensitiveMultimap headers {
@@ -2714,6 +3322,79 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Resolve non-terminal peripheral claims associated with one session runtime.
+   *
+   * Session ownership filters claim visibility. Workspace and sandbox targets count
+   * when corresponding resources belong to session binding.
+   *
+   * @param session Session snapshot.
+   * @param tracking Published tracking state, or null for untracked legacy session.
+   * @return Sorted unique claim UUIDs.
+   */
+  std::vector<std::string> terra_session_peripheral_claim_ids(const rtsp_stream::session_info_t &session, const terra_session_tracking_t *tracking) {
+    std::vector<std::string> result;
+    if (!terra_peripheral_manager) {
+      return result;
+    }
+    for (const auto &claim : terra_peripheral_manager->list_claims(session.client_uuid)) {
+      const bool session_target = claim.target.type == "session" && claim.target.id == session.id;
+      const bool workspace_target = tracking && !tracking->binding.workspace_id.empty() && claim.target.type == "workspace" && claim.target.id == tracking->binding.workspace_id;
+      const bool sandbox_target = tracking && !tracking->binding.sandbox_id.empty() && claim.target.type == "sandbox" && claim.target.id == tracking->binding.sandbox_id;
+      if (claim.state != terra_peripherals::claim_state_t::released && (session_target || workspace_target || sandbox_target)) {
+        result.push_back(claim.id);
+      }
+    }
+    std::ranges::sort(result);
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+  }
+
+  /**
+   * @brief Resolve display resource associated with one session runtime.
+   *
+   * @param session Session snapshot.
+   * @param tracking Published tracking state, or null for an untracked legacy session.
+   * @return Direct virtual, workspace, or sandbox display UUID when available.
+   */
+  std::optional<std::string> terra_session_display_id(const rtsp_stream::session_info_t &session, const terra_session_tracking_t *tracking) {
+    if (tracking && (tracking->state == "stopped" || tracking->state == "failed")) {
+      return tracking->display_id;
+    }
+#ifdef _WIN32
+    if (terra_virtual_display_manager) {
+      for (const auto &display : terra_virtual_display_manager->list().resources) {
+        if (display.session_id == session.id) {
+          return display.id;
+        }
+      }
+    }
+#endif
+    if (tracking && !tracking->binding.workspace_id.empty() && terra_workspace_manager) {
+      const auto workspace = terra_workspace_manager->get(tracking->binding.workspace_id);
+      if (workspace && !workspace->display_ids.empty()) {
+        return workspace->display_ids.front();
+      }
+    }
+#ifdef _WIN32
+    if (tracking && !tracking->binding.sandbox_id.empty() && terra_sandbox_manager) {
+      const auto sandbox = terra_sandbox_manager->get(tracking->binding.sandbox_id);
+      if (sandbox && !sandbox->display_ids.empty()) {
+        return sandbox->display_ids.front();
+      }
+    }
+    const auto capture_display = video::capture_display_name();
+    if (!capture_display.empty()) {
+      for (const auto &display : terra::windows::display::enumerate_snapshot(http::unique_id, display_device::enumerate_devices())) {
+        if (display.device_id == capture_display || display.platform_id == capture_display || display.name == capture_display) {
+          return display.resource_uuid;
+        }
+      }
+    }
+#endif
+    return tracking ? tracking->display_id : std::nullopt;
+  }
+
+  /**
    * @brief Serialize an immutable stream-session snapshot with tracking metadata.
    *
    * @param session Session snapshot.
@@ -2726,6 +3407,8 @@ namespace nvhttp {
       return value.empty() ? nlohmann::json(nullptr) : nlohmann::json(value);
     };
     const auto updated_at = tracking && tracking->updated_at > 0 ? tracking->updated_at : started_at;
+    const auto display_id = terra_session_display_id(session, tracking);
+    const auto peripheral_claim_ids = tracking && (tracking->state == "stopped" || tracking->state == "failed") ? tracking->peripheral_claim_ids : terra_session_peripheral_claim_ids(session, tracking);
     return {
       {"id", session.id},
       {"ownerClientUuid", session.client_uuid},
@@ -2740,13 +3423,13 @@ namespace nvhttp {
       {"height", session.height},
       {"refreshRate", session.fps},
       {"hdr", session.hdr},
-      {"displayId", nullptr},
+      {"displayId", display_id ? nlohmann::json(*display_id) : nlohmann::json(nullptr)},
       {"displayProfileId", uuid_or_null(tracking ? tracking->binding.display_profile_id : std::string {})},
       {"streamProfileId", uuid_or_null(tracking ? tracking->binding.stream_profile_id : std::string {})},
       {"launchProfileId", uuid_or_null(tracking ? tracking->binding.launch_profile_id : std::string {})},
       {"sandboxProfileId", uuid_or_null(tracking ? tracking->binding.sandbox_profile_id : std::string {})},
       {"sandboxId", uuid_or_null(tracking ? tracking->binding.sandbox_id : std::string {})},
-      {"peripheralClaimIds", nlohmann::json::array()},
+      {"peripheralClaimIds", peripheral_claim_ids},
       {"revision", tracking ? tracking->revision : 1},
     };
   }
@@ -2792,10 +3475,20 @@ namespace nvhttp {
       const auto found = args.find(name);
       return found == args.end() || found->second.empty() ? std::optional<std::string> {} : std::optional<std::string> {found->second};
     };
-    const auto resolve_one = [&](const char *name, const std::string &type, const std::string_view read_scope, const std::optional<std::string> &workspace_default, const std::function<bool(const nlohmann::json &)> &compatible, std::string &resolved) -> bool {
+    const auto *runtime = workspace && workspace->runtime_selection ? &*workspace->runtime_selection : nullptr;
+    if (runtime && runtime->app_uuid != app.uuid) {
+      return fail("workspace_app_mismatch", "Launch application does not match prepared workspace runtime");
+    }
+    const auto overridden = [&](const std::optional<nlohmann::json> terra_workspaces::profile_overrides_t::*member) {
+      return runtime && (runtime->profile_overrides.*member).has_value();
+    };
+    const auto resolve_one = [&](const char *name, const std::string &type, const std::string_view read_scope, const std::optional<std::string> &workspace_default, const std::optional<std::string> &launch_default, const std::function<bool(const nlohmann::json &)> &compatible, std::string &resolved) -> bool {
       auto requested = explicit_reference(name);
       if (!requested && workspace_default) {
         requested = workspace_default;
+      }
+      if (!requested && launch_default) {
+        requested = launch_default;
       }
       if (!requested && type == "launch") {
         for (const auto &profile : app.terra_metadata.value("launchProfiles", nlohmann::json::array())) {
@@ -2820,13 +3513,16 @@ namespace nvhttp {
         fail("invalid_argument", std::format("{} must be a canonical UUID", name));
         return false;
       }
-      const auto profile = terra_profile_manager ? terra_profile_manager->inspect(*requested) : std::nullopt;
-      if (!profile || profile->type != type) {
-        fail("resource_not_found", std::format("{} does not resolve to a readable {}", name, type));
-        return false;
-      }
       if (!scope_allowed(client, read_scope)) {
         fail("permission_denied", std::format("{} requires the {} scope", name, read_scope));
+        return false;
+      }
+      std::optional<terra::profiles::profile_t> profile;
+      if (terra_profile_manager) {
+        profile = terra_profile_manager->get(terra_profile_actor(client), *requested).profile;
+      }
+      if (!profile || profile->type != type) {
+        fail("resource_not_found", std::format("{} does not resolve to a readable {}", name, type));
         return false;
       }
       if (compatible && !compatible(profile->configuration)) {
@@ -2840,25 +3536,192 @@ namespace nvhttp {
     if (workspace) {
       binding.workspace_id = workspace->id;
     }
-    if (!resolve_one("eclipseDisplayProfileId", "display", "display.read", workspace ? workspace->definition.display_profile_id : std::nullopt, {}, binding.display_profile_id)) {
-      return std::nullopt;
-    }
-    if (!resolve_one("eclipseStreamProfileId", "stream", "catalog.read", workspace ? workspace->definition.stream_profile_id : std::nullopt, {}, binding.stream_profile_id)) {
-      return std::nullopt;
-    }
-    if (!resolve_one("eclipseLaunchProfileId", "launch", "catalog.read", workspace ? workspace->definition.launch_profile_id : std::nullopt, [&](const nlohmann::json &configuration) {
+    if (!resolve_one("eclipseLaunchProfileId", "launch", "catalog.read", workspace && !overridden(&terra_workspaces::profile_overrides_t::launch) ? workspace->definition.launch_profile_id : std::nullopt, std::nullopt, [&](const nlohmann::json &configuration) {
           return configuration.at("appUuid") == app.uuid;
         },
                      binding.launch_profile_id)) {
       return std::nullopt;
     }
-    if (!resolve_one("eclipseSandboxProfileId", "sandbox", SANDBOX_READ_SCOPE, workspace ? workspace->definition.sandbox_profile_id : std::nullopt, [&](const nlohmann::json &configuration) {
+    if (!explicit_reference("eclipseLaunchProfileId") && overridden(&terra_workspaces::profile_overrides_t::launch)) {
+      binding.launch_profile_id.clear();
+      const auto &configuration = runtime->profile_overrides.launch;
+      if (configuration && !configuration->is_null()) {
+        binding.launch_configuration = *configuration;
+      }
+    }
+    std::optional<terra::profiles::profile_t> launch_profile;
+    if (!binding.launch_profile_id.empty() && terra_profile_manager) {
+      launch_profile = terra_profile_manager->get(terra_profile_actor(client), binding.launch_profile_id).profile;
+    }
+    const auto launch_default = [&](const char *field) -> std::optional<std::string> {
+      const auto *configuration = binding.launch_configuration ? &*binding.launch_configuration : launch_profile ? &launch_profile->configuration :
+                                                                                                                   nullptr;
+      return configuration && configuration->at(field).is_string() ? std::optional<std::string> {configuration->at(field).get<std::string>()} : std::nullopt;
+    };
+    if (!resolve_one("eclipseDisplayProfileId", "display", "display.read", workspace && !overridden(&terra_workspaces::profile_overrides_t::display) ? workspace->definition.display_profile_id : std::nullopt, launch_default("displayProfileId"), {}, binding.display_profile_id)) {
+      return std::nullopt;
+    }
+    if (!explicit_reference("eclipseDisplayProfileId") && overridden(&terra_workspaces::profile_overrides_t::display)) {
+      binding.display_profile_id.clear();
+      const auto &configuration = runtime->profile_overrides.display;
+      if (configuration && !configuration->is_null()) {
+        binding.display_configuration = *configuration;
+      }
+    }
+    if (!resolve_one("eclipseStreamProfileId", "stream", "catalog.read", workspace && !overridden(&terra_workspaces::profile_overrides_t::stream) ? workspace->definition.stream_profile_id : std::nullopt, launch_default("streamProfileId"), {}, binding.stream_profile_id)) {
+      return std::nullopt;
+    }
+    if (!explicit_reference("eclipseStreamProfileId") && overridden(&terra_workspaces::profile_overrides_t::stream)) {
+      binding.stream_profile_id.clear();
+      const auto &configuration = runtime->profile_overrides.stream;
+      if (configuration && !configuration->is_null()) {
+        binding.stream_configuration = *configuration;
+      }
+    }
+    const bool sandbox_disabled = !explicit_reference("eclipseSandboxProfileId") && overridden(&terra_workspaces::profile_overrides_t::sandbox) && runtime->profile_overrides.sandbox->is_null();
+    if (!resolve_one("eclipseSandboxProfileId", "sandbox", SANDBOX_READ_SCOPE, workspace && !sandbox_disabled ? workspace->definition.sandbox_profile_id : std::nullopt, sandbox_disabled ? std::nullopt : launch_default("sandboxProfileId"), [&](const nlohmann::json &configuration) {
           return terra_json_contains_string(configuration.at("allowedAppUuids"), app.uuid);
         },
                      binding.sandbox_profile_id)) {
       return std::nullopt;
     }
     return binding;
+  }
+
+  /**
+   * @brief Check stream-profile codec, HDR, and chroma requirements against latest encoder probe.
+   *
+   * @param configuration Validated stream-profile configuration.
+   * @return True when current encoder capabilities can satisfy configuration.
+   */
+  bool terra_stream_configuration_supported(const nlohmann::json &configuration) {
+    const auto codec = configuration.at("codec").get<std::string>();
+    const bool hdr = configuration.at("hdr").get<bool>();
+    const bool yuv444 = configuration.at("yuv444").get<bool>();
+    const auto codec_supported = [&](const int index, const int mode) {
+      return mode >= 2 && (!hdr || mode == 3 || mode == 5) && (!yuv444 || video::last_encoder_probe_supported_yuv444_for_codec[index]) && (!hdr || !yuv444 || mode == 5);
+    };
+    if (codec == "h264") {
+      return !hdr && (!yuv444 || video::last_encoder_probe_supported_yuv444_for_codec[0]);
+    }
+    if (codec == "hevc") {
+      return codec_supported(1, video::active_hevc_mode);
+    }
+    if (codec == "av1") {
+      return codec_supported(2, video::active_av1_mode);
+    }
+    return (!hdr && !yuv444) || codec_supported(1, video::active_hevc_mode) || codec_supported(2, video::active_av1_mode);
+  }
+
+  /**
+   * @brief Apply resolved stream and launch profiles to one pending launch session.
+   * @return `true` when every selected profile can be honored.
+   */
+  bool terra_apply_launch_profiles(const verified_client_t &client, const terra_session_binding_t &binding, rtsp_stream::launch_session_t &session, std::string &error_message) {
+    if (!terra_profile_manager && (!binding.stream_profile_id.empty() || !binding.launch_profile_id.empty())) {
+      error_message = "Profile provider became unavailable before launch";
+      return false;
+    }
+    if (!binding.stream_profile_id.empty() || binding.stream_configuration) {
+      const auto profile = !binding.stream_profile_id.empty() ? terra_profile_manager->get(terra_profile_actor(client), binding.stream_profile_id).profile : std::nullopt;
+      if (!binding.stream_configuration && (!profile || profile->type != "stream")) {
+        error_message = "Stream profile became unavailable before launch";
+        return false;
+      }
+      const auto &configuration = binding.stream_configuration ? *binding.stream_configuration : profile->configuration;
+      if (!terra_stream_configuration_supported(configuration)) {
+        error_message = "Stream profile is unsupported by current encoder capabilities";
+        return false;
+      }
+      const auto input_allowed = [&](const std::string &input) {
+        return input == "keyboard" ? session.input_permissions.keyboard : input == "mouse"    ? session.input_permissions.mouse :
+                                                                        input == "controller" ? session.input_permissions.controller :
+                                                                        input == "touch"      ? session.input_permissions.touch :
+                                                                                                input == "pen" && session.input_permissions.pen;
+      };
+      if (std::ranges::any_of(configuration.at("requiredInputClasses"), [&](const auto &input) {
+            return !input_allowed(input.template get<std::string>());
+          })) {
+        error_message = "Client permissions do not satisfy stream profile input requirements";
+        return false;
+      }
+      if (configuration.at("encryptionRequired").get<bool>() && !session.rtsp_cipher) {
+        error_message = "Stream profile requires encrypted RTSP support";
+        return false;
+      }
+      session.width = configuration.at("width").get<int>();
+      session.height = configuration.at("height").get<int>();
+      session.fps = configuration.at("fps").get<int>();
+      session.profile_bitrate_kbps = configuration.at("bitrateKbps").get<int>();
+      const auto codec = configuration.at("codec").get<std::string>();
+      if (codec != "automatic") {
+        session.profile_video_format = codec == "h264" ? 0 : codec == "hevc" ? 1 :
+                                                                               2;
+      }
+      session.enable_hdr = configuration.at("hdr").get<bool>();
+      session.profile_chroma_sampling = configuration.at("yuv444").get<bool>() ? 1 : 0;
+      const auto channels = configuration.at("audioChannels").get<std::string>();
+      session.profile_audio_channels = channels == "stereo" ? 2 : channels == "5.1" ? 6 :
+                                                                                      8;
+      session.profile_audio_mask = channels == "stereo" ? 0x3 : channels == "5.1" ? 0x3F :
+                                                                                    0x63F;
+      session.surround_info = (*session.profile_audio_mask << 16) | *session.profile_audio_channels;
+      session.host_audio = configuration.at("hostAudio").get<bool>();
+      session.profile_mouse_mode = configuration.at("inputMode") == "absolute" ? input::mouse_mode_e::absolute : input::mouse_mode_e::relative;
+      const auto controller_limit = configuration.at("controllerLimit").get<unsigned int>();
+      session.gcmap &= controller_limit >= 16 ? 0xFFFF : controller_limit == 0 ? 0 :
+                                                                                 (1 << controller_limit) - 1;
+      session.enable_sops = configuration.at("gameOptimizations").get<bool>();
+      session.profile_stream_applied = true;
+      session.profile_encryption_required = configuration.at("encryptionRequired").get<bool>();
+    }
+    if (!binding.launch_profile_id.empty() || binding.launch_configuration) {
+      const auto profile = !binding.launch_profile_id.empty() ? terra_profile_manager->get(terra_profile_actor(client), binding.launch_profile_id).profile : std::nullopt;
+      if (!binding.launch_configuration && (!profile || profile->type != "launch" || profile->configuration.at("appUuid") != session.app_uuid)) {
+        error_message = "Launch profile became unavailable before launch";
+        return false;
+      }
+      const auto &configuration = binding.launch_configuration ? *binding.launch_configuration : profile->configuration;
+      if (configuration.at("appUuid") != session.app_uuid) {
+        error_message = "Launch profile does not match selected application";
+        return false;
+      }
+      session.app_arguments = configuration.at("arguments").get<std::vector<std::string>>();
+      for (const auto &[name, value] : configuration.at("environment").items()) {
+        session.app_environment.emplace(name, value.get<std::string>());
+      }
+      if (configuration.at("workingDirectory").is_string()) {
+        session.app_working_directory = configuration.at("workingDirectory").get<std::string>();
+      }
+      session.app_elevated = configuration.at("elevated").get<bool>();
+    }
+#ifdef _WIN32
+    if (!binding.workspace_id.empty()) {
+      const auto workspace = terra_workspace_manager ? terra_workspace_manager->get(binding.workspace_id) : std::nullopt;
+      if (!workspace) {
+        error_message = "Workspace became unavailable before launch";
+        return false;
+      }
+      for (const auto &display_id : workspace->display_ids) {
+        const auto display = terra_virtual_display_manager ? terra_virtual_display_manager->get(display_id) : std::nullopt;
+        if (!display) {
+          continue;
+        }
+        const auto device_id = terra::windows::virtual_display::resolve_device_id(display->platform_id);
+        if (!device_id) {
+          error_message = "Attached workspace display is unavailable for capture";
+          return false;
+        }
+        session.capture_output_name = *device_id;
+        break;
+      }
+      if (!workspace->definition.virtual_displays.empty() && session.capture_output_name.empty()) {
+        error_message = "Workspace has no capture-ready attached display";
+        return false;
+      }
+    }
+#endif
+    return true;
   }
 
   /**
@@ -2871,50 +3734,75 @@ namespace nvhttp {
    * @return True when the sandbox is running.
    */
   bool terra_launch_direct_sandbox(const verified_client_t &client, const proc::ctx_t &app, terra_session_binding_t &binding, std::string &error_message) {
-    if (binding.sandbox_profile_id.empty() || !terra_sandbox_manager) {
+    if (binding.sandbox_profile_id.empty()) {
       return true;
     }
-    const auto profile = terra_profile_manager ? terra_profile_manager->inspect(binding.sandbox_profile_id) : std::nullopt;
+#ifdef _WIN32
+    if (!terra_sandbox_manager) {
+      error_message = "Sandbox isolation is unavailable";
+      return false;
+    }
+    std::optional<terra::profiles::profile_t> profile;
+    if (terra_profile_manager) {
+      profile = terra_profile_manager->get(terra_profile_actor(client), binding.sandbox_profile_id).profile;
+    }
     if (!profile) {
       error_message = "Sandbox profile became unavailable before launch";
       return false;
     }
+    if (!binding.launch_profile_id.empty()) {
+      const auto launch_profile = terra_profile_manager ? terra_profile_manager->get(terra_profile_actor(client), binding.launch_profile_id).profile : std::nullopt;
+      if (!launch_profile || !terra_sandbox_launch_profile_supported(*launch_profile, app.uuid, binding.sandbox_profile_id)) {
+        error_message = "Launch profile is unsupported by sandbox isolation";
+        return false;
+      }
+    }
     const auto created = terra_sandbox_manager->create(client.uuid, {
-                                                                        binding.sandbox_profile_id,
-                                                                        std::nullopt,
-                                                                        app.uuid,
-                                                                        false,
-                                                                        app.name,
-                                                                        profile->configuration,
-                                                                      });
+                                                                      binding.sandbox_profile_id,
+                                                                      std::nullopt,
+                                                                      app.uuid,
+                                                                      false,
+                                                                      app.name,
+                                                                      profile->configuration,
+                                                                    });
     if (created.status != terra_sandboxes::status_t::success || !created.resource) {
       error_message = "Sandbox isolation could not be created for this launch";
       return false;
     }
-    publish_terra_sandbox_event("sandbox.created", *created.resource, terra_sandboxes::to_json(*created.resource), client.uuid);
-    const auto started = terra_sandbox_manager->start(created.resource->id, created.resource->revision, terra_sandboxes::start_t {.app_uuid = app.uuid});
+    const auto started = terra_sandbox_manager->start(created.resource->id, created.resource->revision, terra_sandboxes::start_t {.app_uuid = app.uuid, .launch_profile_id = binding.launch_profile_id.empty() ? std::nullopt : std::optional<std::string> {binding.launch_profile_id}});
     if (started.status != terra_sandboxes::status_t::success || !started.resource) {
       error_message = "Sandbox isolation could not be started for this launch";
       terra_destroy_sandbox_by_id(created.resource->id);
       return false;
     }
-    publish_terra_sandbox_event("sandbox.updated", *started.resource, terra_sandboxes::to_json(*started.resource), client.uuid);
     binding.sandbox_id = started.resource->id;
     return true;
+#else
+    (void) client;
+    (void) app;
+    (void) binding;
+    error_message = "Sandbox isolation is unavailable on this platform";
+    return false;
+#endif
   }
 
   /**
    * @brief Destroy one session-scoped sandbox, forcing termination when required.
    *
    * @param sandbox_id Canonical sandbox UUID.
+   * @return `true` when sandbox is absent or removed.
    */
-  void terra_destroy_sandbox_by_id(const std::string &sandbox_id) {
-    if (sandbox_id.empty() || !terra_sandbox_manager) {
-      return;
+  bool terra_destroy_sandbox_by_id(const std::string &sandbox_id) {
+    if (sandbox_id.empty()) {
+      return true;
+    }
+#ifdef _WIN32
+    if (!terra_sandbox_manager) {
+      return false;
     }
     const auto sandbox = terra_sandbox_manager->get(sandbox_id);
     if (!sandbox) {
-      return;
+      return true;
     }
     auto removed = terra_sandbox_manager->remove(sandbox->id, sandbox->revision);
     if (removed.status != terra_sandboxes::status_t::success) {
@@ -2925,18 +3813,28 @@ namespace nvhttp {
     }
     if (removed.status != terra_sandboxes::status_t::success) {
       BOOST_LOG(error) << "Failed to destroy session sandbox [" << sandbox_id << ']';
+      return false;
     } else if (terra_peripheral_manager) {
-      terra_peripheral_manager->target_ended("sandbox", sandbox_id, true);
+      transition_terra_peripheral_target("sandbox", sandbox_id, true);
+      terra_close_target_channels("sandbox", sandbox_id);
     }
+    return true;
+#else
+    return false;
+#endif
   }
 
   /**
    * @brief Destroy the sandbox bound to one session binding.
    *
    * @param binding Resolved launch references.
+   * @return `true` when sandbox is absent or removed.
    */
-  void terra_destroy_session_sandbox(const terra_session_binding_t &binding) {
-    terra_destroy_sandbox_by_id(binding.sandbox_id);
+  bool terra_destroy_session_sandbox(const terra_session_binding_t &binding) {
+    if (!binding.workspace_id.empty()) {
+      return true;
+    }
+    return terra_destroy_sandbox_by_id(binding.sandbox_id);
   }
 
   /**
@@ -2962,62 +3860,108 @@ namespace nvhttp {
     const auto uuid_or_null = [](const std::string &value) {
       return value.empty() ? nlohmann::json(nullptr) : nlohmann::json(value);
     };
+    const auto display_id = terra_session_display_id(session, tracking);
+    const auto peripheral_claim_ids = tracking && (tracking->state == "stopped" || tracking->state == "failed") ? tracking->peripheral_claim_ids : terra_session_peripheral_claim_ids(session, tracking);
+    const bool sampled = !session.codec.empty();
+    const auto sampled_value = [sampled](const auto value) {
+      return sampled ? nlohmann::json(value) : nlohmann::json(nullptr);
+    };
+    const auto interval_value = [&](const auto value) {
+      return sampled && session.interval_sampled ? nlohmann::json(value) : nlohmann::json(nullptr);
+    };
     return {
       {"sessionId", session.id},
-      {"generation", 1},
+      {"generation", sampled_value(session.telemetry_generation)},
       {"state", session.state},
-      {"codec", nullptr},
+      {"codec", sampled ? nlohmann::json(session.codec) : nlohmann::json(nullptr)},
       {"width", session.width},
       {"height", session.height},
       {"refreshRate", session.fps},
       {"hdr", session.hdr},
-      {"captureFps", nullptr},
-      {"encodeFps", nullptr},
-      {"transmitFps", nullptr},
-      {"capturedFrames", nullptr},
-      {"encodedFrames", nullptr},
-      {"droppedFrames", nullptr},
-      {"transmittedFrames", nullptr},
-      {"captureLatencyMs", nullptr},
-      {"encodeLatencyMs", nullptr},
-      {"bitrateKbps", nullptr},
+      {"captureFps", interval_value(session.capture_fps)},
+      {"encodeFps", interval_value(session.encode_fps)},
+      {"transmitFps", interval_value(session.transmit_fps)},
+      {"capturedFrames", sampled_value(session.captured_frames)},
+      {"encodedFrames", sampled_value(session.encoded_frames)},
+      {"droppedFrames", sampled_value(session.dropped_frames)},
+      {"transmittedFrames", sampled_value(session.transmitted_frames)},
+      {"captureLatencyMs", sampled && session.capture_latency_sampled ? nlohmann::json(session.capture_latency_ms) : nlohmann::json(nullptr)},
+      {"encodeLatencyMs", sampled && session.encode_latency_sampled ? nlohmann::json(session.encode_latency_ms) : nlohmann::json(nullptr)},
+      {"bitrateKbps", interval_value(session.bitrate_kbps)},
       {"networkRttMs", nullptr},
       {"networkJitterMs", nullptr},
       {"networkLossPercent", nullptr},
-      {"videoBytes", nullptr},
-      {"audioBytes", nullptr},
-      {"controlBytes", nullptr},
-      {"inputBytes", nullptr},
-      {"queueDepth", nullptr},
-      {"queueDrops", nullptr},
-      {"displayId", nullptr},
+      {"videoBytes", sampled_value(session.video_bytes)},
+      {"audioBytes", sampled_value(session.audio_bytes)},
+      {"controlBytes", sampled_value(session.control_bytes)},
+      {"inputBytes", sampled_value(session.input_bytes)},
+      {"queueDepth", sampled_value(session.queue_depth)},
+      {"queueDrops", sampled_value(session.queue_drops)},
+      {"displayId", display_id ? nlohmann::json(*display_id) : nlohmann::json(nullptr)},
       {"sandboxId", uuid_or_null(tracking ? tracking->binding.sandbox_id : std::string {})},
       {"workspaceId", uuid_or_null(tracking ? tracking->binding.workspace_id : std::string {})},
-      {"peripheralClaimIds", nlohmann::json::array()},
+      {"peripheralClaimIds", peripheral_claim_ids},
     };
   }
 
   /**
    * @brief Serialize host telemetry and the visible session telemetry collection.
    *
-   * @param owner_filter When non-empty, restrict session entries to this owner UUID.
+   * @param client Caller authorization used for ownership and application projection, or null for host-internal visibility.
    * @return Complete telemetry document without `schemaVersion`.
    */
-  nlohmann::json terra_telemetry_document(const std::string &owner_filter) {
-    const auto snapshots = terra_session_snapshots();
+  nlohmann::json terra_telemetry_document(const verified_client_t *client) {
+    const bool administer = !client || scope_allowed(*client, "host.control");
+    const std::string owner_filter = administer ? std::string {} : client->uuid;
+    const auto snapshots = terra_session_snapshots(true);
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     const auto uptime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - terra_start_time).count();
-    std::size_t transport_sessions = 0;
+    const auto transport_sessions = std::ranges::count_if(snapshots, [](const auto &session) {
+      return session.state == "starting" || session.state == "running";
+    });
+    const auto logical_sessions = std::ranges::count_if(snapshots, [](const auto &session) {
+      return session.state == "starting" || session.state == "running" || session.state == "preparing" || session.state == "disconnected";
+    });
+    const auto active_transport = snapshots | std::views::filter([](const auto &session) {
+                                    return session.state == "starting" || session.state == "running";
+                                  });
+    const bool rates_sampled = transport_sessions > 0 && std::ranges::all_of(active_transport, &rtsp_stream::session_info_t::interval_sampled);
+    const std::optional<bool> capture_healthy = !rates_sampled ? std::nullopt : std::optional<bool> {std::ranges::all_of(active_transport, [](const auto &session) {
+      return session.state == "running" && session.capture_active;
+    })};
+    const std::optional<bool> encoder_healthy = !rates_sampled ? std::nullopt : std::optional<bool> {std::ranges::all_of(active_transport, [](const auto &session) {
+      return session.state == "running" && session.encode_fps > 0 && !session.codec.empty();
+    })};
+    const std::optional<bool> audio_healthy = !rates_sampled ? std::nullopt : std::optional<bool> {std::ranges::all_of(active_transport, [](const auto &session) {
+      return session.state == "running" && session.audio_active;
+    })};
+    double aggregate_capture_fps = 0;
+    double aggregate_encode_latency = 0;
+    std::string encoder_codec;
+    for (const auto &session : active_transport) {
+      aggregate_capture_fps = std::max(aggregate_capture_fps, session.capture_fps);
+      aggregate_encode_latency += session.encode_latency_ms;
+      if (encoder_codec.empty()) {
+        encoder_codec = session.codec;
+      } else if (encoder_codec != session.codec) {
+        encoder_codec = "mixed";
+      }
+    }
+    if (transport_sessions > 0) {
+      aggregate_encode_latency /= transport_sessions;
+    }
+    const bool host_healthy = terra_operation_store && terra_operation_store->available() && capture_healthy.value_or(true) && encoder_healthy.value_or(true) && audio_healthy.value_or(true);
     nlohmann::json sessions = nlohmann::json::array();
     for (const auto &session : snapshots) {
-      if (!owner_filter.empty() && session.client_uuid != owner_filter) {
+      if (!administer && (session.client_uuid != owner_filter || (client && !app_allowed(*client, session.app_uuid)))) {
         continue;
-      }
-      if (session.state == "starting" || session.state == "running") {
-        ++transport_sessions;
       }
       const auto tracking = terra_session_tracking_for(session.id);
       sessions.push_back(terra_telemetry_session_json(session, tracking ? &*tracking : nullptr));
+    }
+    std::optional<std::uint64_t> active_peripheral_claims;
+    if (terra_peripheral_manager) {
+      active_peripheral_claims = terra_peripherals::active_claim_count(terra_peripheral_manager->list_claims(owner_filter));
     }
 #ifdef _WIN32
     const auto display_snapshot = terra_display_snapshot();
@@ -3030,7 +3974,7 @@ namespace nvhttp {
     if (terra_virtual_display_manager) {
       healthy_virtual_displays = 0;
       for (const auto &virtual_display : terra_virtual_display_manager->list().resources) {
-        if (virtual_display.state == terra_virtual_display::state_t::ready || virtual_display.state == terra_virtual_display::state_t::attached) {
+        if ((administer || virtual_display.owner_client_uuid == owner_filter) && (virtual_display.state == terra_virtual_display::state_t::ready || virtual_display.state == terra_virtual_display::state_t::attached)) {
           ++*healthy_virtual_displays;
         }
       }
@@ -3043,7 +3987,7 @@ namespace nvhttp {
     if (terra_sandbox_manager) {
       running_sandboxes = 0;
       for (const auto &sandbox : terra_sandbox_manager->list().resources) {
-        if (sandbox.state == terra_sandboxes::state_t::running || sandbox.state == terra_sandboxes::state_t::starting) {
+        if ((!client || terra_sandbox_visible(*client, sandbox)) && (sandbox.state == terra_sandboxes::state_t::running || sandbox.state == terra_sandboxes::state_t::starting)) {
           ++*running_sandboxes;
         }
       }
@@ -3060,16 +4004,16 @@ namespace nvhttp {
         "host",
         {
           {"uptimeMs", uptime_ms},
-          {"healthy", true},
-          {"captureHealthy", nullptr},
-          {"captureFps", nullptr},
-          {"encoderHealthy", nullptr},
+          {"healthy", host_healthy},
+          {"captureHealthy", capture_healthy ? nlohmann::json(*capture_healthy) : nlohmann::json(nullptr)},
+          {"captureFps", rates_sampled ? nlohmann::json(aggregate_capture_fps) : nlohmann::json(nullptr)},
+          {"encoderHealthy", encoder_healthy ? nlohmann::json(*encoder_healthy) : nlohmann::json(nullptr)},
           {"encoderName", nullptr},
-          {"encoderCodec", nullptr},
+          {"encoderCodec", encoder_codec.empty() ? nlohmann::json(nullptr) : nlohmann::json(encoder_codec)},
           {"encoderPixelFormat", nullptr},
           {"encoderUtilizationPercent", nullptr},
-          {"encoderLatencyMs", nullptr},
-          {"audioCaptureHealthy", nullptr},
+          {"encoderLatencyMs", transport_sessions > 0 && std::ranges::all_of(active_transport, &rtsp_stream::session_info_t::encode_latency_sampled) ? nlohmann::json(aggregate_encode_latency) : nlohmann::json(nullptr)},
+          {"audioCaptureHealthy", audio_healthy ? nlohmann::json(*audio_healthy) : nlohmann::json(nullptr)},
           {"audioQueueDepth", nullptr},
           {"sunshineCpuPercent", nullptr},
           {"sunshineMemoryBytes", nullptr},
@@ -3077,12 +4021,12 @@ namespace nvhttp {
           {"gpuMemoryBytes", nullptr},
           {"gpuTemperatureC", nullptr},
           {"gpuDriverReset", nullptr},
-          {"activeLogicalSessions", snapshots.size()},
+          {"activeLogicalSessions", logical_sessions},
           {"activeTransportSessions", transport_sessions},
           {"healthyDisplayCount", count_or_null(healthy_displays)},
           {"healthyVirtualDisplayCount", count_or_null(healthy_virtual_displays)},
           {"runningSandboxCount", count_or_null(running_sandboxes)},
-          {"activePeripheralClaimCount", nullptr},
+          {"activePeripheralClaimCount", count_or_null(active_peripheral_claims)},
         },
       },
       {"sessions", std::move(sessions)},
@@ -3092,32 +4036,59 @@ namespace nvhttp {
   /**
    * @brief Return active and resumable logical session snapshots.
    *
+   * @param include_retained Whether to include terminal resources during retention.
    * @return Immutable logical-session views, including disconnected resumable application state.
    */
-  std::vector<rtsp_stream::session_info_t> terra_session_snapshots() {
+  std::vector<rtsp_stream::session_info_t> terra_session_snapshots(const bool include_retained) {
     auto sessions = rtsp_stream::sessions();
-    std::lock_guard lock {logical_session_mutex};
-    if (!logical_session) {
+    const bool runtime_running = proc::runtime_running();
+    {
+      std::lock_guard lock {logical_session_mutex};
+      if (logical_session) {
+        const bool active = std::ranges::any_of(sessions, [&](const auto &session) {
+          return session.id == logical_session->id;
+        });
+        if (!active && runtime_running) {
+          sessions.push_back({
+            .id = logical_session->id,
+            .client_uuid = logical_session->client_uuid,
+            .app_uuid = logical_session->app_uuid,
+            .legacy_app_id = logical_session->legacy_app_id,
+            .state = "disconnected",
+            .started_at = logical_session->started_at,
+            .width = logical_session->width,
+            .height = logical_session->height,
+            .fps = logical_session->fps,
+            .hdr = logical_session->hdr,
+          });
+        } else if (!active) {
+          logical_session.reset();
+        }
+      }
+    }
+    if (!include_retained) {
       return sessions;
     }
-    const bool active = std::ranges::any_of(sessions, [&](const auto &session) {
-      return session.id == logical_session->id;
-    });
-    if (!active && proc::proc.running() > 0) {
-      sessions.push_back({
-        .id = logical_session->id,
-        .client_uuid = logical_session->client_uuid,
-        .app_uuid = logical_session->app_uuid,
-        .legacy_app_id = logical_session->legacy_app_id,
-        .state = "disconnected",
-        .started_at = logical_session->started_at,
-        .width = logical_session->width,
-        .height = logical_session->height,
-        .fps = logical_session->fps,
-        .hdr = logical_session->hdr,
+    std::lock_guard tracking_lock {terra_session_tracking_mutex};
+    for (const auto &[session_id, tracking] : terra_session_tracking) {
+      const auto existing = std::ranges::find_if(sessions, [&](const auto &session) {
+        return session.id == session_id;
       });
-    } else if (!active) {
-      logical_session.reset();
+      if (existing != sessions.end()) {
+        if (existing->state == "disconnected") {
+          if (tracking.retained_snapshot) {
+            *existing = *tracking.retained_snapshot;
+          }
+          existing->state = tracking.state;
+        }
+        continue;
+      }
+      if (!tracking.terminal_since || !tracking.retained_snapshot) {
+        continue;
+      }
+      auto retained = *tracking.retained_snapshot;
+      retained.state = tracking.state;
+      sessions.push_back(std::move(retained));
     }
     return sessions;
   }
@@ -3187,6 +4158,89 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Build one caller-visible Catalog V2 projection.
+   *
+   * @param client Calling client identity and policy.
+   * @return Projection revision, resources, and whether visible content changed.
+   */
+  std::tuple<std::uint64_t, nlohmann::json, bool> terra_catalog_projection(const verified_client_t &client) {
+    std::lock_guard projection_lock {terra_catalog_revision.mutex};
+    const auto catalog = proc::catalog_snapshot();
+    const auto previous_process_revision = terra_catalog_process_revision.exchange(catalog.revision);
+    if (previous_process_revision != 0 && previous_process_revision != catalog.revision) {
+      ++terra_catalog_change_generation;
+    }
+    const auto source_generation = terra_catalog_change_generation.load();
+    nlohmann::json apps = nlohmann::json::array();
+    for (const auto &app : catalog.apps) {
+      if (app_allowed(client, app.uuid)) {
+        apps.emplace_back(terra_app_json(app, &client));
+      }
+    }
+#ifdef _WIN32
+    if (terra_workspace_manager) {
+      for (const auto &workspace : terra_workspace_manager->list().workspaces) {
+        if (workspace.definition.desktop_app_uuid.empty() || !app_allowed(client, workspace.definition.desktop_app_uuid) || !terra_workspace_visible(client, workspace, false)) {
+          continue;
+        }
+        apps.push_back(terra_workspace_catalog_json(workspace));
+      }
+    }
+#endif
+    const auto fingerprint = apps.dump();
+    auto &projection = terra_catalog_revision.projections[client.uuid];
+    const bool initial = projection.revision == 0;
+    const bool changed = initial || projection.fingerprint != fingerprint;
+    if (changed) {
+      projection.fingerprint = fingerprint;
+      if (initial) {
+        projection.revision = std::max<std::uint64_t>(1, std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+      } else {
+        ++projection.revision;
+      }
+      if (initial && source_generation == 0) {
+        projection.published_revision = projection.revision;
+      }
+    }
+    return {projection.revision, std::move(apps), changed};
+  }
+
+  /**
+   * @brief Publish catalog changes using each recipient's current projection revision.
+   */
+  void publish_terra_catalog_changes() {
+    if (!terra_event_hub) {
+      return;
+    }
+    std::vector<verified_client_t> clients;
+    {
+      std::lock_guard lock {client_auth_mutex};
+      for (const auto &client : client_root.named_devices) {
+        if (client.enabled && !permissions_expired(client.permissions) && client.permissions.scopes.contains("catalog.read")) {
+          clients.push_back({client.uuid, client.name, client.cert, client.permissions});
+        }
+      }
+    }
+    for (const auto &client : clients) {
+      const auto [revision, apps, changed] = terra_catalog_projection(client);
+      static_cast<void>(apps);
+      static_cast<void>(changed);
+      bool unpublished = false;
+      {
+        std::lock_guard lock {terra_catalog_revision.mutex};
+        const auto &projection = terra_catalog_revision.projections.at(client.uuid);
+        unpublished = projection.published_revision < projection.revision;
+      }
+      if (unpublished) {
+        terra_event_hub->publish({"catalog.changed", std::nullopt, revision, {{"revision", revision}}}, {client.uuid});
+        std::lock_guard lock {terra_catalog_revision.mutex};
+        auto &projection = terra_catalog_revision.projections.at(client.uuid);
+        projection.published_revision = std::max(projection.published_revision, revision);
+      }
+    }
+  }
+
+  /**
    * @brief Return Terra Catalog V2 resources visible to the caller.
    */
   void terra_apps(resp_https_t response, req_https_t request) {
@@ -3194,7 +4248,6 @@ namespace nvhttp {
     if (!client) {
       return;
     }
-    const auto catalog = proc::catalog_snapshot();
     std::optional<std::uint64_t> since;
     const auto args = request->parse_query_string();
     if (const auto value = args.find("since"); value != args.end()) {
@@ -3210,34 +4263,15 @@ namespace nvhttp {
       }
     }
 
-    const bool changed = !since || *since != catalog.revision;
-    nlohmann::json apps = nlohmann::json::array();
-    if (changed) {
-      for (const auto &app : catalog.apps) {
-        if (app_allowed(*client, app.uuid)) {
-          apps.emplace_back(terra_app_json(app));
-        }
-      }
-#ifdef _WIN32
-      if (terra_workspace_manager) {
-        for (const auto &workspace : terra_workspace_manager->list().workspaces) {
-          if (workspace.definition.desktop_app_uuid.empty() || !app_allowed(*client, workspace.definition.desktop_app_uuid)) {
-            continue;
-          }
-          if (!terra_workspace_visible(*client, workspace, false)) {
-            continue;
-          }
-          apps.push_back(terra_workspace_catalog_json(workspace));
-        }
-      }
-#endif
-    }
+    auto [revision, apps, projection_changed] = terra_catalog_projection(*client);
+    static_cast<void>(projection_changed);
+    const bool changed = !since || *since != revision;
     send_terra_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                         {"revision", catalog.revision},
-                                                                         {"changed", changed},
-                                                                         {"fullSnapshot", changed},
-                                                                         {"apps", std::move(apps)},
-                                                                       });
+                                                                       {"revision", revision},
+                                                                       {"changed", changed},
+                                                                       {"fullSnapshot", changed},
+                                                                       {"apps", changed ? std::move(apps) : nlohmann::json::array()},
+                                                                     });
   }
 
 #ifdef _WIN32
@@ -3286,6 +4320,7 @@ namespace nvhttp {
       {"width", actual_size.at("width")},
       {"height", actual_size.at("height")},
     };
+    display["scale"] = {{"numerator", 1}, {"denominator", 1}};
     display["currentMode"] = std::move(actual_size);
     display["supportedModes"] = nlohmann::json::array({display.at("currentMode")});
     display["hdr"] = {
@@ -3299,40 +4334,91 @@ namespace nvhttp {
   /**
    * @brief Build the unified physical and virtual display inventory.
    *
-   * @return Unified collection revision and display resources, or no value when
-   * physical display enumeration is unavailable.
+   * @param client Optional caller used for virtual-display ownership projection.
+   * @return Caller-visible collection revision and display resources, or no value
+   * when physical display enumeration is unavailable.
    */
-  std::optional<std::pair<std::uint64_t, nlohmann::json>> terra_unified_displays() {
+  std::optional<std::pair<std::uint64_t, nlohmann::json>> terra_unified_displays(const verified_client_t *client) {
     auto physical = terra_display_snapshot();
     if (!physical) {
       return std::nullopt;
     }
-    std::uint64_t virtual_revision = 0;
     if (terra_virtual_display_manager) {
       const auto virtual_displays = terra_virtual_display_manager->list();
-      virtual_revision = virtual_displays.revision;
       for (const auto &resource : virtual_displays.resources) {
+        if (const auto device_id = terra::windows::virtual_display::resolve_device_id(resource.platform_id)) {
+          const auto physical_id = terra::windows::display::display_resource_uuid(http::unique_id, *device_id);
+          for (auto display = physical->second.begin(); display != physical->second.end();) {
+            if (display->at("id") == physical_id) {
+              display = physical->second.erase(display);
+            } else {
+              ++display;
+            }
+          }
+        }
+        if (client && !terra_virtual_visible(*client, resource)) {
+          continue;
+        }
         physical->second.push_back(terra_unified_virtual_display_json(resource));
       }
     }
+    const auto fingerprint = physical->second.dump();
+    const auto projection_key = client ? client->uuid : std::string {};
     std::scoped_lock lock {terra_unified_display_revision.mutex};
-    if (terra_unified_display_revision.revision == 0 || terra_unified_display_revision.inputs != std::pair {physical->first, virtual_revision}) {
-      terra_unified_display_revision.inputs = {physical->first, virtual_revision};
-      ++terra_unified_display_revision.revision;
+    auto &projection = terra_unified_display_revision.projections[projection_key];
+    if (projection.revision == 0 || projection.fingerprint != fingerprint) {
+      projection.fingerprint = fingerprint;
+      ++projection.revision;
     }
-    for (auto &display : physical->second) {
-      display["revision"] = terra_unified_display_revision.revision;
+    return std::pair {projection.revision, std::move(physical->second)};
+  }
+
+  /**
+   * @brief Publish caller-projected unified display collection changes.
+   *
+   * First observations establish a baseline without generating a synthetic change.
+   */
+  void publish_terra_display_changes() {
+    std::vector<verified_client_t> clients;
+    {
+      std::lock_guard lock {client_auth_mutex};
+      for (const auto &client : client_root.named_devices) {
+        verified_client_t verified {client.uuid, client.name, client.cert, client.permissions};
+        if (client.enabled && !permissions_expired(client.permissions) && scope_allowed(verified, "display.read")) {
+          clients.push_back(std::move(verified));
+        }
+      }
     }
-    return std::pair {terra_unified_display_revision.revision, std::move(physical->second)};
+    for (const auto &client : clients) {
+      const auto snapshot = terra_unified_displays(&client);
+      if (!snapshot) {
+        continue;
+      }
+      bool changed = false;
+      {
+        std::scoped_lock lock {terra_unified_display_revision.mutex};
+        auto &projection = terra_unified_display_revision.projections.at(client.uuid);
+        if (projection.published_revision == 0) {
+          projection.published_revision = projection.revision;
+        } else if (projection.published_revision != projection.revision) {
+          projection.published_revision = projection.revision;
+          changed = true;
+        }
+      }
+      if (changed && terra_event_hub) {
+        terra_event_hub->publish({"displays.changed", std::nullopt, snapshot->first, {{"revision", snapshot->first}}}, {client.uuid});
+      }
+    }
   }
 
   /**
    * @brief Serialize the current topology resource from the unified inventory.
    *
    * @param displays Unified display inventory resources.
-   * @return Topology object with stable identifier and revision.
+   * @param client Optional caller selecting the revision projection.
+   * @return Topology object with stable identifier and caller-projected revision.
    */
-  nlohmann::json terra_topology_document(nlohmann::json displays) {
+  nlohmann::json terra_topology_document(nlohmann::json displays, const verified_client_t *client) {
     nlohmann::json entries = nlohmann::json::array();
     for (const auto &display : displays) {
       entries.push_back({
@@ -3341,21 +4427,23 @@ namespace nvhttp {
         {"primary", display.at("primary")},
         {"x", display.at("position").at("x")},
         {"y", display.at("position").at("y")},
-        {"scale", static_cast<double>(display.at("scale").at("numerator").get<std::uint64_t>()) / static_cast<double>(display.at("scale").at("denominator").get<std::uint64_t>())},
+        {"scale", display.at("scale")},
         {"rotation", display.value("rotation", 0)},
         {"modeId", display.at("currentMode").is_null() ? nlohmann::json(nullptr) : nlohmann::json(display.at("currentMode").at("id"))},
         {"hdr", display.at("hdr").is_object() ? nlohmann::json(display.at("hdr").value("enabled", false)) : nlohmann::json(nullptr)},
       });
     }
     const auto fingerprint = entries.dump();
+    const auto projection_key = client ? client->uuid : std::string {};
     std::scoped_lock lock {terra_topology_state.mutex};
-    if (terra_topology_state.revision == 0 || terra_topology_state.fingerprint != fingerprint) {
-      terra_topology_state.fingerprint = fingerprint;
-      ++terra_topology_state.revision;
+    auto &[previous_fingerprint, revision] = terra_topology_state.projections[projection_key];
+    if (revision == 0 || previous_fingerprint != fingerprint) {
+      previous_fingerprint = fingerprint;
+      ++revision;
     }
     return {
       {"id", terra::windows::display::display_resource_uuid(http::unique_id, "eclipse-display-topology")},
-      {"revision", terra_topology_state.revision},
+      {"revision", revision},
       {"displays", std::move(entries)},
     };
   }
@@ -3364,15 +4452,16 @@ namespace nvhttp {
    * @brief Return the current display topology resource.
    */
   void terra_display_topology_get(resp_https_t response, req_https_t request) {
-    if (!authorize_terra_request(response, request, "display.read")) {
+    const auto client = authorize_terra_request(response, request, "display.read");
+    if (!client) {
       return;
     }
-    auto snapshot = terra_unified_displays();
+    auto snapshot = terra_unified_displays(&*client);
     if (!snapshot) {
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Windows display inventory is unavailable");
       return;
     }
-    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"topology", terra_topology_document(std::move(snapshot->second))}});
+    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"topology", terra_topology_document(std::move(snapshot->second), &*client)}});
   }
 
   /**
@@ -3437,39 +4526,84 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Apply selected physical display profile before encoder probing.
+   * @return `true` when profile was absent or requested state was applied.
+   */
+  bool terra_apply_launch_display_profile(const verified_client_t &client, const terra_session_binding_t &binding, rtsp_stream::launch_session_t &session, std::string &error_message) {
+    if (binding.display_profile_id.empty() && !binding.display_configuration) {
+      return true;
+    }
+    const auto profile = !binding.display_profile_id.empty() && terra_profile_manager ? terra_profile_manager->get(terra_profile_actor(client), binding.display_profile_id).profile : std::nullopt;
+    const auto displays = terra_unified_displays(&client);
+    if ((!binding.display_configuration && (!profile || profile->type != "display")) || !displays) {
+      error_message = "Display profile provider became unavailable before launch";
+      return false;
+    }
+    const auto &configuration = binding.display_configuration ? *binding.display_configuration : profile->configuration;
+    if (!configuration.at("targetDisplayId").is_string()) {
+      error_message = "Display profile requires a target display on this host";
+      return false;
+    }
+    const auto target_id = configuration.at("targetDisplayId").get<std::string>();
+    const auto target = std::ranges::find_if(displays->second, [&](const auto &display) {
+      return display.at("id") == target_id && display.at("kind") == "physical";
+    });
+    if (target == displays->second.end()) {
+      error_message = "Display profile target is unavailable";
+      return false;
+    }
+    nlohmann::json mode = nullptr;
+    if (configuration.at("modeId").is_string()) {
+      mode = terra_resolve_display_mode(*target, configuration.at("modeId").get<std::string>());
+      if (mode.is_null()) {
+        error_message = "Display profile mode is unavailable";
+        return false;
+      }
+    }
+    const auto snapshots = terra::windows::display::enumerate_snapshot(http::unique_id, display_device::enumerate_devices());
+    const auto platform = std::ranges::find(snapshots, target_id, &terra::windows::display::Snapshot::resource_uuid);
+    const auto hdr = configuration.at("hdr").is_boolean() ? std::optional<bool> {configuration.at("hdr").get<bool>()} : std::nullopt;
+    const bool primary = configuration.at("primaryPolicy") == "preserve" ? target->at("primary").get<bool>() : true;
+    if (platform == snapshots.end() || !terra_apply_physical_display(platform->device_id, mode, primary, hdr, displays->second.dump())) {
+      error_message = "Display profile could not be applied";
+      return false;
+    }
+    const auto restore_policy = configuration.at("restorePolicy").get<std::string>();
+    session.display_restore = restore_policy == "always" ? rtsp_stream::display_restore_e::always : restore_policy == "on-stop" ? rtsp_stream::display_restore_e::on_stop :
+                                                                                                                                  rtsp_stream::display_restore_e::never;
+    session.capture_output_name = platform->device_id;
+    return true;
+  }
+
+  /**
    * @brief Replace the desired topology for managed physical displays.
    */
   void terra_display_topology_put(resp_https_t response, req_https_t request) {
-    const auto client = authorize_terra_request(response, request, "display.manage");
+    auto client = authorize_terra_request(response, request, "display.manage");
     if (!client) {
+      return;
+    }
+    std::lock_guard client_mutation_lock {terra_client_mutation_mutex(client->uuid)};
+    client = authorize_terra_request(response, request, "display.manage");
+    if (!client) {
+      return;
+    }
+    auto before = terra_unified_displays(&*client);
+    if (!before) {
+      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Windows display inventory is unavailable");
+      return;
+    }
+    const auto topology_revision = terra_topology_document(before->second, &*client).at("revision").get<std::uint64_t>();
+    const auto if_match = terra_require_if_match(response, request, topology_revision, "topology");
+    if (!if_match) {
       return;
     }
     const auto body = terra_request_json(response, request);
     if (!body) {
       return;
     }
-    if (!body->contains("displays") || !body->at("displays").is_array()) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Body must contain a displays array");
-      return;
-    }
-    const auto if_match = terra_if_match(request);
-    if (!if_match) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_precondition_required, "precondition_required", "If-Match header with the current topology revision is required");
-      return;
-    }
-    auto before = terra_unified_displays();
-    if (!before) {
-      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Windows display inventory is unavailable");
-      return;
-    }
-    std::uint64_t topology_revision = 0;
-    {
-      std::scoped_lock lock {terra_topology_state.mutex};
-      topology_revision = terra_topology_state.revision;
-    }
-    if (topology_revision == 0 || *if_match != topology_revision) {
-      nlohmann::json details {{"currentRevision", topology_revision}};
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "revision_conflict", "Topology revision does not match If-Match", std::move(details));
+    if (body->size() != 2 || !body->contains("displays") || !body->at("displays").is_array()) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Body must contain only schemaVersion and displays");
       return;
     }
 
@@ -3481,12 +4615,17 @@ namespace nvhttp {
     };
 
     std::vector<requested_display_t> requested;
+    std::set<std::string> requested_ids;
     for (const auto &entry : body->at("displays")) {
-      if (!entry.is_object() || !entry.contains("id") || !entry.at("id").is_string() || !entry.contains("enabled") || !entry.at("enabled").is_boolean() || !entry.contains("primary") || !entry.at("primary").is_boolean() || !entry.contains("x") || !entry.at("x").is_number_integer() || !entry.contains("y") || !entry.at("y").is_number_integer() || !entry.contains("scale") || !entry.at("scale").is_number() || !entry.contains("rotation") || !entry.at("rotation").is_number_integer()) {
-        send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Each displays entry requires id, enabled, primary, x, y, scale, and rotation");
+      if (!entry.is_object() || entry.size() != 9 || !entry.contains("id") || !entry.at("id").is_string() || !entry.contains("enabled") || !entry.at("enabled").is_boolean() || !entry.contains("primary") || !entry.at("primary").is_boolean() || !entry.contains("x") || !entry.at("x").is_number_integer() || !entry.contains("y") || !entry.at("y").is_number_integer() || !entry.contains("scale") || !entry.at("scale").is_object() || entry.at("scale").size() != 2 || !entry.at("scale").contains("numerator") || !entry.at("scale").at("numerator").is_number_unsigned() || !entry.at("scale").contains("denominator") || !entry.at("scale").at("denominator").is_number_unsigned() || entry.at("scale").at("denominator") == 0 || !entry.contains("rotation") || !entry.at("rotation").is_number_integer() || !entry.contains("modeId") || (!entry.at("modeId").is_null() && !entry.at("modeId").is_string()) || !entry.contains("hdr") || (!entry.at("hdr").is_null() && !entry.at("hdr").is_boolean())) {
+        send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Each displays entry requires exact id, enabled, primary, x, y, rational scale, rotation, modeId, and hdr fields");
         return;
       }
       const auto display_id = entry.at("id").get<std::string>();
+      if (!terra_canonical_uuid(display_id) || !requested_ids.emplace(display_id).second) {
+        send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Display identifiers must be unique");
+        return;
+      }
       const auto found = std::ranges::find_if(before->second, [&](const nlohmann::json &display) {
         return display.at("id") == display_id;
       });
@@ -3498,32 +4637,36 @@ namespace nvhttp {
         send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Disabling displays is not supported by this host");
         return;
       }
-      if (entry.at("rotation").get<int>() != 0) {
+      if (entry.at("rotation") != 0) {
         send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Rotation values other than zero are not supported by this host");
         return;
       }
+      if (entry.at("scale").at("numerator") == 0 || entry.at("x") != found->at("position").at("x") || entry.at("y") != found->at("position").at("y") || entry.at("scale") != found->at("scale")) {
+        send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Changing physical display position or scale is not supported by this host");
+        return;
+      }
       nlohmann::json mode = nullptr;
-      if (entry.contains("modeId") && !entry.at("modeId").is_null()) {
+      if (!entry.at("modeId").is_null()) {
         mode = terra_resolve_display_mode(*found, entry.at("modeId").get<std::string>());
         if (mode.is_null()) {
           send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Requested display mode is not supported by the display");
           return;
         }
       }
-      requested.push_back({*found, entry.at("primary").get<bool>(), entry.contains("hdr") && !entry.at("hdr").is_null() ? std::optional<bool> {entry.at("hdr").get<bool>()} : std::nullopt, std::move(mode)});
+      requested.push_back({*found, entry.at("primary").get<bool>(), !entry.at("hdr").is_null() ? std::optional<bool> {entry.at("hdr").get<bool>()} : std::nullopt, std::move(mode)});
     }
-    if (std::ranges::count_if(requested, [](const auto &entry) {
-          return entry.primary;
-        }) > 1) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Only one display may be requested as primary");
+    if (!requested.empty() && std::ranges::count_if(requested, [](const auto &entry) {
+                                return entry.primary;
+                              }) != 1) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Exactly one listed display must be requested as primary");
       return;
     }
     if (requested.empty()) {
-      const auto after = terra_unified_displays();
+      const auto after = terra_unified_displays(&*client);
       send_terra_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                           {"topology", terra_topology_document(after ? after->second : nlohmann::json::array())},
-                                                                           {"displays", after ? after->second : nlohmann::json::array()},
-                                                                         });
+                                                                         {"topology", terra_topology_document(after ? after->second : nlohmann::json::array(), &*client)},
+                                                                         {"displays", after ? after->second : nlohmann::json::array()},
+                                                                       });
       return;
     }
     const auto previous_fingerprint = before->second.dump();
@@ -3544,33 +4687,68 @@ namespace nvhttp {
         break;
       }
     }
-    const auto after = terra_unified_displays();
+    const auto after = terra_unified_displays(&*client);
+    if (applied && after) {
+      for (const auto &entry : requested) {
+        const auto actual = std::ranges::find_if(after->second, [&](const nlohmann::json &display) {
+          return display.at("id") == entry.display.at("id");
+        });
+        if (actual == after->second.end() || actual->at("primary") != entry.primary || (!entry.mode.is_null() && (actual->at("currentMode").is_null() || actual->at("currentMode").at("id") != entry.mode.at("id"))) || (entry.hdr && actual->at("hdrEnabled") != *entry.hdr)) {
+          applied = false;
+          break;
+        }
+      }
+    }
     if (!applied || !after) {
       display_device::revert_configuration();
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "host_failure", "Topology could not be applied; requested state was reverted");
       return;
     }
-    BOOST_LOG(info) << "Audit: client ["sv << client->uuid << "] applied display topology";
     send_terra_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                         {"topology", terra_topology_document(after->second)},
-                                                                         {"displays", after->second},
-                                                                       });
+                                                                       {"topology", terra_topology_document(after->second, &*client)},
+                                                                       {"displays", after->second},
+                                                                     });
   }
 
   /**
    * @brief Patch one managed display resource.
    */
   void terra_patch_display(resp_https_t response, req_https_t request) {
-    const auto client = authorize_terra_request(response, request, "display.manage");
+    auto client = authorize_terra_request(response, request, "display.manage");
+    if (!client) {
+      return;
+    }
+    std::lock_guard client_mutation_lock {terra_client_mutation_mutex(client->uuid)};
+    client = authorize_terra_request(response, request, "display.manage");
     if (!client) {
       return;
     }
     const auto display_id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, display_id, "Display")) {
+      return;
+    }
+    const auto requested_revision = terra_require_if_match_value(response, request, "Display");
+    if (!requested_revision) {
+      return;
+    }
     const auto body = terra_request_json(response, request);
     if (!body) {
       return;
     }
-    auto before = terra_unified_displays();
+    const auto virtual_patch = terra_virtual_patch(*body);
+    const auto idempotency_key = terra_header(request, "Idempotency-Key");
+    if (virtual_patch && (!virtual_patch->scale || *virtual_patch->scale == 1.0) && idempotency_key && !idempotency_key->empty() && scope_allowed(*client, "virtual-display.manage") && terra_operation_store && terra_operation_store->available()) {
+      const auto replay = terra_operation_store->replay_exact(client->uuid, "virtual-display.patch", *idempotency_key, terra_operations::item_request_body(*body, display_id, *requested_revision));
+      if (replay) {
+        if (replay->status == terra_operations::submission_status_t::conflict) {
+          send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "idempotency_conflict", "Idempotency-Key was already used with different request content");
+        } else {
+          send_terra_response(response, SimpleWeb::StatusCode::success_accepted, replay->response);
+        }
+        return;
+      }
+    }
+    auto before = terra_unified_displays(&*client);
     if (!before) {
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Windows display inventory is unavailable");
       return;
@@ -3586,7 +4764,14 @@ namespace nvhttp {
       terra_patch_virtual_display(response, request);
       return;
     }
+    const auto revision = terra_require_if_match(response, request, found->at("revision").get<std::uint64_t>(), "display");
+    if (!revision) {
+      return;
+    }
     for (const auto &field : body->items()) {
+      if (field.key() == "schemaVersion") {
+        continue;
+      }
       if (field.key() == "position" || field.key() == "scale" || field.key() == "rotation") {
         send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", std::format("{} is immutable on this host", field.key()));
         return;
@@ -3595,6 +4780,10 @@ namespace nvhttp {
         send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", std::format("{} is not a mutable display field", field.key()));
         return;
       }
+    }
+    if (body->size() == 1 || (body->contains("enabled") && !body->at("enabled").is_boolean()) || (body->contains("primary") && !body->at("primary").is_boolean()) || (body->contains("modeId") && !body->at("modeId").is_null() && (!body->at("modeId").is_string() || body->at("modeId").get_ref<const std::string &>().empty())) || (body->contains("hdr") && !body->at("hdr").is_null() && !body->at("hdr").is_boolean())) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Display patch fields have invalid types or patch is empty");
+      return;
     }
     if (body->contains("enabled") && !body->at("enabled").get<bool>()) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Disabling displays is not supported by this host");
@@ -3625,7 +4814,7 @@ namespace nvhttp {
       body->contains("hdr") && !body->at("hdr").is_null() ? std::optional<bool> {body->at("hdr").get<bool>()} : std::nullopt,
       before->second.dump()
     );
-    const auto after = terra_unified_displays();
+    const auto after = terra_unified_displays(&*client);
     if (!applied || !after) {
       display_device::revert_configuration();
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "host_failure", "Display state could not be applied; requested state was reverted");
@@ -3634,11 +4823,12 @@ namespace nvhttp {
     const auto updated = std::ranges::find_if(after->second, [&](const nlohmann::json &display) {
       return display.at("id") == display_id;
     });
-    if (updated == after->second.end()) {
-      send_terra_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, "host_failure", "Display disappeared during mutation");
+    const bool matches = updated != after->second.end() && (!body->contains("enabled") || updated->at("enabled") == body->at("enabled")) && (!body->contains("primary") || updated->at("primary") == body->at("primary")) && (mode.is_null() || (!updated->at("currentMode").is_null() && updated->at("currentMode").at("id") == mode.at("id"))) && (!body->contains("hdr") || body->at("hdr").is_null() || updated->at("hdrEnabled") == body->at("hdr"));
+    if (!matches) {
+      display_device::revert_configuration();
+      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "host_failure", "Display did not reach requested state; previous configuration was restored");
       return;
     }
-    BOOST_LOG(info) << "Audit: client ["sv << client->uuid << "] patched display ["sv << display_id << ']';
     send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"display", *updated}});
   }
 
@@ -3646,7 +4836,8 @@ namespace nvhttp {
    * @brief Return physical display resources visible to caller.
    */
   void terra_displays(resp_https_t response, req_https_t request) {
-    if (!authorize_terra_request(response, request, "display.read")) {
+    const auto client = authorize_terra_request(response, request, "display.read");
+    if (!client) {
       return;
     }
     std::optional<std::uint64_t> since;
@@ -3663,29 +4854,33 @@ namespace nvhttp {
         return;
       }
     }
-    auto snapshot = terra_unified_displays();
+    auto snapshot = terra_unified_displays(&*client);
     if (!snapshot) {
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Windows display inventory is unavailable");
       return;
     }
     const bool changed = !since || *since != snapshot->first;
     send_terra_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                         {"revision", snapshot->first},
-                                                                         {"changed", changed},
-                                                                         {"fullSnapshot", changed},
-                                                                         {"displays", changed ? std::move(snapshot->second) : nlohmann::json::array()},
-                                                                       });
+                                                                       {"revision", snapshot->first},
+                                                                       {"changed", changed},
+                                                                       {"fullSnapshot", changed},
+                                                                       {"displays", changed ? std::move(snapshot->second) : nlohmann::json::array()},
+                                                                     });
   }
 
   /**
    * @brief Return one physical display resource.
    */
   void terra_display(resp_https_t response, req_https_t request) {
-    if (!authorize_terra_request(response, request, "display.read")) {
+    const auto client = authorize_terra_request(response, request, "display.read");
+    if (!client) {
       return;
     }
     const auto display_id = request->path_match[1].str();
-    auto snapshot = terra_unified_displays();
+    if (!terra_require_canonical_uuid(response, display_id, "Display")) {
+      return;
+    }
+    auto snapshot = terra_unified_displays(&*client);
     if (snapshot) {
       for (auto &display : snapshot->second) {
         if (display.at("id") == display_id) {
@@ -3711,6 +4906,46 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Return whether text is a canonical lowercase UUID.
+   *
+   * @param value Candidate UUID text.
+   * @return `true` for canonical lowercase UUID text.
+   */
+  bool terra_canonical_uuid(const std::string &value) {
+    return uuid_util::is_valid(value) && std::ranges::none_of(value, [](const unsigned char character) {
+             return character >= 'A' && character <= 'F';
+           });
+  }
+
+  /**
+   * @brief Match one case-insensitive token in a comma-separated HTTP header.
+   *
+   * @param value Complete header value.
+   * @param token Token to match.
+   * @return `true` when one trimmed list entry equals the token.
+   */
+  bool terra_header_contains_token(std::string_view value, std::string_view token) {
+    while (!value.empty()) {
+      const auto comma = value.find(',');
+      auto candidate = value.substr(0, comma);
+      const auto first = candidate.find_first_not_of(" \t");
+      if (first != std::string_view::npos) {
+        candidate.remove_prefix(first);
+        const auto last = candidate.find_last_not_of(" \t");
+        candidate = candidate.substr(0, last + 1);
+        if (boost::iequals(candidate, token)) {
+          return true;
+        }
+      }
+      if (comma == std::string_view::npos) {
+        break;
+      }
+      value.remove_prefix(comma + 1);
+    }
+    return false;
+  }
+
+  /**
    * @brief Parse required strong numeric `If-Match` revision.
    *
    * @param request HTTPS request.
@@ -3730,6 +4965,47 @@ namespace nvhttp {
     } catch (const std::exception &) {
       return std::nullopt;
     }
+  }
+
+  /**
+   * @brief Require a syntactically valid strong numeric resource revision.
+   *
+   * @param response HTTPS response used for structured errors.
+   * @param request HTTPS request carrying `If-Match`.
+   * @param resource_name Human-readable resource name used in diagnostics.
+   * @return Parsed revision, or no value after sending an error.
+   */
+  std::optional<std::uint64_t> terra_require_if_match_value(const resp_https_t &response, const req_https_t &request, const std::string_view resource_name) {
+    if (!terra_header(request, "If-Match")) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_precondition_required, "precondition_required", std::format("Strong numeric If-Match header with the current {} revision is required", resource_name));
+      return std::nullopt;
+    }
+    const auto revision = terra_if_match(request);
+    if (!revision) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "If-Match must contain one strong quoted positive numeric revision");
+    }
+    return revision;
+  }
+
+  /**
+   * @brief Require a current strong numeric resource revision.
+   *
+   * @param response HTTPS response used for structured errors.
+   * @param request HTTPS request carrying `If-Match`.
+   * @param current_revision Current resource revision.
+   * @param resource_name Human-readable resource name used in diagnostics.
+   * @return Parsed matching revision, or no value after sending an error.
+   */
+  std::optional<std::uint64_t> terra_require_if_match(const resp_https_t &response, const req_https_t &request, const std::uint64_t current_revision, const std::string_view resource_name) {
+    const auto revision = terra_require_if_match_value(response, request, resource_name);
+    if (!revision) {
+      return std::nullopt;
+    }
+    if (*revision != current_revision) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "revision_conflict", std::format("{} revision does not match If-Match", resource_name), {{"currentRevision", current_revision}});
+      return std::nullopt;
+    }
+    return revision;
   }
 
   /**
@@ -3761,7 +5037,7 @@ namespace nvhttp {
     }
     try {
       auto json = nlohmann::json::parse(body.text);
-      if (!json.is_object() || json.value("schemaVersion", 0) != terra_api::API_VERSION) {
+      if (!terra_api::valid_request_schema(json)) {
         send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Request body must be a schemaVersion 1 JSON object");
         return std::nullopt;
       }
@@ -3770,6 +5046,42 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Request body is not valid JSON");
       return std::nullopt;
     }
+  }
+
+  /**
+   * @brief Require an exact schema-version-only JSON request object.
+   *
+   * @param response HTTPS response used for structured errors.
+   * @param request HTTPS request carrying JSON.
+   * @param action_name Human-readable action name used in diagnostics.
+   * @return Validated request object, or no value after sending an error.
+   */
+  std::optional<nlohmann::json> terra_empty_request_json(const resp_https_t &response, const req_https_t &request, const std::string_view action_name) {
+    auto body = terra_request_json(response, request);
+    if (!body) {
+      return std::nullopt;
+    }
+    if (body->size() != 1 || !body->contains("schemaVersion")) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", std::format("{} requires an empty schema-versioned object", action_name));
+      return std::nullopt;
+    }
+    return body;
+  }
+
+  /**
+   * @brief Reject a malformed UUID path parameter before resource lookup or operation submission.
+   *
+   * @param response HTTPS response receiving validation failure.
+   * @param id Path parameter value.
+   * @param resource_name Human-readable resource name used in diagnostics.
+   * @return `true` when the value is a canonical UUID.
+   */
+  bool terra_require_canonical_uuid(const resp_https_t &response, const std::string_view id, const std::string_view resource_name) {
+    if (terra_canonical_uuid(std::string {id})) {
+      return true;
+    }
+    send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", std::format("{} ID must be a canonical UUID", resource_name));
+    return false;
   }
 
 #ifdef _WIN32
@@ -3781,7 +5093,7 @@ namespace nvhttp {
    */
   std::optional<terra_virtual_display::mode_t> terra_virtual_mode(const nlohmann::json &value) {
     try {
-      if (!value.is_object()) {
+      if (!terra_fields_allowed(value, {"width", "height", "refreshNumerator", "refreshDenominator", "bitDepth", "hdr"}) || value.size() != 6) {
         return std::nullopt;
       }
       return terra_virtual_display::mode_t {
@@ -3805,9 +5117,12 @@ namespace nvhttp {
    */
   std::optional<terra_virtual_display::specification_t> terra_virtual_specification(const nlohmann::json &value) {
     try {
+      if (!terra_fields_allowed(value, {"schemaVersion", "name", "mode", "position", "scale", "rotation", "primary", "hdr", "persistent", "workspaceId"})) {
+        return std::nullopt;
+      }
       const auto mode = terra_virtual_mode(value.at("mode"));
       const auto &position = value.at("position");
-      if (!mode || !position.is_object()) {
+      if (!mode || !terra_fields_allowed(position, {"x", "y"}) || position.size() != 2) {
         return std::nullopt;
       }
       terra_virtual_display::specification_t result {
@@ -3823,6 +5138,9 @@ namespace nvhttp {
       };
       if (value.contains("workspaceId") && !value.at("workspaceId").is_null()) {
         result.workspace_id = value.at("workspaceId").get<std::string>();
+        if (!terra_canonical_uuid(*result.workspace_id)) {
+          return std::nullopt;
+        }
       }
       return result;
     } catch (const std::exception &) {
@@ -3839,6 +5157,9 @@ namespace nvhttp {
   std::optional<terra_virtual_display::patch_t> terra_virtual_patch(const nlohmann::json &value) {
     terra_virtual_display::patch_t result;
     try {
+      if (!terra_fields_allowed(value, {"schemaVersion", "name", "mode", "position", "scale", "rotation", "primary", "hdr", "persistent", "workspaceId"})) {
+        return std::nullopt;
+      }
       if (value.contains("name")) {
         result.name = value.at("name").get<std::string>();
       }
@@ -3849,6 +5170,9 @@ namespace nvhttp {
         }
       }
       if (value.contains("position")) {
+        if (!terra_fields_allowed(value.at("position"), {"x", "y"}) || value.at("position").size() != 2) {
+          return std::nullopt;
+        }
         result.position = terra_virtual_display::position_t {value.at("position").at("x").get<int>(), value.at("position").at("y").get<int>()};
       }
       if (value.contains("scale")) {
@@ -3868,6 +5192,9 @@ namespace nvhttp {
       }
       if (value.contains("workspaceId")) {
         result.workspace_id = value.at("workspaceId").is_null() ? std::optional<std::string> {} : std::optional<std::string> {value.at("workspaceId").get<std::string>()};
+        if (*result.workspace_id && !terra_canonical_uuid(**result.workspace_id)) {
+          return std::nullopt;
+        }
       }
     } catch (const std::exception &) {
       return std::nullopt;
@@ -3890,6 +5217,88 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Publish one committed virtual-display transition using direct-read visibility.
+   *
+   * @param previous Resource before mutation, or no value for creation.
+   * @param current Resource after mutation, or no value for removal.
+   */
+  void publish_terra_virtual_display_change(const std::optional<terra_virtual_display::resource_t> &previous, const std::optional<terra_virtual_display::resource_t> &current) {
+    if (!terra_event_hub) {
+      return;
+    }
+    std::vector<verified_client_t> clients;
+    {
+      std::lock_guard lock {client_auth_mutex};
+      for (const auto &client : client_root.named_devices) {
+        verified_client_t verified {client.uuid, client.name, client.cert, client.permissions};
+        if (client.enabled && !permissions_expired(client.permissions) && scope_allowed(verified, "display.read")) {
+          clients.push_back(std::move(verified));
+        }
+      }
+    }
+    for (const auto &client : clients) {
+      const bool previous_visible = previous && terra_virtual_visible(client, *previous);
+      const bool current_visible = current && terra_virtual_visible(client, *current);
+      if (!previous_visible && !current_visible) {
+        continue;
+      }
+      if (!previous_visible) {
+        terra_event_hub->publish({"virtualDisplay.created", current->id, current->revision, terra_virtual_display::to_json(*current)}, {client.uuid});
+      } else if (!current_visible) {
+        terra_event_hub->publish({"virtualDisplay.removed", previous->id, previous->revision + 1, {{"id", previous->id}, {"revision", previous->revision + 1}}}, {client.uuid});
+      } else {
+        terra_event_hub->publish({"virtualDisplay.updated", current->id, current->revision, terra_virtual_display::to_json(*current)}, {client.uuid});
+      }
+    }
+    publish_terra_display_changes();
+  }
+
+  /**
+   * @brief Detach persistent and remove ephemeral virtual displays owned by an ended session.
+   *
+   * @param session_id Canonical ended session UUID.
+   */
+  void terra_end_session_virtual_displays(const std::string &session_id) {
+    std::lock_guard target_lock {terra_target_transaction_mutex};
+    if (!terra_virtual_display_manager) {
+      return;
+    }
+    for (const auto &display : terra_virtual_display_manager->list().resources) {
+      if (display.session_id != session_id) {
+        continue;
+      }
+      const auto detached = terra_virtual_display_manager->detach(display.id, display.revision);
+      if (detached.status != terra_virtual_display::status_t::success || !detached.resource) {
+        BOOST_LOG(error) << "Failed to detach virtual display [" << display.id << "] from ended session [" << session_id << ']';
+        continue;
+      }
+      if (!detached.resource->persistent && terra_virtual_display_manager->remove(display.id, detached.resource->revision).status != terra_virtual_display::status_t::success) {
+        BOOST_LOG(error) << "Failed to remove ephemeral virtual display [" << display.id << "] after session [" << session_id << "] ended";
+      }
+    }
+  }
+
+  /**
+   * @brief Check one virtual-display runtime attachment against current caller visibility.
+   *
+   * @param client Current authenticated caller.
+   * @param attachment Requested session or workspace target.
+   * @return `true` when exactly one canonical target exists and remains visible.
+   */
+  bool terra_virtual_attachment_visible(const verified_client_t &client, const terra_virtual_display::attachment_t &attachment) {
+    if (attachment.session_id) {
+      return terra_canonical_uuid(*attachment.session_id) && std::ranges::any_of(terra_session_snapshots(false), [&](const auto &session) {
+               return session.id == *attachment.session_id && (scope_allowed(client, "host.control") || session.client_uuid == client.uuid);
+             });
+    }
+    if (attachment.workspace_id && terra_canonical_uuid(*attachment.workspace_id) && terra_workspace_manager) {
+      const auto workspace = terra_workspace_manager->get(*attachment.workspace_id);
+      return workspace && (workspace->state == terra_workspaces::state_t::ready || workspace->state == terra_workspaces::state_t::active) && terra_workspace_visible(client, *workspace, true);
+    }
+    return false;
+  }
+
+  /**
    * @brief Convert virtual-display mutation status to operation failure object.
    *
    * @param status Mutation status.
@@ -3904,6 +5313,8 @@ namespace nvhttp {
         return {{"code", "invalid_argument"}, {"message", "Virtual display request is invalid"}};
       case status_t::conflict:
         return {{"code", "revision_conflict"}, {"message", "Virtual display state or revision changed"}};
+      case status_t::limit_reached:
+        return {{"code", "resource_limit"}, {"message", "Virtual display provider capacity is exhausted"}};
       case status_t::provider_error:
         return {{"code", "provider_failure"}, {"message", "MttVDD or Windows display operation failed"}};
       case status_t::persistence_error:
@@ -3916,13 +5327,75 @@ namespace nvhttp {
     return nullptr;
   }
 
-  /** @brief Completed result from one deferred Terra mutation. */
-  struct terra_operation_completion_t {
-    bool succeeded {};  ///< Whether operation reached `succeeded`.
-    std::optional<std::string> resource_id;  ///< Created or changed resource UUID.
-    nlohmann::json result;  ///< Success result document.
-    nlohmann::json error;  ///< Structured failure document.
-  };
+  /** @brief Require an initialized live virtual-display provider for a new mutation. */
+  bool terra_virtual_displays_available(const resp_https_t &response) {
+    if (terra_virtual_display_manager && terra_virtual_display_manager->available()) {
+      return true;
+    }
+    send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "MttVDD virtual display provider is unavailable");
+    return false;
+  }
+
+#endif
+
+  /**
+   * @brief Replay an operation before current resource checks.
+   *
+   * @param response HTTPS response receiving replay or validation failure.
+   * @param client Authenticated operation owner.
+   * @param request Current HTTPS request.
+   * @param action Exact durable operation action.
+   * @param body Canonical operation body.
+   * @return `true` when request was handled as replay, conflict, or validation failure.
+   */
+  bool replay_terra_operation(const resp_https_t &response, const verified_client_t &client, const req_https_t &request, const std::string_view action, const nlohmann::json &body) {
+    const auto key = terra_header(request, "Idempotency-Key");
+    if (!key || key->empty()) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "idempotency_key_required", "Idempotency-Key header is required");
+      return true;
+    }
+    if (!terra_operation_store || !terra_operation_store->available()) {
+      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Operation store is unavailable");
+      return true;
+    }
+    const auto replay = terra_operation_store->replay_exact(client.uuid, action, *key, body);
+    if (!replay) {
+      return false;
+    }
+    if (replay->status == terra_operations::submission_status_t::conflict) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "idempotency_conflict", "Idempotency-Key was already used with different request content");
+    } else if (!replay->operation || !scope_allowed(client, terra_operation_scope(replay->operation->action))) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", "Client certificate lacks operation domain permission");
+    } else {
+      send_terra_response(response, SimpleWeb::StatusCode::success_accepted, replay->response);
+    }
+    return true;
+  }
+
+  /** @brief Replay a profile item operation before current resource checks. */
+  bool replay_terra_profile_operation(const resp_https_t &response, const verified_client_t &client, const req_https_t &request, const std::string_view suffix, const nlohmann::json &body) {
+    const auto key = terra_header(request, "Idempotency-Key");
+    if (!key || key->empty()) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "idempotency_key_required", "Idempotency-Key header is required");
+      return true;
+    }
+    if (!terra_operation_store || !terra_operation_store->available()) {
+      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Operation store is unavailable");
+      return true;
+    }
+    const auto replay = terra_operation_store->replay(client.uuid, "profile.", suffix, *key, body);
+    if (!replay) {
+      return false;
+    }
+    if (replay->status == terra_operations::submission_status_t::conflict) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "idempotency_conflict", "Idempotency-Key was already used with different request content");
+    } else if (!replay->operation || !scope_allowed(client, terra_operation_scope(replay->operation->action))) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", "Client certificate lacks operation domain permission");
+    } else {
+      send_terra_response(response, SimpleWeb::StatusCode::success_accepted, replay->response);
+    }
+    return true;
+  }
 
   /**
    * @brief Submit and schedule one idempotent Terra mutation.
@@ -3940,7 +5413,7 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "idempotency_key_required", "Idempotency-Key header is required");
       return;
     }
-    if (!terra_operation_store) {
+    if (!terra_operation_store || !terra_operation_store->available()) {
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Operation store is unavailable");
       return;
     }
@@ -3961,8 +5434,11 @@ namespace nvhttp {
     if (submission.status == terra_operations::submission_status_t::created) {
       const auto operation_id = submission.operation->id;
       const auto required_scope = std::string {terra_operation_scope(action)};
-      terra_operation_pool.push([operation_id, client_uuid = client.uuid, required_scope, mutation = std::move(mutation)]() mutable {
+      const auto target_id = body.contains("targetId") && body.at("targetId").is_string() ? std::optional<std::string> {body.at("targetId").get<std::string>()} : std::nullopt;
+      terra_operation_pool.push([operation_id, client_uuid = client.uuid, client_certificate = client.cert, action = std::move(action), required_scope, target_id, mutation = std::move(mutation)]() mutable {
+        std::lock_guard client_mutation_lock {terra_client_mutation_mutex(client_uuid)};
         if (!terra_operation_store || !terra_operation_store->transition(operation_id, terra_operations::state_t::running)) {
+          audit_terra_mutation(client_uuid, action, target_id, "persistence_failure");
           return;
         }
 
@@ -3970,7 +5446,7 @@ namespace nvhttp {
         {
           std::lock_guard authorization_lock {client_auth_mutex};
           const auto paired_client = std::ranges::find(client_root.named_devices, client_uuid, &named_cert_t::uuid);
-          if (paired_client != client_root.named_devices.end() && paired_client->enabled && !permissions_expired(paired_client->permissions) && !required_scope.empty() && paired_client->permissions.scopes.contains(required_scope)) {
+          if (paired_client != client_root.named_devices.end() && paired_client->cert == client_certificate && paired_client->enabled && !permissions_expired(paired_client->permissions) && !required_scope.empty() && paired_client->permissions.scopes.contains(required_scope)) {
             current_client = verified_client_t {
               .uuid = paired_client->uuid,
               .name = paired_client->name,
@@ -3980,23 +5456,28 @@ namespace nvhttp {
           }
         }
         if (!current_client) {
-          terra_operation_store->transition(operation_id, terra_operations::state_t::failed, std::nullopt, nullptr, {
-                                                                                                                          {"code", "authorization_revoked"},
-                                                                                                                          {"message", "Client authorization was revoked before operation execution"},
-                                                                                                                        });
+          const auto failed = terra_operation_store->transition(operation_id, terra_operations::state_t::failed, std::nullopt, nullptr, {
+                                                                                                                                          {"code", "authorization_revoked"},
+                                                                                                                                          {"message", "Client authorization was revoked before operation execution"},
+                                                                                                                                        });
+          audit_terra_mutation(client_uuid, action, target_id, failed ? "authorization_revoked" : "persistence_failure");
           return;
         }
         const auto result = mutation(*current_client);
         if (result.succeeded) {
-          terra_operation_store->transition(operation_id, terra_operations::state_t::succeeded, result.resource_id, std::move(result.result));
+          const auto succeeded = terra_operation_store->transition(operation_id, terra_operations::state_t::succeeded, result.resource_id, std::move(result.result));
+          audit_terra_mutation(client_uuid, action, result.resource_id ? result.resource_id : target_id, succeeded ? "succeeded" : "persistence_failure");
         } else {
-          terra_operation_store->transition(operation_id, terra_operations::state_t::failed, std::nullopt, nullptr, std::move(result.error));
+          const auto error_code = result.error.is_object() && result.error.contains("code") && result.error.at("code").is_string() ? result.error.at("code").get<std::string>() : "failed";
+          const auto failed = terra_operation_store->transition(operation_id, terra_operations::state_t::failed, std::nullopt, nullptr, std::move(result.error));
+          audit_terra_mutation(client_uuid, action, target_id, failed ? error_code : "persistence_failure");
         }
       });
     }
     send_terra_response(response, SimpleWeb::StatusCode::success_accepted, submission.response);
   }
 
+#ifdef _WIN32
   /**
    * @brief Submit and schedule idempotent virtual-display mutation.
    *
@@ -4005,11 +5486,11 @@ namespace nvhttp {
    * @param request HTTPS request carrying idempotency key.
    * @param action Stable mutation action.
    * @param body Canonical request body.
-   * @param mutation Deferred manager mutation.
+   * @param mutation Deferred manager mutation receiving current client authorization.
    */
-  void submit_virtual_operation(const resp_https_t &response, const verified_client_t &client, const req_https_t &request, std::string action, const nlohmann::json &body, std::function<terra_virtual_display::result_t()> mutation) {
-    submit_terra_operation(response, client, request, std::move(action), body, [mutation = std::move(mutation)](const verified_client_t &) mutable {
-      const auto result = mutation();
+  void submit_virtual_operation(const resp_https_t &response, const verified_client_t &client, const req_https_t &request, std::string action, const nlohmann::json &body, std::function<terra_virtual_display::result_t(const verified_client_t &)> mutation) {
+    submit_terra_operation(response, client, request, std::move(action), body, [mutation = std::move(mutation)](const verified_client_t &current_client) mutable {
+      const auto result = mutation(current_client);
       if (result.status == terra_virtual_display::status_t::success && result.resource) {
         return terra_operation_completion_t {true, result.resource->id, {{"resource", terra_virtual_display::to_json(*result.resource)}}, nullptr};
       }
@@ -4043,16 +5524,26 @@ namespace nvhttp {
         return;
       }
     }
-    auto listed = terra_virtual_display_manager->list(since);
+    const auto listed = terra_virtual_display_manager->list();
     nlohmann::json resources = nlohmann::json::array();
-    if (listed.changed) {
-      for (const auto &resource : listed.resources) {
-        if (terra_virtual_visible(*client, resource)) {
-          resources.push_back(terra_virtual_display::to_json(resource));
-        }
+    for (const auto &resource : listed.resources) {
+      if (terra_virtual_visible(*client, resource)) {
+        resources.push_back(terra_virtual_display::to_json(resource));
       }
     }
-    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"revision", listed.revision}, {"changed", listed.changed}, {"fullSnapshot", listed.changed}, {"virtualDisplays", std::move(resources)}});
+    const auto fingerprint = resources.dump();
+    std::uint64_t revision;
+    {
+      std::scoped_lock lock {terra_virtual_display_revision.mutex};
+      auto &[previous_fingerprint, projection_revision] = terra_virtual_display_revision.projections[client->uuid];
+      if (projection_revision == 0 || previous_fingerprint != fingerprint) {
+        previous_fingerprint = fingerprint;
+        ++projection_revision;
+      }
+      revision = projection_revision;
+    }
+    const bool changed = !since || *since != revision;
+    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"revision", revision}, {"changed", changed}, {"fullSnapshot", changed}, {"virtualDisplays", changed ? std::move(resources) : nlohmann::json::array()}});
   }
 
   /**
@@ -4063,7 +5554,11 @@ namespace nvhttp {
     if (!client) {
       return;
     }
-    const auto resource = terra_virtual_display_manager ? terra_virtual_display_manager->get(request->path_match[1].str()) : std::nullopt;
+    const auto id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, id, "Virtual display")) {
+      return;
+    }
+    const auto resource = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
     if (!resource || !terra_virtual_visible(*client, *resource)) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
       return;
@@ -4088,8 +5583,20 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "unsupported_configuration", "Virtual display request is invalid or uses unsupported scale");
       return;
     }
-    submit_virtual_operation(response, *client, request, "virtual-display.create", *body, [owner = client->uuid, specification = *specification]() {
-      return terra_virtual_display_manager->create(owner, specification);
+    if (replay_terra_operation(response, *client, request, "virtual-display.create", *body) || !terra_virtual_displays_available(response)) {
+      return;
+    }
+    submit_virtual_operation(response, *client, request, "virtual-display.create", *body, [specification = *specification](const verified_client_t &current_client) {
+      if (!terra_virtual_display_manager || !terra_virtual_display_manager->available()) {
+        return terra_virtual_display::result_t {terra_virtual_display::status_t::unavailable, std::nullopt};
+      }
+      if (specification.workspace_id) {
+        const auto workspace = terra_workspace_manager ? terra_workspace_manager->get(*specification.workspace_id) : std::nullopt;
+        if (!workspace || !terra_workspace_visible(current_client, *workspace, true)) {
+          return terra_virtual_display::result_t {terra_virtual_display::status_t::not_found, std::nullopt};
+        }
+      }
+      return terra_virtual_display_manager->create(current_client.uuid, specification);
     });
   }
 
@@ -4102,18 +5609,11 @@ namespace nvhttp {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto resource = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
-    if (!resource || !terra_virtual_visible(*client, *resource)) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
+    if (!terra_require_canonical_uuid(response, id, "Virtual display")) {
       return;
     }
-    const auto revision = terra_if_match(request);
+    const auto revision = terra_require_if_match_value(response, request, "Virtual display");
     if (!revision) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_precondition_required, "revision_required", "Strong numeric If-Match header is required");
-      return;
-    }
-    if (*revision != resource->revision) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_precondition_failed, "revision_conflict", "Virtual display revision does not match");
       return;
     }
     const auto body = terra_request_json(response, request);
@@ -4124,7 +5624,32 @@ namespace nvhttp {
       }
       return;
     }
-    submit_virtual_operation(response, *client, request, "virtual-display.patch", *body, [id, revision = *revision, patch = *patch]() {
+    const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (replay_terra_operation(response, *client, request, "virtual-display.patch", operation_body)) {
+      return;
+    }
+    if (!terra_virtual_displays_available(response)) {
+      return;
+    }
+    const auto current = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
+    if (!current || !terra_virtual_visible(*client, *current)) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
+      return;
+    }
+    if (!terra_require_if_match(response, request, current->revision, "Virtual display")) {
+      return;
+    }
+    submit_virtual_operation(response, *client, request, "virtual-display.patch", operation_body, [id, revision = *revision, patch = *patch](const verified_client_t &current_client) {
+      const auto current = terra_virtual_display_manager->get(id);
+      if (!current || !terra_virtual_visible(current_client, *current)) {
+        return terra_virtual_display::result_t {terra_virtual_display::status_t::not_found, std::nullopt};
+      }
+      if (patch.workspace_id && *patch.workspace_id) {
+        const auto workspace = terra_workspace_manager ? terra_workspace_manager->get(**patch.workspace_id) : std::nullopt;
+        if (!workspace || !terra_workspace_visible(current_client, *workspace, true)) {
+          return terra_virtual_display::result_t {terra_virtual_display::status_t::not_found, std::nullopt};
+        }
+      }
       return terra_virtual_display_manager->patch(id, revision, patch);
     });
   }
@@ -4138,22 +5663,37 @@ namespace nvhttp {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto resource = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
-    if (!resource || !terra_virtual_visible(*client, *resource)) {
+    if (!terra_require_canonical_uuid(response, id, "Virtual display")) {
+      return;
+    }
+    const auto revision = terra_require_if_match_value(response, request, "Virtual display");
+    if (!revision) {
+      return;
+    }
+    const auto body = terra_empty_request_json(response, request, "Virtual display deletion");
+    if (!body) {
+      return;
+    }
+    auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (replay_terra_operation(response, *client, request, "virtual-display.delete", operation_body)) {
+      return;
+    }
+    if (!terra_virtual_displays_available(response)) {
+      return;
+    }
+    const auto current = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
+    if (!current || !terra_virtual_visible(*client, *current)) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_precondition_required, "revision_required", "Strong numeric If-Match header is required");
+    if (!terra_require_if_match(response, request, current->revision, "Virtual display")) {
       return;
     }
-    if (*revision != resource->revision) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_precondition_failed, "revision_conflict", "Virtual display revision does not match");
-      return;
-    }
-    const nlohmann::json body {{"id", id}, {"revision", *revision}};
-    submit_virtual_operation(response, *client, request, "virtual-display.delete", body, [id, revision = *revision]() {
+    submit_virtual_operation(response, *client, request, "virtual-display.delete", operation_body, [id, revision = *revision](const verified_client_t &current_client) {
+      const auto current = terra_virtual_display_manager->get(id);
+      if (!current || !terra_virtual_visible(current_client, *current)) {
+        return terra_virtual_display::result_t {terra_virtual_display::status_t::not_found, std::nullopt};
+      }
       return terra_virtual_display_manager->remove(id, revision);
     });
   }
@@ -4167,14 +5707,11 @@ namespace nvhttp {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto resource = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
-    if (!resource || !terra_virtual_visible(*client, *resource)) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
+    if (!terra_require_canonical_uuid(response, id, "Virtual display")) {
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != resource->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Virtual display revision does not match" : "Strong numeric If-Match header is required");
+    const auto revision = terra_require_if_match_value(response, request, "Virtual display");
+    if (!revision) {
       return;
     }
     const auto body = terra_request_json(response, request);
@@ -4193,11 +5730,31 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Attachment target is invalid");
       return;
     }
-    if (attachment.session_id.has_value() == attachment.workspace_id.has_value()) {
+    if (body->size() != 2 || attachment.session_id.has_value() == attachment.workspace_id.has_value() || (attachment.session_id && !terra_canonical_uuid(*attachment.session_id)) || (attachment.workspace_id && !terra_canonical_uuid(*attachment.workspace_id))) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Exactly one sessionId or workspaceId is required");
       return;
     }
-    submit_virtual_operation(response, *client, request, "virtual-display.attach", *body, [id, revision = *revision, attachment]() {
+    const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (replay_terra_operation(response, *client, request, "virtual-display.attach", operation_body)) {
+      return;
+    }
+    if (!terra_virtual_displays_available(response)) {
+      return;
+    }
+    const auto current = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
+    if (!current || !terra_virtual_visible(*client, *current)) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
+      return;
+    }
+    if (!terra_require_if_match(response, request, current->revision, "Virtual display")) {
+      return;
+    }
+    submit_virtual_operation(response, *client, request, "virtual-display.attach", operation_body, [id, revision = *revision, attachment](const verified_client_t &current_client) {
+      std::lock_guard target_lock {terra_target_transaction_mutex};
+      const auto current = terra_virtual_display_manager->get(id);
+      if (!current || !terra_virtual_visible(current_client, *current) || !terra_virtual_attachment_visible(current_client, attachment)) {
+        return terra_virtual_display::result_t {terra_virtual_display::status_t::not_found, std::nullopt};
+      }
       return terra_virtual_display_manager->attach(id, revision, attachment);
     });
   }
@@ -4211,18 +5768,37 @@ namespace nvhttp {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto resource = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
-    if (!resource || !terra_virtual_visible(*client, *resource)) {
+    if (!terra_require_canonical_uuid(response, id, "Virtual display")) {
+      return;
+    }
+    const auto revision = terra_require_if_match_value(response, request, "Virtual display");
+    if (!revision) {
+      return;
+    }
+    const auto body = terra_empty_request_json(response, request, "Virtual display detachment");
+    if (!body) {
+      return;
+    }
+    auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (replay_terra_operation(response, *client, request, "virtual-display.detach", operation_body)) {
+      return;
+    }
+    if (!terra_virtual_displays_available(response)) {
+      return;
+    }
+    const auto current = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
+    if (!current || !terra_virtual_visible(*client, *current)) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not visible to this client");
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != resource->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Virtual display revision does not match" : "Strong numeric If-Match header is required");
+    if (!terra_require_if_match(response, request, current->revision, "Virtual display")) {
       return;
     }
-    const nlohmann::json body {{"id", id}, {"revision", *revision}};
-    submit_virtual_operation(response, *client, request, "virtual-display.detach", body, [id, revision = *revision]() {
+    submit_virtual_operation(response, *client, request, "virtual-display.detach", operation_body, [id, revision = *revision](const verified_client_t &current_client) {
+      const auto current = terra_virtual_display_manager->get(id);
+      if (!current || !terra_virtual_visible(current_client, *current)) {
+        return terra_virtual_display::result_t {terra_virtual_display::status_t::not_found, std::nullopt};
+      }
       return terra_virtual_display_manager->detach(id, revision);
     });
   }
@@ -4235,20 +5811,43 @@ namespace nvhttp {
     if (!client) {
       return;
     }
+    if (!scope_allowed(*client, "host.control")) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", "Client certificate lacks host.control permission");
+      return;
+    }
     const auto id = request->path_match[1].str();
-    const auto resource = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
-    if (!resource || resource->owner_client_uuid) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Orphaned virtual display does not exist");
+    if (!terra_require_canonical_uuid(response, id, "Virtual display")) {
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != resource->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Virtual display revision does not match" : "Strong numeric If-Match header is required");
+    const auto revision = terra_require_if_match_value(response, request, "Virtual display");
+    if (!revision) {
       return;
     }
-    const nlohmann::json body {{"id", id}, {"revision", *revision}};
-    submit_virtual_operation(response, *client, request, "virtual-display.adopt", body, [id, revision = *revision, owner = client->uuid]() {
-      return terra_virtual_display_manager->adopt(id, revision, owner);
+    const auto body = terra_empty_request_json(response, request, "Virtual display adoption");
+    if (!body) {
+      return;
+    }
+    auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (replay_terra_operation(response, *client, request, "virtual-display.adopt", operation_body)) {
+      return;
+    }
+    if (!terra_virtual_displays_available(response)) {
+      return;
+    }
+    const auto current = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
+    if (!current || current->owner_client_uuid) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "virtual_display_not_found", "Virtual display does not exist or is not adoptable");
+      return;
+    }
+    if (!terra_require_if_match(response, request, current->revision, "Virtual display")) {
+      return;
+    }
+    submit_virtual_operation(response, *client, request, "virtual-display.adopt", operation_body, [id, revision = *revision](const verified_client_t &current_client) {
+      const auto current = terra_virtual_display_manager->get(id);
+      if (!current || current->owner_client_uuid || !scope_allowed(current_client, "host.control")) {
+        return terra_virtual_display::result_t {terra_virtual_display::status_t::not_found, std::nullopt};
+      }
+      return terra_virtual_display_manager->adopt(id, revision, current_client.uuid);
     });
   }
 
@@ -4270,20 +5869,6 @@ namespace nvhttp {
       return mutation ? "host.control" : "catalog.read";
     }
     return {};
-  }
-
-  /**
-   * @brief Convert current paired-client policy to profile actor context.
-   *
-   * @param client Current client identity and permissions.
-   * @return Profile manager actor.
-   */
-  terra::profiles::actor_t terra_profile_actor(const verified_client_t &client) {
-    return {
-      client.uuid,
-      {client.permissions.scopes.begin(), client.permissions.scopes.end()},
-      {client.permissions.allowed_apps.begin(), client.permissions.allowed_apps.end()},
-    };
   }
 
   /**
@@ -4382,8 +5967,17 @@ namespace nvhttp {
    * @param profile Resulting or removed profile.
    * @param data Event data.
    */
-  void publish_terra_profile_event(const std::string &type, const terra::profiles::profile_t &profile, nlohmann::json data) {
-    publish_terra_event({type, profile.id, profile.revision, std::move(data)}, terra_profile_scope(profile.type, false), profile.shared ? std::string {} : profile.owner_client_uuid.value_or(""), terra_profile_apps(profile));
+  void publish_terra_profile_event(const std::string &type, const terra::profiles::profile_t &profile, nlohmann::json data, const std::optional<terra::profiles::profile_t> &previous = std::nullopt) {
+    ++terra_catalog_change_generation;
+    publish_terra_projection("profile", [&]() {
+      const auto scope = terra_profile_scope(profile.type, false);
+      const auto recipients = profile.owner_client_uuid ? terra_event_recipients(scope, profile.shared ? std::string {} : *profile.owner_client_uuid, terra_profile_apps(profile)) : std::vector<std::string> {};
+      if (previous && type != "profile.removed") {
+        const auto previous_recipients = previous->owner_client_uuid ? terra_event_recipients(terra_profile_scope(previous->type, false), previous->shared ? std::string {} : *previous->owner_client_uuid, terra_profile_apps(*previous)) : std::vector<std::string> {};
+        publish_terra_visibility_loss("profile.removed", profile.id, previous->revision, previous_recipients, recipients);
+      }
+      publish_terra_event_to({type, profile.id, profile.revision, std::move(data)}, recipients);
+    });
   }
 
   /**
@@ -4392,9 +5986,9 @@ namespace nvhttp {
    * @param owner Previous owner UUID.
    * @param permissions Current policy, or no value when identity is revoked.
    */
-  void revoke_terra_profiles(const std::string &owner, const std::optional<terra_api::client_permissions_t> &permissions) {
+  bool revoke_terra_profiles(const std::string &owner, const std::optional<terra_api::client_permissions_t> &permissions) {
     if (!terra_profile_manager) {
-      return;
+      return true;
     }
     terra::profiles::result_t result;
     if (permissions) {
@@ -4405,12 +5999,17 @@ namespace nvhttp {
     }
     if (result.status != terra::profiles::status_t::success) {
       BOOST_LOG(error) << "Failed to persist profile revocation for client [" << owner << ']';
-      return;
+      return false;
+    }
+    if (!result.profiles.empty()) {
+      ++terra_catalog_change_generation;
     }
     for (const auto &profile : result.profiles) {
-      const auto event_owner = profile.shared ? std::string {} : owner;
-      publish_terra_event({"profile.updated", profile.id, profile.revision, terra::profiles::to_json(profile)}, terra_profile_scope(profile.type, false), event_owner, terra_profile_apps(profile));
+      auto previous = profile;
+      previous.owner_client_uuid = owner;
+      publish_terra_profile_event("profile.removed", previous, {{"id", profile.id}, {"revision", profile.revision}});
     }
+    return true;
   }
 
   /** @brief Return profiles visible to caller. */
@@ -4471,6 +6070,9 @@ namespace nvhttp {
       return;
     }
     const auto id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, id, "Profile")) {
+      return;
+    }
     const auto type = terra_profile_manager->type(id);
     if (!type) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
@@ -4478,7 +6080,7 @@ namespace nvhttp {
     }
     const auto scope = terra_profile_scope(*type, false);
     if (!scope_allowed(*client, scope)) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", std::format("Client certificate lacks {} permission", scope));
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
       return;
     }
     const auto result = terra_profile_manager->get(terra_profile_actor(*client), id);
@@ -4495,13 +6097,10 @@ namespace nvhttp {
     if (!client) {
       return;
     }
-    if (!terra_profiles_available(response)) {
-      return;
-    }
     auto body = terra_request_json(response, request);
-    if (!body || !body->contains("type") || !body->at("type").is_string()) {
+    if (!body || body->size() != 5 || !body->contains("type") || !body->at("type").is_string() || !body->contains("name") || !body->at("name").is_string() || body->at("name").get_ref<const std::string &>().empty() || !body->contains("shared") || !body->at("shared").is_boolean() || !body->contains("configuration")) {
       if (body) {
-        send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Profile type is required");
+        send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Profile creation requires exact type, name, shared, and configuration fields");
       }
       return;
     }
@@ -4515,9 +6114,18 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", std::format("Client certificate lacks {} permission", scope));
       return;
     }
+    const auto action = std::format("profile.{}.create", type);
+    if (replay_terra_operation(response, *client, request, action, *body) || !terra_profiles_available(response)) {
+      return;
+    }
+    const auto configuration_status = terra_profile_manager->validate_configuration(type, body->at("configuration"));
+    if (configuration_status != terra::profiles::status_t::success) {
+      send_terra_error(response, configuration_status == terra::profiles::status_t::unsupported ? SimpleWeb::StatusCode::client_error_unprocessable_entity : SimpleWeb::StatusCode::client_error_bad_request, configuration_status == terra::profiles::status_t::unsupported ? "unsupported_configuration" : "invalid_argument", "Profile configuration is invalid or unsupported");
+      return;
+    }
     auto mutation = *body;
     mutation.erase("schemaVersion");
-    submit_terra_operation(response, *client, request, std::format("profile.{}.create", type), *body, [mutation = std::move(mutation)](const verified_client_t &current_client) {
+    submit_terra_operation(response, *client, request, action, *body, [mutation = std::move(mutation)](const verified_client_t &current_client) {
       const auto result = terra_profile_manager->create(terra_profile_actor(current_client), mutation);
       if (result.status != terra::profiles::status_t::success || !result.profile) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, terra_profile_error(result.status, result.message)};
@@ -4533,10 +6141,32 @@ namespace nvhttp {
     if (!client) {
       return;
     }
+    const auto id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, id, "Profile")) {
+      return;
+    }
+    const auto revision = terra_require_if_match_value(response, request, "Profile");
+    if (!revision) {
+      return;
+    }
+    auto body = terra_request_json(response, request);
+    if (!body) {
+      return;
+    }
+    if (body->size() < 2 || !std::ranges::all_of(body->items(), [](const auto &item) {
+          return item.key() == "schemaVersion" || item.key() == "name" || item.key() == "shared" || item.key() == "configuration";
+        }) ||
+        (body->contains("name") && (!body->at("name").is_string() || body->at("name").get_ref<const std::string &>().empty())) || (body->contains("shared") && !body->at("shared").is_boolean())) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Profile patch is empty or contains invalid fields");
+      return;
+    }
+    const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (replay_terra_profile_operation(response, *client, request, ".patch", operation_body)) {
+      return;
+    }
     if (!terra_profiles_available(response)) {
       return;
     }
-    const auto id = request->path_match[1].str();
     const auto stored = terra_profile_manager->inspect(id);
     if (!stored) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
@@ -4551,23 +6181,24 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != stored->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Profile revision does not match" : "Strong numeric If-Match header is required");
+    if (!terra_require_if_match(response, request, stored->revision, "Profile")) {
       return;
     }
-    auto body = terra_request_json(response, request);
-    if (!body) {
-      return;
+    if (body->contains("configuration")) {
+      const auto configuration_status = terra_profile_manager->validate_configuration(stored->type, body->at("configuration"));
+      if (configuration_status != terra::profiles::status_t::success) {
+        send_terra_error(response, configuration_status == terra::profiles::status_t::unsupported ? SimpleWeb::StatusCode::client_error_unprocessable_entity : SimpleWeb::StatusCode::client_error_bad_request, configuration_status == terra::profiles::status_t::unsupported ? "unsupported_configuration" : "invalid_argument", "Profile configuration is invalid or unsupported");
+        return;
+      }
     }
     auto mutation = *body;
     mutation.erase("schemaVersion");
-    submit_terra_operation(response, *client, request, std::format("profile.{}.patch", stored->type), *body, [id, revision = *revision, mutation = std::move(mutation)](const verified_client_t &current_client) {
+    submit_terra_operation(response, *client, request, std::format("profile.{}.patch", stored->type), operation_body, [id, revision = *revision, mutation = std::move(mutation), previous = *stored](const verified_client_t &current_client) {
       const auto result = terra_profile_manager->patch(terra_profile_actor(current_client), id, revision, mutation);
       if (result.status != terra::profiles::status_t::success || !result.profile) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, terra_profile_error(result.status, result.message)};
       }
-      publish_terra_profile_event("profile.updated", *result.profile, terra::profiles::to_json(*result.profile));
+      publish_terra_profile_event("profile.updated", *result.profile, terra::profiles::to_json(*result.profile), previous);
       return terra_operation_completion_t {true, result.profile->id, {{"profile", terra::profiles::to_json(*result.profile)}}, nullptr};
     });
   }
@@ -4578,10 +6209,25 @@ namespace nvhttp {
     if (!client) {
       return;
     }
+    const auto id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, id, "Profile")) {
+      return;
+    }
+    const auto revision = terra_require_if_match_value(response, request, "Profile");
+    if (!revision) {
+      return;
+    }
+    const auto body = terra_empty_request_json(response, request, "Profile deletion");
+    if (!body) {
+      return;
+    }
+    const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (replay_terra_profile_operation(response, *client, request, ".delete", operation_body)) {
+      return;
+    }
     if (!terra_profiles_available(response)) {
       return;
     }
-    const auto id = request->path_match[1].str();
     const auto stored = terra_profile_manager->inspect(id);
     if (!stored) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
@@ -4596,18 +6242,17 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Profile does not exist or is not visible to this client");
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != stored->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Profile revision does not match" : "Strong numeric If-Match header is required");
+    if (!terra_require_if_match(response, request, stored->revision, "Profile")) {
       return;
     }
-    const nlohmann::json body {{"id", id}, {"revision", *revision}};
-    submit_terra_operation(response, *client, request, std::format("profile.{}.delete", stored->type), body, [id, revision = *revision, removed = *stored](const verified_client_t &current_client) {
+    submit_terra_operation(response, *client, request, std::format("profile.{}.delete", stored->type), operation_body, [id, revision = *revision, removed = *stored](const verified_client_t &current_client) {
       const auto result = terra_profile_manager->erase(terra_profile_actor(current_client), id, revision);
       if (result.status != terra::profiles::status_t::success) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, terra_profile_error(result.status, result.message)};
       }
-      publish_terra_profile_event("profile.removed", removed, {{"id", id}, {"revision", result.collection_revision}});
+      auto tombstone = removed;
+      ++tombstone.revision;
+      publish_terra_profile_event("profile.removed", tombstone, {{"id", id}, {"revision", tombstone.revision}});
       return terra_operation_completion_t {true, id, {{"removed", true}, {"id", id}}, nullptr};
     });
   }
@@ -4618,10 +6263,25 @@ namespace nvhttp {
     if (!client) {
       return;
     }
+    const auto id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, id, "Profile")) {
+      return;
+    }
+    const auto revision = terra_require_if_match_value(response, request, "Profile");
+    if (!revision) {
+      return;
+    }
+    const auto body = terra_empty_request_json(response, request, "Profile adoption");
+    if (!body) {
+      return;
+    }
+    const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (replay_terra_profile_operation(response, *client, request, ".adopt", operation_body)) {
+      return;
+    }
     if (!terra_profiles_available(response)) {
       return;
     }
-    const auto id = request->path_match[1].str();
     const auto stored = terra_profile_manager->inspect(id);
     if (!stored || stored->owner_client_uuid) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "profile_not_found", "Orphaned profile does not exist");
@@ -4632,18 +6292,15 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", std::format("Client certificate lacks {} permission", scope));
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != stored->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Profile revision does not match" : "Strong numeric If-Match header is required");
+    if (!terra_require_if_match(response, request, stored->revision, "Profile")) {
       return;
     }
-    const nlohmann::json body {{"id", id}, {"revision", *revision}};
-    submit_terra_operation(response, *client, request, std::format("profile.{}.adopt", stored->type), body, [id, revision = *revision](const verified_client_t &current_client) {
+    submit_terra_operation(response, *client, request, std::format("profile.{}.adopt", stored->type), operation_body, [id, revision = *revision, previous = *stored](const verified_client_t &current_client) {
       const auto result = terra_profile_manager->adopt(terra_profile_actor(current_client), id, revision);
       if (result.status != terra::profiles::status_t::success || !result.profile) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, terra_profile_error(result.status, result.message)};
       }
-      publish_terra_profile_event("profile.updated", *result.profile, terra::profiles::to_json(*result.profile));
+      publish_terra_profile_event("profile.updated", *result.profile, terra::profiles::to_json(*result.profile), previous);
       return terra_operation_completion_t {true, result.profile->id, {{"profile", terra::profiles::to_json(*result.profile)}}, nullptr};
     });
   }
@@ -4753,6 +6410,23 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Validate canonical UUIDs and exact nested virtual-display shapes in a workspace definition.
+   *
+   * @param definition Candidate workspace definition.
+   * @return `true` when identifiers and nested resource declarations are canonical.
+   */
+  bool terra_workspace_definition_well_formed(const terra_workspaces::definition_t &definition) {
+    const std::optional<std::string> *profiles[] {&definition.display_profile_id, &definition.stream_profile_id, &definition.launch_profile_id, &definition.sandbox_profile_id};
+    return terra_canonical_uuid(definition.desktop_app_uuid) && std::ranges::all_of(definition.permitted_app_uuids, terra_canonical_uuid) && std::ranges::all_of(profiles, [](const auto *id) {
+             return !*id || terra_canonical_uuid(**id);
+           }) &&
+           std::ranges::all_of(definition.peripheral_policy.required_device_ids, terra_canonical_uuid) && std::ranges::all_of(definition.virtual_displays, [](const auto &value) {
+             const auto specification = terra_virtual_specification(value);
+             return specification && !specification->workspace_id;
+           });
+  }
+
+  /**
    * @brief Convert workspace status to stable operation error.
    *
    * @param status Workspace manager status.
@@ -4790,24 +6464,47 @@ namespace nvhttp {
    * @param workspace Resulting or removed workspace.
    * @param data Event payload.
    */
-  void publish_terra_workspace_event(const std::string &type, const terra_workspaces::resource_t &workspace, nlohmann::json data) {
-    publish_terra_event({type, workspace.id, workspace.revision, std::move(data)}, "catalog.read", workspace.definition.shared ? std::string {} : workspace.owner_client_uuid.value_or(""), terra_workspace_apps(workspace.definition));
+  void publish_terra_workspace_event(const std::string &type, const terra_workspaces::resource_t &workspace, nlohmann::json data, const std::optional<terra_workspaces::resource_t> &previous = std::nullopt) {
+    publish_terra_projection("workspace", [&]() {
+      const auto recipients = workspace.owner_client_uuid ? terra_event_recipients("catalog.read", workspace.definition.shared ? std::string {} : *workspace.owner_client_uuid, terra_workspace_apps(workspace.definition)) : std::vector<std::string> {};
+      if (previous && type != "workspace.removed") {
+        const auto previous_recipients = previous->owner_client_uuid ? terra_event_recipients("catalog.read", previous->definition.shared ? std::string {} : *previous->owner_client_uuid, terra_workspace_apps(previous->definition)) : std::vector<std::string> {};
+        publish_terra_visibility_loss("workspace.removed", workspace.id, previous->revision, previous_recipients, recipients);
+      }
+      publish_terra_event_to({type, workspace.id, workspace.revision, std::move(data)}, recipients);
+    });
   }
 
   /**
-   * @brief Stop and revoke all workspaces for removed authorization identity.
+   * @brief Stop and revoke workspaces no longer authorized for an identity.
    *
    * @param owner Revoked owner UUID.
+   * @param permissions Current policy for selective cleanup, or no value for full cleanup.
+   * @return True when matching workspaces were reconciled.
    */
-  void revoke_terra_workspaces(const std::string &owner) {
+  bool revoke_terra_workspaces(const std::string &owner, const std::optional<terra_api::client_permissions_t> &permissions) {
     if (!terra_workspace_manager) {
-      return;
+      return true;
     }
-    const auto status = terra_workspace_manager->revoke_owner(owner);
+    auto status = terra_workspaces::status_t::success;
+    if (permissions) {
+      const verified_client_t client {.uuid = owner, .permissions = *permissions};
+      std::vector<std::string> authorized_ids;
+      const auto workspaces = terra_workspace_manager->list();
+      for (const auto &workspace : workspaces.workspaces) {
+        if (workspace.owner_client_uuid == owner && scope_allowed(client, "host.control") && terra_workspace_definition_authorized(client, workspace.definition)) {
+          authorized_ids.push_back(workspace.id);
+        }
+      }
+      status = terra_workspace_manager->revoke_unauthorized(owner, authorized_ids, workspaces.revision);
+    } else {
+      status = terra_workspace_manager->revoke_owner(owner);
+    }
     if (status != terra_workspaces::status_t::success) {
       BOOST_LOG(error) << "Failed to revoke workspaces for client [" << owner << ']';
-      return;
+      return false;
     }
+    return true;
   }
 
   /**
@@ -4817,11 +6514,45 @@ namespace nvhttp {
    * @return `true` when manager is usable.
    */
   bool terra_workspaces_available(const resp_https_t &response) {
-    if (terra_workspace_manager && terra_workspace_manager->available()) {
+    const auto reason = terra_workspace_unavailable_reason();
+    if (reason.empty()) {
       return true;
     }
-    send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Workspace manager is unavailable");
+    send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", std::string {reason});
     return false;
+  }
+
+  /**
+   * @brief Replay and validate one workspace item mutation before durable submission.
+   *
+   * @param response HTTPS response receiving replay or validation failure.
+   * @param client Current authenticated client.
+   * @param request Current HTTPS request.
+   * @param id Canonical workspace UUID.
+   * @param revision Parsed requested revision.
+   * @param action Exact durable action.
+   * @param operation_body Canonical durable operation body.
+   * @param orphan Whether mutation requires an orphaned workspace.
+   * @return Current workspace when submission may proceed.
+   */
+  std::optional<terra_workspaces::resource_t> terra_workspace_mutation_preflight(const resp_https_t &response, const verified_client_t &client, const req_https_t &request, const std::string &id, const std::uint64_t revision, const std::string_view action, const nlohmann::json &operation_body, const bool orphan = false) {
+    if (replay_terra_operation(response, client, request, action, operation_body)) {
+      return std::nullopt;
+    }
+    if (!terra_workspaces_available(response)) {
+      return std::nullopt;
+    }
+    const auto current = terra_workspace_manager ? terra_workspace_manager->get(id) : std::nullopt;
+    const bool visible = current && (orphan ? !current->owner_client_uuid && terra_workspace_definition_authorized(client, current->definition) : terra_workspace_visible(client, *current, true));
+    if (!visible) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace does not exist or is not visible to this client");
+      return std::nullopt;
+    }
+    if (current->revision != revision) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "revision_conflict", "Workspace revision does not match If-Match", {{"currentRevision", current->revision}});
+      return std::nullopt;
+    }
+    return current;
   }
 
   /** @brief Return caller-visible workspace collection. */
@@ -4841,16 +6572,16 @@ namespace nvhttp {
       }
       since = parsed;
     }
-    const auto listed = terra_workspace_manager->list(since);
+    const auto listed = terra_workspace_manager->list();
     nlohmann::json workspaces = nlohmann::json::array();
-    if (listed.changed) {
-      for (const auto &workspace : listed.workspaces) {
-        if (terra_workspace_visible(*client, workspace)) {
-          workspaces.push_back(terra_workspaces::to_json(workspace));
-        }
+    for (const auto &workspace : listed.workspaces) {
+      if (terra_workspace_visible(*client, workspace)) {
+        workspaces.push_back(terra_workspaces::to_json(workspace));
       }
     }
-    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"revision", listed.revision}, {"changed", listed.changed}, {"fullSnapshot", listed.changed}, {"workspaces", std::move(workspaces)}});
+    const auto revision = terra_projection_revision("workspaces", client->uuid, workspaces.dump());
+    const bool changed = !since || *since != revision;
+    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"revision", revision}, {"changed", changed}, {"fullSnapshot", changed}, {"workspaces", changed ? std::move(workspaces) : nlohmann::json::array()}});
   }
 
   /** @brief Return one caller-visible workspace. */
@@ -4859,7 +6590,11 @@ namespace nvhttp {
     if (!client || !terra_workspaces_available(response)) {
       return;
     }
-    const auto workspace = terra_workspace_manager->get(request->path_match[1].str());
+    const auto id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, id, "Workspace")) {
+      return;
+    }
+    const auto workspace = terra_workspace_manager->get(id);
     if (!workspace || !terra_workspace_visible(*client, *workspace)) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace does not exist or is not visible to this client");
       return;
@@ -4870,7 +6605,7 @@ namespace nvhttp {
   /** @brief Create workspace through durable idempotent operation handling. */
   void terra_create_workspace(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "host.control");
-    if (!client || !terra_workspaces_available(response)) {
+    if (!client) {
       return;
     }
     auto body = terra_request_json(response, request);
@@ -4881,6 +6616,13 @@ namespace nvhttp {
     mutation.erase("schemaVersion");
     const auto definition = terra_workspaces::parse_definition(mutation);
     if (!definition) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Workspace creation object is invalid");
+      return;
+    }
+    if (replay_terra_operation(response, *client, request, "workspace.create", *body) || !terra_workspaces_available(response)) {
+      return;
+    }
+    if (!terra_workspace_definition_well_formed(*definition) || !terra_workspace_definition_authorized(*client, *definition)) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Workspace creation object is invalid");
       return;
     }
@@ -4899,18 +6641,15 @@ namespace nvhttp {
   /** @brief Patch workspace definition through durable operation handling. */
   void terra_patch_workspace(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "host.control");
-    if (!client || !terra_workspaces_available(response)) {
+    if (!client) {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto workspace = terra_workspace_manager->get(id);
-    if (!workspace || !terra_workspace_visible(*client, *workspace, true)) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace does not exist or is not visible to this client");
+    if (!terra_require_canonical_uuid(response, id, "Workspace")) {
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != workspace->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Workspace revision does not match" : "Strong numeric If-Match header is required");
+    const auto revision = terra_require_if_match_value(response, request, "Workspace");
+    if (!revision) {
       return;
     }
     auto body = terra_request_json(response, request);
@@ -4924,7 +6663,20 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Workspace patch is empty or invalid");
       return;
     }
-    submit_terra_operation(response, *client, request, "workspace.patch", *body, [id, revision = *revision, patch = *patch](const verified_client_t &current_client) {
+    const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    const auto current = terra_workspace_mutation_preflight(response, *client, request, id, *revision, "workspace.patch", operation_body);
+    if (!current) {
+      return;
+    }
+    const auto candidate = terra_workspace_apply_patch(current->definition, *patch);
+    if (!terra_workspace_definition_well_formed(candidate) || !terra_workspace_definition_authorized(*client, candidate)) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace references are not visible to this client");
+      return;
+    }
+    submit_terra_operation(response, *client, request, "workspace.patch", operation_body, [id, revision = *revision, patch = *patch](const verified_client_t &current_client) {
+      if (!terra_workspace_manager || !terra_workspace_manager->available()) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, terra_workspace_error(terra_workspaces::status_t::unavailable)};
+      }
       const auto current = terra_workspace_manager->get(id);
       if (!current || !terra_workspace_visible(current_client, *current, true) || !terra_workspace_definition_authorized(current_client, terra_workspace_apply_patch(current->definition, patch))) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "workspace_not_found"}, {"message", "Workspace or references are not visible to this client"}}};
@@ -4940,22 +6692,29 @@ namespace nvhttp {
   /** @brief Delete stopped workspace through durable operation handling. */
   void terra_delete_workspace(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "host.control");
-    if (!client || !terra_workspaces_available(response)) {
+    if (!client) {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto workspace = terra_workspace_manager->get(id);
-    if (!workspace || !terra_workspace_visible(*client, *workspace, true)) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace does not exist or is not visible to this client");
+    if (!terra_require_canonical_uuid(response, id, "Workspace")) {
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != workspace->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Workspace revision does not match" : "Strong numeric If-Match header is required");
+    const auto revision = terra_require_if_match_value(response, request, "Workspace");
+    if (!revision) {
       return;
     }
-    const nlohmann::json body {{"id", id}, {"revision", *revision}};
-    submit_terra_operation(response, *client, request, "workspace.delete", body, [id, revision = *revision](const verified_client_t &current_client) {
+    const auto body = terra_empty_request_json(response, request, "Workspace deletion");
+    if (!body) {
+      return;
+    }
+    auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (!terra_workspace_mutation_preflight(response, *client, request, id, *revision, "workspace.delete", operation_body)) {
+      return;
+    }
+    submit_terra_operation(response, *client, request, "workspace.delete", operation_body, [id, revision = *revision](const verified_client_t &current_client) {
+      if (!terra_workspace_manager || !terra_workspace_manager->available()) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, terra_workspace_error(terra_workspaces::status_t::unavailable)};
+      }
       const auto current = terra_workspace_manager->get(id);
       if (!current || !terra_workspace_visible(current_client, *current, true)) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "workspace_not_found"}, {"message", "Workspace does not exist or is not visible to this client"}}};
@@ -4971,18 +6730,15 @@ namespace nvhttp {
   /** @brief Prepare workspace runtime through durable operation handling. */
   void terra_start_workspace(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "stream.launch");
-    if (!client || !terra_workspaces_available(response)) {
+    if (!client) {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto workspace = terra_workspace_manager->get(id);
-    if (!workspace || !terra_workspace_visible(*client, *workspace, true)) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace does not exist or is not controllable by this client");
+    if (!terra_require_canonical_uuid(response, id, "Workspace")) {
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != workspace->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Workspace revision does not match" : "Strong numeric If-Match header is required");
+    const auto revision = terra_require_if_match_value(response, request, "Workspace");
+    if (!revision) {
       return;
     }
     auto body = terra_request_json(response, request);
@@ -4996,7 +6752,20 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Workspace start object is invalid");
       return;
     }
-    submit_terra_operation(response, *client, request, "workspace.start", *body, [id, revision = *revision, start = *start](const verified_client_t &current_client) {
+    if ((start->app_uuid && !terra_canonical_uuid(*start->app_uuid)) || !std::ranges::all_of(std::initializer_list<std::pair<std::string_view, const std::optional<nlohmann::json> *>> {{"display", &start->profile_overrides.display}, {"stream", &start->profile_overrides.stream}, {"launch", &start->profile_overrides.launch}, {"sandbox", &start->profile_overrides.sandbox}}, [](const auto &entry) {
+          return !*entry.second || (**entry.second).is_null() || terra_profile_manager->validate_configuration(std::string {entry.first}, **entry.second) == terra::profiles::status_t::success;
+        })) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Workspace start overrides are invalid or unsupported");
+      return;
+    }
+    const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (!terra_workspace_mutation_preflight(response, *client, request, id, *revision, "workspace.start", operation_body)) {
+      return;
+    }
+    submit_terra_operation(response, *client, request, "workspace.start", operation_body, [id, revision = *revision, start = *start](const verified_client_t &current_client) {
+      if (!terra_workspace_manager || !terra_workspace_manager->available()) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, terra_workspace_error(terra_workspaces::status_t::unavailable)};
+      }
       const auto current = terra_workspace_manager->get(id);
       const auto app_uuid = start.app_uuid.value_or(current ? current->definition.desktop_app_uuid : std::string {});
       if (!current || !terra_workspace_visible(current_client, *current, true) || !app_allowed(current_client, app_uuid) || !terra_workspace_definition_authorized(current_client, current->definition)) {
@@ -5013,18 +6782,15 @@ namespace nvhttp {
   /** @brief Stop or disconnect workspace runtime through durable operation handling. */
   void terra_stop_workspace(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "session.control");
-    if (!client || !terra_workspaces_available(response)) {
+    if (!client) {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto workspace = terra_workspace_manager->get(id);
-    if (!workspace || !terra_workspace_visible(*client, *workspace, true)) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Workspace does not exist or is not controllable by this client");
+    if (!terra_require_canonical_uuid(response, id, "Workspace")) {
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != workspace->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Workspace revision does not match" : "Strong numeric If-Match header is required");
+    const auto revision = terra_require_if_match_value(response, request, "Workspace");
+    if (!revision) {
       return;
     }
     const auto body = terra_request_json(response, request);
@@ -5035,7 +6801,14 @@ namespace nvhttp {
       return;
     }
     const bool terminate = body->at("terminateApplication");
-    submit_terra_operation(response, *client, request, "workspace.stop", *body, [id, revision = *revision, terminate](const verified_client_t &current_client) {
+    const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (!terra_workspace_mutation_preflight(response, *client, request, id, *revision, "workspace.stop", operation_body)) {
+      return;
+    }
+    submit_terra_operation(response, *client, request, "workspace.stop", operation_body, [id, revision = *revision, terminate](const verified_client_t &current_client) {
+      if (!terra_workspace_manager || !terra_workspace_manager->available()) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, terra_workspace_error(terra_workspaces::status_t::unavailable)};
+      }
       const auto current = terra_workspace_manager->get(id);
       if (!current || !terra_workspace_visible(current_client, *current, true)) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "workspace_not_found"}, {"message", "Workspace does not exist or is not controllable by this client"}}};
@@ -5045,7 +6818,8 @@ namespace nvhttp {
         return terra_operation_completion_t {false, std::nullopt, nullptr, terra_workspace_error(result.status)};
       }
       if (terra_peripheral_manager) {
-        terra_peripheral_manager->target_ended("workspace", id, terminate);
+        transition_terra_peripheral_target("workspace", id, terminate);
+        terra_close_target_channels("workspace", id);
       }
       return terra_operation_completion_t {true, id, {{"workspace", terra_workspaces::to_json(*result.resource)}}, nullptr};
     });
@@ -5054,22 +6828,29 @@ namespace nvhttp {
   /** @brief Adopt orphaned persistent workspace through durable operation handling. */
   void terra_adopt_workspace(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "host.control");
-    if (!client || !terra_workspaces_available(response)) {
+    if (!client) {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto workspace = terra_workspace_manager->get(id);
-    if (!workspace || workspace->owner_client_uuid) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "workspace_not_found", "Orphaned workspace does not exist");
+    if (!terra_require_canonical_uuid(response, id, "Workspace")) {
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != workspace->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_precondition_failed : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "revision_required", revision ? "Workspace revision does not match" : "Strong numeric If-Match header is required");
+    const auto revision = terra_require_if_match_value(response, request, "Workspace");
+    if (!revision) {
       return;
     }
-    const nlohmann::json body {{"id", id}, {"revision", *revision}};
-    submit_terra_operation(response, *client, request, "workspace.adopt", body, [id, revision = *revision](const verified_client_t &current_client) {
+    const auto body = terra_empty_request_json(response, request, "Workspace adoption");
+    if (!body) {
+      return;
+    }
+    auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (!terra_workspace_mutation_preflight(response, *client, request, id, *revision, "workspace.adopt", operation_body, true)) {
+      return;
+    }
+    submit_terra_operation(response, *client, request, "workspace.adopt", operation_body, [id, revision = *revision](const verified_client_t &current_client) {
+      if (!terra_workspace_manager || !terra_workspace_manager->available()) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, terra_workspace_error(terra_workspaces::status_t::unavailable)};
+      }
       const auto current = terra_workspace_manager->get(id);
       if (!current || current->owner_client_uuid || !terra_workspace_definition_authorized(current_client, current->definition)) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "workspace_not_found"}, {"message", "Orphaned workspace or references are unavailable"}}};
@@ -5080,17 +6861,6 @@ namespace nvhttp {
       }
       return terra_operation_completion_t {true, id, {{"workspace", terra_workspaces::to_json(*result.resource)}}, nullptr};
     });
-  }
-
-  /**
-   * @brief Return whether text is a canonical lowercase UUID.
-   * @param value Candidate UUID text.
-   * @return `true` for canonical lowercase UUID text.
-   */
-  bool terra_canonical_uuid(const std::string &value) {
-    return uuid_util::is_valid(value) && std::ranges::none_of(value, [](const unsigned char character) {
-             return character >= 'A' && character <= 'F';
-           });
   }
 
   /**
@@ -5133,6 +6903,48 @@ namespace nvhttp {
     }
     return std::ranges::all_of(terra_sandbox_apps(sandbox), [&](const auto &app_uuid) {
       return app_allowed(client, app_uuid);
+    });
+  }
+
+  /**
+   * @brief Emit removal events for resources hidden by one client's policy replacement.
+   * @param client_uuid Changed client UUID.
+   * @param previous_permissions Policy used by prior direct reads.
+   * @param current_permissions Current policy, or empty after authorization loss.
+   */
+  void publish_terra_policy_visibility_losses(const std::string &client_uuid, const terra_api::client_permissions_t &previous_permissions, const std::optional<terra_api::client_permissions_t> &current_permissions) {
+    publish_terra_projection("policy visibility", [&]() {
+      const verified_client_t previous_client {.uuid = client_uuid, .permissions = previous_permissions};
+      const auto currently_visible = [&](const auto &predicate) {
+        return current_permissions && predicate(verified_client_t {.uuid = client_uuid, .permissions = *current_permissions});
+      };
+      if (terra_profile_manager) {
+        for (const auto &profile : terra_profile_manager->list(terra_profile_actor(previous_client)).profiles) {
+          if (!currently_visible([&](const auto &client) {
+                return terra_profile_manager->get(terra_profile_actor(client), profile.id).status == terra::profiles::status_t::success;
+              })) {
+            publish_terra_event_to({"profile.removed", profile.id, profile.revision, {{"id", profile.id}, {"revision", profile.revision}}}, {client_uuid});
+          }
+        }
+      }
+      if (terra_workspace_manager && scope_allowed(previous_client, "catalog.read")) {
+        for (const auto &workspace : terra_workspace_manager->list().workspaces) {
+          if (terra_workspace_visible(previous_client, workspace) && !currently_visible([&](const auto &client) {
+                return scope_allowed(client, "catalog.read") && terra_workspace_visible(client, workspace);
+              })) {
+            publish_terra_event_to({"workspace.removed", workspace.id, workspace.revision, {{"id", workspace.id}, {"revision", workspace.revision}}}, {client_uuid});
+          }
+        }
+      }
+      if (terra_sandbox_manager && scope_allowed(previous_client, "sandbox.manage")) {
+        for (const auto &sandbox : terra_sandbox_manager->list().resources) {
+          if (terra_sandbox_visible(previous_client, sandbox) && !currently_visible([&](const auto &client) {
+                return scope_allowed(client, "sandbox.manage") && terra_sandbox_visible(client, sandbox);
+              })) {
+            publish_terra_event_to({"sandbox.removed", sandbox.id, sandbox.revision, {{"id", sandbox.id}, {"revision", sandbox.revision}}}, {client_uuid});
+          }
+        }
+      }
     });
   }
 
@@ -5220,11 +7032,48 @@ namespace nvhttp {
 
   /** @brief Verify sandbox manager startup availability. */
   bool terra_sandboxes_available(const resp_https_t &response) {
-    if (terra_sandbox_manager && terra_sandbox_manager->available()) {
+    const auto health = terra::windows::sandbox::health();
+    if (terra_sandbox_manager && terra_sandbox_manager->available() && health.available) {
       return true;
     }
-    send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Sandbox provider is unavailable");
+    send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", health.reason.empty() ? "Sandbox provider is unavailable" : health.reason);
     return false;
+  }
+
+  /**
+   * @brief Replay and validate one standalone sandbox mutation before durable submission.
+   *
+   * @param response HTTPS response receiving replay or validation failure.
+   * @param client Current authenticated client.
+   * @param request Current HTTPS request.
+   * @param id Canonical sandbox UUID.
+   * @param revision Parsed requested revision.
+   * @param action Exact durable action.
+   * @param operation_body Canonical durable operation body.
+   * @param orphan Whether mutation requires an orphaned sandbox.
+   * @return Current sandbox when submission may proceed.
+   */
+  std::optional<terra_sandboxes::resource_t> terra_sandbox_mutation_preflight(const resp_https_t &response, const verified_client_t &client, const req_https_t &request, const std::string &id, const std::uint64_t revision, const std::string_view action, const nlohmann::json &operation_body, const bool orphan = false) {
+    if (replay_terra_operation(response, client, request, action, operation_body)) {
+      return std::nullopt;
+    }
+    if (!terra_sandboxes_available(response)) {
+      return std::nullopt;
+    }
+    const auto current = terra_sandbox_manager ? terra_sandbox_manager->get(id) : std::nullopt;
+    const bool visible = current && !current->workspace_id && (orphan ? !current->owner_client_uuid && std::ranges::all_of(terra_sandbox_apps(*current), [&](const auto &app_uuid) {
+                           return app_allowed(client, app_uuid);
+                         }) :
+                                                                        terra_sandbox_visible(client, *current));
+    if (!visible) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Sandbox does not exist or is not visible to this client");
+      return std::nullopt;
+    }
+    if (current->revision != revision) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "revision_conflict", "Sandbox revision does not match If-Match", {{"currentRevision", current->revision}});
+      return std::nullopt;
+    }
+    return current;
   }
 
   /** @brief Convert sandbox lifecycle status to stable operation error. */
@@ -5254,15 +7103,100 @@ namespace nvhttp {
   }
 
   /** @brief Publish sandbox event through current ownership and allowlist projection. */
-  void publish_terra_sandbox_event(const std::string &type, const terra_sandboxes::resource_t &sandbox, nlohmann::json data, const std::string &owner) {
-    publish_terra_event({type, sandbox.id, sandbox.revision, std::move(data)}, "sandbox.manage", owner, terra_sandbox_apps(sandbox));
+  void publish_terra_sandbox_event(const std::string &type, const terra_sandboxes::resource_t &sandbox, nlohmann::json data, const std::string &owner, const std::optional<terra_sandboxes::resource_t> &previous) {
+    publish_terra_projection("sandbox", [&]() {
+      const auto recipients = owner.empty() ? std::vector<std::string> {} : terra_event_recipients("sandbox.manage", owner, terra_sandbox_apps(sandbox));
+      if (previous && type != "sandbox.removed") {
+        const auto previous_recipients = previous->owner_client_uuid ? terra_event_recipients("sandbox.manage", *previous->owner_client_uuid, terra_sandbox_apps(*previous)) : std::vector<std::string> {};
+        publish_terra_visibility_loss("sandbox.removed", sandbox.id, previous->revision, previous_recipients, recipients);
+      }
+      publish_terra_event_to({type, sandbox.id, sandbox.revision, std::move(data)}, recipients);
+    });
   }
 
-  /** @brief Stop and orphan or remove sandboxes owned by revoked client. */
-  void revoke_terra_sandboxes(const std::string &owner) {
-    if (terra_sandbox_manager && terra_sandbox_manager->revoke_owner(owner) != terra_sandboxes::status_t::success) {
-      BOOST_LOG(error) << "Failed to revoke sandboxes for client [" << owner << ']';
+  /** @brief Revoke unauthorized sandboxes. @param owner Owner UUID. @param permissions Current policy, or no value for full cleanup. @return True on completion. */
+  bool revoke_terra_sandboxes(const std::string &owner, const std::optional<terra_api::client_permissions_t> &permissions) {
+    auto status = terra_sandboxes::status_t::success;
+    if (terra_sandbox_manager && permissions) {
+      const verified_client_t client {.uuid = owner, .permissions = *permissions};
+      std::vector<std::string> authorized_ids;
+      const auto sandboxes = terra_sandbox_manager->list();
+      for (const auto &sandbox : sandboxes.resources) {
+        if (sandbox.owner_client_uuid == owner && scope_allowed(client, "sandbox.manage") && std::ranges::all_of(terra_sandbox_apps(sandbox), [&](const auto &app_uuid) {
+              return app_allowed(client, app_uuid);
+            }) &&
+            terra_sandbox_profile(client, sandbox.profile_id, "sandbox")) {
+          authorized_ids.push_back(sandbox.id);
+        }
+      }
+      status = terra_sandbox_manager->revoke_unauthorized(owner, authorized_ids, sandboxes.revision);
+    } else if (terra_sandbox_manager) {
+      status = terra_sandbox_manager->revoke_owner(owner);
     }
+    if (status != terra_sandboxes::status_t::success) {
+      BOOST_LOG(error) << "Failed to revoke sandboxes for client [" << owner << ']';
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * @brief Execute one persisted owner-resource revocation request.
+   *
+   * @param owner Owner UUID whose resources must be reconciled.
+   * @param domains Pending resource-domain bitmask.
+   * @return Domains still pending after this attempt.
+   */
+  std::uint32_t process_terra_revocation(const std::string &owner, const std::uint32_t domains) {
+    auto remaining = domains;
+    bool full_identity = (domains & terra_revoke_full_identity) != 0;
+    std::optional<terra_api::client_permissions_t> permissions;
+    {
+      std::lock_guard lock {client_auth_mutex};
+      const auto client = std::ranges::find(client_root.named_devices, owner, &named_cert_t::uuid);
+      if (client != client_root.named_devices.end() && client->enabled && !permissions_expired(client->permissions)) {
+        permissions = client->permissions;
+      } else {
+        full_identity = true;
+        remaining |= TERRA_FULL_REVOCATION;
+      }
+    }
+    if ((remaining & terra_revoke_peripherals) != 0 && terra_peripheral_manager) {
+      const bool revoke_all_peripherals = full_identity || !permissions || !permissions->scopes.contains("peripheral.forward");
+      std::vector<std::string> revoked_classes;
+      if (!revoke_all_peripherals && permissions) {
+        if (!permissions->input.keyboard) {
+          revoked_classes.emplace_back("keyboard");
+        }
+        if (!permissions->input.mouse) {
+          revoked_classes.emplace_back("mouse");
+        }
+      }
+      if (revoke_all_peripherals || !revoked_classes.empty()) {
+        const auto revoked = revoke_terra_peripheral_owner(owner, revoked_classes);
+        for (const auto &claim : revoked.claims) {
+          terra_close_peripheral_channel(claim.id);
+        }
+      }
+    }
+    remaining &= ~terra_revoke_peripherals;
+    const std::optional<terra_api::client_permissions_t> selective_permissions = full_identity ? std::optional<terra_api::client_permissions_t> {} : permissions;
+    if ((remaining & terra_revoke_workspaces) != 0 && revoke_terra_workspaces(owner, selective_permissions)) {
+      remaining &= ~terra_revoke_workspaces;
+    }
+    if ((remaining & terra_revoke_sandboxes) != 0 && revoke_terra_sandboxes(owner, selective_permissions)) {
+      remaining &= ~terra_revoke_sandboxes;
+    }
+    if ((remaining & terra_revoke_virtual_displays) != 0 && (!terra_virtual_display_manager || (!full_identity && permissions && permissions->scopes.contains("virtual-display.manage")) || terra_virtual_display_manager->revoke_owner(owner) == terra_virtual_display::status_t::success)) {
+      remaining &= ~terra_revoke_virtual_displays;
+    }
+    if ((remaining & terra_revoke_profiles) != 0 && revoke_terra_profiles(owner, full_identity ? std::nullopt : permissions)) {
+      remaining &= ~terra_revoke_profiles;
+    }
+    if ((remaining & TERRA_REVOCATION_DOMAINS) == 0) {
+      remaining = 0;
+    }
+    return remaining;
   }
 
   /**
@@ -5319,16 +7253,16 @@ namespace nvhttp {
       }
       since = parsed;
     }
-    const auto listed = terra_sandbox_manager->list(since);
+    const auto listed = terra_sandbox_manager->list();
     nlohmann::json sandboxes = nlohmann::json::array();
-    if (listed.changed) {
-      for (const auto &sandbox : listed.resources) {
-        if (terra_sandbox_visible(*client, sandbox)) {
-          sandboxes.push_back(terra_sandboxes::to_json(sandbox));
-        }
+    for (const auto &sandbox : listed.resources) {
+      if (terra_sandbox_visible(*client, sandbox)) {
+        sandboxes.push_back(terra_sandboxes::to_json(sandbox));
       }
     }
-    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"revision", listed.revision}, {"changed", listed.changed}, {"fullSnapshot", listed.changed}, {"sandboxes", std::move(sandboxes)}});
+    const auto revision = terra_projection_revision("sandboxes", client->uuid, sandboxes.dump());
+    const bool changed = !since || *since != revision;
+    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"revision", revision}, {"changed", changed}, {"fullSnapshot", changed}, {"sandboxes", changed ? std::move(sandboxes) : nlohmann::json::array()}});
   }
 
   /** @brief Return one caller-visible sandbox. */
@@ -5337,7 +7271,11 @@ namespace nvhttp {
     if (!client || !terra_sandboxes_available(response)) {
       return;
     }
-    const auto sandbox = terra_sandbox_manager->get(request->path_match[1].str());
+    const auto id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, id, "Sandbox")) {
+      return;
+    }
+    const auto sandbox = terra_sandbox_manager->get(id);
     if (!sandbox || !terra_sandbox_visible(*client, *sandbox)) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Sandbox does not exist or is not visible to this client");
       return;
@@ -5348,7 +7286,7 @@ namespace nvhttp {
   /** @brief Create sandbox through durable idempotent operation handling. */
   void terra_create_sandbox(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "sandbox.manage");
-    if (!client || !terra_sandboxes_available(response)) {
+    if (!client) {
       return;
     }
     const auto body = terra_request_json(response, request);
@@ -5373,6 +7311,13 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Sandbox creation object is invalid");
       return;
     }
+    if (!terra_canonical_uuid(creation.profile_id) || (creation.workspace_id && !terra_canonical_uuid(*creation.workspace_id)) || (creation.app_uuid && !terra_canonical_uuid(*creation.app_uuid)) || creation.name.empty()) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Sandbox creation identifiers and name are invalid");
+      return;
+    }
+    if (replay_terra_operation(response, *client, request, "sandbox.create", *body) || !terra_sandboxes_available(response)) {
+      return;
+    }
     const auto profile = terra_canonical_uuid(creation.profile_id) ? terra_sandbox_profile(*client, creation.profile_id, "sandbox") : std::nullopt;
     if (creation.workspace_id) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Workspace-bound sandboxes are created through workspace lifecycle operations");
@@ -5395,7 +7340,6 @@ namespace nvhttp {
       if (result.status != terra_sandboxes::status_t::success || !result.resource) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, terra_sandbox_error(result.status)};
       }
-      BOOST_LOG(info) << "Audit: client [" << current_client.uuid << "] created sandbox [" << result.resource->id << ']';
       return terra_operation_completion_t {true, result.resource->id, {{"sandbox", terra_sandboxes::to_json(*result.resource)}}, nullptr};
     });
   }
@@ -5403,22 +7347,15 @@ namespace nvhttp {
   /** @brief Start sandbox through durable idempotent operation handling. */
   void terra_start_sandbox(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "sandbox.manage");
-    if (!client || !terra_sandboxes_available(response)) {
+    if (!client) {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto sandbox = terra_sandbox_manager->get(id);
-    if (!sandbox || !terra_sandbox_visible(*client, *sandbox)) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Sandbox does not exist or is not visible to this client");
+    if (!terra_require_canonical_uuid(response, id, "Sandbox")) {
       return;
     }
-    if (sandbox->workspace_id) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "Workspace-bound sandbox must be controlled through its workspace");
-      return;
-    }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != sandbox->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_conflict : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "precondition_required", revision ? "Sandbox revision does not match" : "Strong numeric If-Match header is required");
+    const auto revision = terra_require_if_match_value(response, request, "Sandbox");
+    if (!revision) {
       return;
     }
     const auto body = terra_request_json(response, request);
@@ -5441,24 +7378,28 @@ namespace nvhttp {
       }
       return;
     }
-    const auto app_uuid = start.app_uuid ? start.app_uuid : sandbox->app_uuid;
-    const auto launch_profile = start.launch_profile_id && terra_canonical_uuid(*start.launch_profile_id) ? terra_sandbox_profile(*client, *start.launch_profile_id, "launch") : std::nullopt;
-    if (!app_uuid || !terra_canonical_uuid(*app_uuid) || !app_allowed(*client, *app_uuid) || !terra_json_contains_string(sandbox->effective_policy.at("allowedAppUuids"), *app_uuid) || (start.launch_profile_id && (!launch_profile || !terra_sandbox_launch_profile_supported(*launch_profile, *app_uuid, sandbox->profile_id))) || !terra_resolve_sandbox_application(*app_uuid, start.launch_profile_id)) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Sandbox application or launch profile cannot be executed under this policy");
+    if ((start.app_uuid && !terra_canonical_uuid(*start.app_uuid)) || (start.launch_profile_id && !terra_canonical_uuid(*start.launch_profile_id))) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Sandbox start identifiers must be canonical UUIDs");
       return;
     }
-    submit_terra_operation(response, *client, request, "sandbox.start", *body, [id, revision = *revision, start](const verified_client_t &current_client) {
+    const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (!terra_sandbox_mutation_preflight(response, *client, request, id, *revision, "sandbox.start", operation_body)) {
+      return;
+    }
+    submit_terra_operation(response, *client, request, "sandbox.start", operation_body, [id, revision = *revision, start](const verified_client_t &current_client) {
+      if (!terra_sandbox_manager || !terra_sandbox_manager->available()) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, terra_sandbox_error(terra_sandboxes::status_t::unavailable)};
+      }
       const auto current = terra_sandbox_manager->get(id);
       const auto app_uuid = start.app_uuid ? start.app_uuid : (current ? current->app_uuid : std::nullopt);
       const auto launch_profile = start.launch_profile_id && terra_canonical_uuid(*start.launch_profile_id) ? terra_sandbox_profile(current_client, *start.launch_profile_id, "launch") : std::nullopt;
-      if (!current || current->workspace_id || !terra_sandbox_visible(current_client, *current) || !app_uuid || !app_allowed(current_client, *app_uuid) || !terra_json_contains_string(current->effective_policy.at("allowedAppUuids"), *app_uuid) || (start.launch_profile_id && (!launch_profile || !terra_sandbox_launch_profile_supported(*launch_profile, *app_uuid, current->profile_id)))) {
+      if (!current || current->workspace_id || !terra_sandbox_visible(current_client, *current) || !app_uuid || !app_allowed(current_client, *app_uuid) || !terra_json_contains_string(current->effective_policy.at("allowedAppUuids"), *app_uuid) || (start.launch_profile_id && (!launch_profile || !terra_sandbox_launch_profile_supported(*launch_profile, *app_uuid, current->profile_id))) || !terra_resolve_sandbox_application(*app_uuid, start.launch_profile_id)) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "sandbox_not_found"}, {"message", "Sandbox or launch references are unavailable to this client"}}};
       }
       const auto result = terra_sandbox_manager->start(id, revision, start);
       if (result.status != terra_sandboxes::status_t::success || !result.resource) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, terra_sandbox_error(result.status)};
       }
-      BOOST_LOG(info) << "Audit: client [" << current_client.uuid << "] started sandbox [" << id << ']';
       return terra_operation_completion_t {true, id, {{"sandbox", terra_sandboxes::to_json(*result.resource)}}, nullptr};
     });
   }
@@ -5466,22 +7407,15 @@ namespace nvhttp {
   /** @brief Stop or restart sandbox through durable operation handling. */
   void terra_stop_or_restart_sandbox(resp_https_t response, req_https_t request, const bool restart) {
     const auto client = authorize_terra_request(response, request, "sandbox.manage");
-    if (!client || !terra_sandboxes_available(response)) {
+    if (!client) {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto sandbox = terra_sandbox_manager->get(id);
-    if (!sandbox || !terra_sandbox_visible(*client, *sandbox)) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Sandbox does not exist or is not visible to this client");
+    if (!terra_require_canonical_uuid(response, id, "Sandbox")) {
       return;
     }
-    if (sandbox->workspace_id) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "Workspace-bound sandbox must be controlled through its workspace");
-      return;
-    }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != sandbox->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_conflict : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "precondition_required", revision ? "Sandbox revision does not match" : "Strong numeric If-Match header is required");
+    const auto revision = terra_require_if_match_value(response, request, "Sandbox");
+    if (!revision) {
       return;
     }
     const auto body = terra_request_json(response, request);
@@ -5493,7 +7427,14 @@ namespace nvhttp {
     }
     const bool force = body->at("force");
     const auto action = restart ? "sandbox.restart" : "sandbox.stop";
-    submit_terra_operation(response, *client, request, action, *body, [id, revision = *revision, force, restart](const verified_client_t &current_client) {
+    const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (!terra_sandbox_mutation_preflight(response, *client, request, id, *revision, action, operation_body)) {
+      return;
+    }
+    submit_terra_operation(response, *client, request, action, operation_body, [id, revision = *revision, force, restart](const verified_client_t &current_client) {
+      if (!terra_sandbox_manager || !terra_sandbox_manager->available()) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, terra_sandbox_error(terra_sandboxes::status_t::unavailable)};
+      }
       const auto current = terra_sandbox_manager->get(id);
       if (!current || current->workspace_id || !terra_sandbox_visible(current_client, *current)) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "sandbox_not_found"}, {"message", "Sandbox does not exist or is not visible to this client"}}};
@@ -5502,7 +7443,10 @@ namespace nvhttp {
       if (result.status != terra_sandboxes::status_t::success || !result.resource) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, terra_sandbox_error(result.status)};
       }
-      BOOST_LOG(info) << "Audit: client [" << current_client.uuid << "] " << (restart ? "restarted" : "stopped") << " sandbox [" << id << ']';
+      if (terra_peripheral_manager) {
+        transition_terra_peripheral_target("sandbox", id, false);
+        terra_close_target_channels("sandbox", id);
+      }
       return terra_operation_completion_t {true, id, {{"sandbox", terra_sandboxes::to_json(*result.resource)}}, nullptr};
     });
   }
@@ -5520,26 +7464,29 @@ namespace nvhttp {
   /** @brief Delete sandbox through durable operation handling. */
   void terra_delete_sandbox(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "sandbox.manage");
-    if (!client || !terra_sandboxes_available(response)) {
+    if (!client) {
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto sandbox = terra_sandbox_manager->get(id);
-    if (!sandbox || !terra_sandbox_visible(*client, *sandbox)) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Sandbox does not exist or is not visible to this client");
+    if (!terra_require_canonical_uuid(response, id, "Sandbox")) {
       return;
     }
-    if (sandbox->workspace_id) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "Workspace-bound sandbox must be controlled through its workspace");
+    const auto revision = terra_require_if_match_value(response, request, "Sandbox");
+    if (!revision) {
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != sandbox->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_conflict : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "precondition_required", revision ? "Sandbox revision does not match" : "Strong numeric If-Match header is required");
+    const auto body = terra_empty_request_json(response, request, "Sandbox deletion");
+    if (!body) {
       return;
     }
-    const nlohmann::json body {{"id", id}, {"revision", *revision}};
-    submit_terra_operation(response, *client, request, "sandbox.delete", body, [id, revision = *revision](const verified_client_t &current_client) {
+    auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (!terra_sandbox_mutation_preflight(response, *client, request, id, *revision, "sandbox.delete", operation_body)) {
+      return;
+    }
+    submit_terra_operation(response, *client, request, "sandbox.delete", operation_body, [id, revision = *revision](const verified_client_t &current_client) {
+      if (!terra_sandbox_manager || !terra_sandbox_manager->available()) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, terra_sandbox_error(terra_sandboxes::status_t::unavailable)};
+      }
       const auto current = terra_sandbox_manager->get(id);
       if (!current || current->workspace_id || !terra_sandbox_visible(current_client, *current)) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "sandbox_not_found"}, {"message", "Sandbox does not exist or is not visible to this client"}}};
@@ -5549,9 +7496,9 @@ namespace nvhttp {
         return terra_operation_completion_t {false, std::nullopt, nullptr, terra_sandbox_error(result.status)};
       }
       if (terra_peripheral_manager) {
-        terra_peripheral_manager->target_ended("sandbox", id, true);
+        transition_terra_peripheral_target("sandbox", id, true);
+        terra_close_target_channels("sandbox", id);
       }
-      BOOST_LOG(info) << "Audit: client [" << current_client.uuid << "] deleted sandbox [" << id << ']';
       return terra_operation_completion_t {true, id, {{"deleted", true}, {"id", id}}, nullptr};
     });
   }
@@ -5559,45 +7506,35 @@ namespace nvhttp {
   /** @brief Adopt orphaned persistent sandbox through durable operation handling. */
   void terra_adopt_sandbox(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "sandbox.manage");
-    if (!client || !scope_allowed(*client, "host.control") || !terra_sandboxes_available(response)) {
+    if (!client || !scope_allowed(*client, "host.control")) {
       if (client && !scope_allowed(*client, "host.control")) {
         send_terra_error(response, SimpleWeb::StatusCode::client_error_forbidden, "permission_denied", "Client certificate lacks host.control permission");
       }
       return;
     }
     const auto id = request->path_match[1].str();
-    const auto sandbox = terra_sandbox_manager->get(id);
-    if (!sandbox) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Orphaned sandbox does not exist");
+    if (!terra_require_canonical_uuid(response, id, "Sandbox")) {
       return;
     }
-    if (sandbox->owner_client_uuid) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "Sandbox is already owned");
+    const auto revision = terra_require_if_match_value(response, request, "Sandbox");
+    if (!revision) {
       return;
     }
-    if (sandbox->workspace_id) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "Workspace-bound sandbox must be controlled through its workspace");
+    const auto body = terra_empty_request_json(response, request, "Sandbox adoption");
+    if (!body) {
       return;
     }
-    if (!std::ranges::all_of(terra_sandbox_apps(*sandbox), [&](const auto &app_uuid) {
-          return app_allowed(*client, app_uuid);
-        })) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "sandbox_not_found", "Orphaned sandbox does not exist or is not visible to this client");
+    const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
+    if (!terra_sandbox_mutation_preflight(response, *client, request, id, *revision, "sandbox.adopt", operation_body, true)) {
       return;
     }
-    const auto revision = terra_if_match(request);
-    if (!revision || *revision != sandbox->revision) {
-      send_terra_error(response, revision ? SimpleWeb::StatusCode::client_error_conflict : SimpleWeb::StatusCode::client_error_precondition_required, revision ? "revision_conflict" : "precondition_required", revision ? "Sandbox revision does not match" : "Strong numeric If-Match header is required");
-      return;
-    }
-    const auto body = terra_request_json(response, request);
-    if (!body || body->size() != 1) {
-      if (body) {
-        send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Sandbox adoption requires an empty object");
+    submit_terra_operation(response, *client, request, "sandbox.adopt", operation_body, [id, revision = *revision](const verified_client_t &current_client) {
+      if (!scope_allowed(current_client, "host.control")) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "permission_denied"}, {"message", "Client authorization no longer permits sandbox adoption"}}};
       }
-      return;
-    }
-    submit_terra_operation(response, *client, request, "sandbox.adopt", *body, [id, revision = *revision](const verified_client_t &current_client) {
+      if (!terra_sandbox_manager || !terra_sandbox_manager->available()) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, terra_sandbox_error(terra_sandboxes::status_t::unavailable)};
+      }
       const auto current = terra_sandbox_manager->get(id);
       if (!current || current->workspace_id || current->owner_client_uuid || !std::ranges::all_of(terra_sandbox_apps(*current), [&](const auto &app_uuid) {
             return app_allowed(current_client, app_uuid);
@@ -5608,11 +7545,51 @@ namespace nvhttp {
       if (result.status != terra_sandboxes::status_t::success || !result.resource) {
         return terra_operation_completion_t {false, std::nullopt, nullptr, terra_sandbox_error(result.status)};
       }
-      BOOST_LOG(info) << "Audit: client [" << current_client.uuid << "] adopted sandbox [" << id << ']';
       return terra_operation_completion_t {true, id, {{"sandbox", terra_sandboxes::to_json(*result.resource)}}, nullptr};
     });
   }
 #endif
+
+#ifndef _WIN32
+  /** @brief Complete a no-op owner revocation on platforms without Terra runtime providers. */
+  std::uint32_t process_terra_revocation(const std::string &, const std::uint32_t) {
+    return 0;
+  }
+#endif
+
+  /** @brief Retry and durably clear every pending owner-resource revocation. */
+  void retry_terra_revocations() {
+    std::map<std::string, terra_pending_revocation_t, std::less<>> pending;
+    {
+      std::lock_guard lock {client_auth_mutex};
+      pending = client_root.pending_revocations;
+    }
+    for (const auto &[owner, pending_work] : pending) {
+      std::lock_guard client_mutation_lock {terra_client_mutation_mutex(owner)};
+      std::lock_guard revocation_lock {terra_revocation_mutex};
+      {
+        std::lock_guard lock {client_auth_mutex};
+        const auto current = client_root.pending_revocations.find(owner);
+        if (current == client_root.pending_revocations.end() || current->second != pending_work) {
+          continue;
+        }
+      }
+      const auto remaining = process_terra_revocation(owner, pending_work.domains);
+      std::lock_guard lock {client_auth_mutex};
+      const auto current = client_root.pending_revocations.find(owner);
+      if (current == client_root.pending_revocations.end() || current->second != pending_work) {
+        continue;
+      }
+      if (remaining == 0) {
+        client_root.pending_revocations.erase(current);
+      } else {
+        current->second.domains = remaining;
+      }
+      if (!save_state()) {
+        client_root.pending_revocations[owner] = pending_work;
+      }
+    }
+  }
 
   /**
    * @brief Return one asynchronous operation visible to caller.
@@ -5623,6 +7600,9 @@ namespace nvhttp {
       return;
     }
     const auto operation_id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, operation_id, "Operation")) {
+      return;
+    }
     const auto operation = terra_operation_store ? terra_operation_store->get(operation_id) : std::nullopt;
     if (!operation) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "operation_not_found", "Operation does not exist or is not visible to this client");
@@ -5663,27 +7643,21 @@ namespace nvhttp {
       }
     }
     const bool administer = scope_allowed(*client, "host.control");
-    std::uint64_t revision = 0;
     nlohmann::json sessions = nlohmann::json::array();
-    {
-      std::lock_guard lock {terra_session_tracking_mutex};
-      revision = terra_session_collection_revision;
-    }
-    const bool changed = !since || *since != revision;
-    if (changed) {
-      for (const auto &session : terra_session_snapshots()) {
-        if (administer || session.client_uuid == client->uuid) {
-          const auto tracking = terra_session_tracking_for(session.id);
-          sessions.emplace_back(terra_session_json(session, tracking ? &*tracking : nullptr));
-        }
+    for (const auto &session : terra_session_snapshots()) {
+      if (administer || (session.client_uuid == client->uuid && app_allowed(*client, session.app_uuid))) {
+        const auto tracking = terra_session_tracking_for(session.id);
+        sessions.emplace_back(terra_session_json(session, tracking ? &*tracking : nullptr));
       }
     }
+    const auto revision = terra_projection_revision("sessions", client->uuid, sessions.dump());
+    const bool changed = !since || *since != revision;
     send_terra_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                         {"revision", revision},
-                                                                         {"changed", changed},
-                                                                         {"fullSnapshot", changed},
-                                                                         {"sessions", std::move(sessions)},
-                                                                       });
+                                                                       {"revision", revision},
+                                                                       {"changed", changed},
+                                                                       {"fullSnapshot", changed},
+                                                                       {"sessions", changed ? std::move(sessions) : nlohmann::json::array()},
+                                                                     });
   }
 
   /**
@@ -5695,9 +7669,12 @@ namespace nvhttp {
       return;
     }
     const auto session_id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, session_id, "Session")) {
+      return;
+    }
     const bool administer = scope_allowed(*client, "host.control");
     for (const auto &session : terra_session_snapshots()) {
-      if (session.id == session_id && (administer || session.client_uuid == client->uuid)) {
+      if (session.id == session_id && (administer || (session.client_uuid == client->uuid && app_allowed(*client, session.app_uuid)))) {
         const auto tracking = terra_session_tracking_for(session.id);
         send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"session", terra_session_json(session, tracking ? &*tracking : nullptr)}});
         return;
@@ -5738,11 +7715,16 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Advance the peripherals collection revision.
+   * @brief Advance administrative and owner-visible peripheral revisions.
+   *
+   * @param owner_uuid Resource owner whose projection changed.
    */
-  void terra_bump_peripheral_revision() {
+  void terra_bump_peripheral_revision(const std::string_view owner_uuid) {
     std::lock_guard lock {terra_peripheral_revision_mutex};
-    ++terra_peripheral_collection_revision;
+    ++terra_peripheral_collection_revisions[""];
+    if (!owner_uuid.empty()) {
+      ++terra_peripheral_collection_revisions[std::string {owner_uuid}];
+    }
   }
 
   /**
@@ -5750,9 +7732,142 @@ namespace nvhttp {
    *
    * @param type Event type name.
    * @param data Event payload.
+   * @param owner_uuid Resource owner restricting event visibility.
    */
-  void publish_terra_peripheral_event(const std::string &type, nlohmann::json data) {
-    publish_terra_event({type, data.contains("id") ? std::optional<std::string> {data.at("id").get<std::string>()} : std::nullopt, data.contains("revision") ? std::optional<std::uint64_t> {data.at("revision").get<std::uint64_t>()} : std::nullopt, std::move(data)}, "peripheral.forward");
+  void publish_terra_peripheral_event(const std::string &type, nlohmann::json data, const std::string_view owner_uuid) {
+    std::lock_guard publication_lock {terra_peripheral_publication_mutex};
+    if (data.contains("id") && data.contains("revision")) {
+      auto &published_revision = terra_peripheral_published_revisions[data.at("id").get<std::string>()];
+      const auto revision = data.at("revision").get<std::uint64_t>();
+      if (revision <= published_revision) {
+        return;
+      }
+      published_revision = revision;
+      constexpr std::size_t MAX_PUBLISHED_REVISIONS = 2 * (terra_peripherals::MAX_RETAINED_CLAIMS + terra_peripherals::MAX_DEVICES);
+      while (terra_peripheral_published_revisions.size() > MAX_PUBLISHED_REVISIONS) {
+        terra_peripheral_published_revisions.erase(terra_peripheral_published_revisions.begin());
+      }
+    }
+    publish_terra_event({type, data.contains("id") ? std::optional<std::string> {data.at("id").get<std::string>()} : std::nullopt, data.contains("revision") ? std::optional<std::uint64_t> {data.at("revision").get<std::uint64_t>()} : std::nullopt, std::move(data)}, "peripheral.forward", owner_uuid);
+  }
+
+  /**
+   * @brief Publish one committed batch of automatic claim state transitions.
+   *
+   * @param claims Changed claim snapshots.
+   */
+  void publish_terra_peripheral_claim_changes(const std::vector<terra_peripherals::claim_t> &claims) {
+    if (claims.empty()) {
+      return;
+    }
+    std::set<std::string> owners;
+    std::set<std::string> device_ids;
+    for (const auto &claim : claims) {
+      device_ids.emplace(claim.device_id);
+      if (claim.owner_client_uuid) {
+        owners.emplace(*claim.owner_client_uuid);
+      }
+    }
+    {
+      std::lock_guard lock {terra_peripheral_revision_mutex};
+      ++terra_peripheral_collection_revisions[""];
+      for (const auto &owner : owners) {
+        ++terra_peripheral_collection_revisions[owner];
+      }
+    }
+    for (const auto &claim : claims) {
+      publish_terra_peripheral_event("peripheral.updated", terra_peripherals::claim_json(claim), claim.owner_client_uuid.value_or(""));
+    }
+    if (terra_peripheral_manager) {
+      for (const auto &device_id : device_ids) {
+        const auto device = terra_peripheral_manager->get_device({}, device_id);
+        if (device) {
+          publish_terra_peripheral_event("peripheral.updated", terra_peripherals::device_json(device->first, device->second), device->first.owner_client_uuid.value_or(""));
+        }
+      }
+    }
+  }
+
+  /**
+   * @brief Publish one committed owner revocation transaction.
+   *
+   * @param revoked Removed devices and released claims.
+   */
+  void publish_terra_peripheral_owner_revocation(const terra_peripherals::owner_revocation_t &revoked) {
+    if (revoked.devices.empty() && revoked.claims.empty()) {
+      return;
+    }
+    std::set<std::string> owners;
+    for (const auto &device : revoked.devices) {
+      if (device.owner_client_uuid) {
+        owners.emplace(*device.owner_client_uuid);
+      }
+    }
+    for (const auto &claim : revoked.claims) {
+      if (claim.owner_client_uuid) {
+        owners.emplace(*claim.owner_client_uuid);
+      }
+    }
+    {
+      std::lock_guard lock {terra_peripheral_revision_mutex};
+      ++terra_peripheral_collection_revisions[""];
+      for (const auto &owner : owners) {
+        ++terra_peripheral_collection_revisions[owner];
+      }
+    }
+    for (const auto &claim : revoked.claims) {
+      publish_terra_peripheral_event("peripheral.updated", terra_peripherals::claim_json(claim), claim.owner_client_uuid.value_or(""));
+    }
+    for (const auto &device : revoked.devices) {
+      publish_terra_peripheral_event("peripheral.removed", {{"id", device.id}, {"revision", device.revision + 1}}, device.owner_client_uuid.value_or(""));
+    }
+  }
+
+  /**
+   * @brief Commit and publish automatic claim transitions for one ended target.
+   *
+   * @param target_type Session, workspace, or sandbox target type.
+   * @param target_id Canonical target UUID.
+   * @param release Whether matching claims release instead of applying policy.
+   */
+  void transition_terra_peripheral_target(const std::string &target_type, const std::string &target_id, const bool release) {
+    std::lock_guard target_lock {terra_target_transaction_mutex};
+    std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+    if (terra_peripheral_manager) {
+      publish_terra_peripheral_claim_changes(terra_peripheral_manager->target_ended(target_type, target_id, release));
+    }
+  }
+
+  /**
+   * @brief Commit and publish owner revocation as one ordered peripheral transaction.
+   *
+   * @param owner_uuid Canonical owner UUID.
+   * @param device_classes Optional class filter.
+   * @return Removed devices and released claims for channel cleanup.
+   */
+  terra_peripherals::owner_revocation_t revoke_terra_peripheral_owner(const std::string &owner_uuid, const std::vector<std::string> &device_classes) {
+    std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+    if (!terra_peripheral_manager) {
+      return {};
+    }
+    auto revoked = terra_peripheral_manager->revoke_owner(owner_uuid, device_classes);
+    publish_terra_peripheral_owner_revocation(revoked);
+    return revoked;
+  }
+
+  /**
+   * @brief Commit and publish credential-expiry transitions in mutation order.
+   *
+   * @return Released claims for channel cleanup.
+   */
+  std::vector<terra_peripherals::claim_t> expire_terra_peripheral_credentials() {
+    std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+    if (!terra_peripheral_manager) {
+      return {};
+    }
+    auto expired = terra_peripheral_manager->expire_credentials();
+    publish_terra_peripheral_claim_changes(expired);
+    return expired;
   }
 
   /**
@@ -5763,6 +7878,33 @@ namespace nvhttp {
    */
   std::string terra_peripheral_owner_filter(const verified_client_t &client) {
     return scope_allowed(client, "host.control") ? std::string {} : std::string {client.uuid};
+  }
+
+  /**
+   * @brief Check whether a peripheral claim target is currently visible to one caller.
+   *
+   * @param client Authenticated caller.
+   * @param target Requested session, workspace, or sandbox target.
+   * @return True when target exists and remains directly readable by caller.
+   */
+  bool terra_peripheral_target_visible(const verified_client_t &client, const terra_peripherals::target_t &target) {
+    if (target.type == "session") {
+      const auto owner = scope_allowed(client, "host.control") ? std::string_view {} : std::string_view {client.uuid};
+      return std::ranges::any_of(terra_session_snapshots(false), [&](const auto &session) {
+        return session.id == target.id && (owner.empty() || session.client_uuid == owner);
+      });
+    }
+#ifdef _WIN32
+    if (target.type == "workspace" && terra_workspace_manager) {
+      const auto workspace = terra_workspace_manager->get(target.id);
+      return workspace && (workspace->state == terra_workspaces::state_t::ready || workspace->state == terra_workspaces::state_t::active) && terra_workspace_visible(client, *workspace, true);
+    }
+    if (target.type == "sandbox" && terra_sandbox_manager) {
+      const auto sandbox = terra_sandbox_manager->get(target.id);
+      return sandbox && sandbox->state == terra_sandboxes::state_t::running && terra_sandbox_visible(client, *sandbox);
+    }
+#endif
+    return false;
   }
 
   /**
@@ -5812,11 +7954,6 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
       return;
     }
-    std::uint64_t revision = 0;
-    {
-      std::lock_guard lock {terra_peripheral_revision_mutex};
-      revision = terra_peripheral_collection_revision;
-    }
     std::optional<std::uint64_t> since;
     const auto args = request->parse_query_string();
     if (const auto value = args.find("since"); value != args.end()) {
@@ -5831,19 +7968,29 @@ namespace nvhttp {
         return;
       }
     }
-    const bool changed = !since || *since != revision;
+    const auto owner_filter = terra_peripheral_owner_filter(*client);
+    std::uint64_t revision = 0;
+    bool changed = false;
     nlohmann::json peripherals = nlohmann::json::array();
-    if (changed) {
-      for (const auto &[device, active_claim] : terra_peripheral_manager->list_devices(terra_peripheral_owner_filter(*client))) {
-        peripherals.push_back(terra_peripherals::device_json(device, active_claim));
+    {
+      std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+      {
+        std::lock_guard revision_lock {terra_peripheral_revision_mutex};
+        revision = terra_peripheral_collection_revisions[owner_filter];
+      }
+      changed = !since || *since != revision;
+      if (changed) {
+        for (const auto &[device, active_claim] : terra_peripheral_manager->list_devices(owner_filter)) {
+          peripherals.push_back(terra_peripherals::device_json(device, active_claim));
+        }
       }
     }
     send_terra_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                         {"revision", revision},
-                                                                         {"changed", changed},
-                                                                         {"fullSnapshot", changed},
-                                                                         {"peripherals", std::move(peripherals)},
-                                                                       });
+                                                                       {"revision", revision},
+                                                                       {"changed", changed},
+                                                                       {"fullSnapshot", changed},
+                                                                       {"peripherals", std::move(peripherals)},
+                                                                     });
   }
 
   /**
@@ -5854,13 +8001,19 @@ namespace nvhttp {
    * @return Creation fields, or no value after sending an error.
    */
   std::optional<terra_peripherals::create_device_t> terra_peripheral_create_body(const resp_https_t &response, const nlohmann::json &body) {
+    if (body.size() < 7 || body.size() > 9 || std::ranges::any_of(body.items(), [](const auto &field) {
+          return field.key() != "schemaVersion" && field.key() != "class" && field.key() != "platformId" && field.key() != "name" && field.key() != "vendorId" && field.key() != "productId" && field.key() != "capabilities" && field.key() != "serial" && field.key() != "reportDescriptorBase64";
+        })) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Peripheral registration contains unknown or missing fields");
+      return std::nullopt;
+    }
     for (const char *field : {"class", "platformId", "name", "vendorId", "productId", "capabilities"}) {
       if (!body.contains(field)) {
         send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", std::format("{} is required", field));
         return std::nullopt;
       }
     }
-    if (!body.at("class").is_string() || !body.at("platformId").is_string() || !body.at("name").is_string() || !body.at("vendorId").is_number_unsigned() || !body.at("productId").is_number_unsigned() || !body.at("capabilities").is_array()) {
+    if (!body.at("class").is_string() || !body.at("platformId").is_string() || !body.at("name").is_string() || !body.at("vendorId").is_number_unsigned() || body.at("vendorId").get<std::uint64_t>() > std::numeric_limits<std::uint32_t>::max() || !body.at("productId").is_number_unsigned() || body.at("productId").get<std::uint64_t>() > std::numeric_limits<std::uint32_t>::max() || !body.at("capabilities").is_array()) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Peripheral fields have invalid types");
       return std::nullopt;
     }
@@ -5870,10 +8023,18 @@ namespace nvhttp {
     creation.name = body.at("name").get<std::string>();
     creation.vendor_id = body.at("vendorId").get<std::uint32_t>();
     creation.product_id = body.at("productId").get<std::uint32_t>();
-    if (body.contains("serial") && body.at("serial").is_string()) {
+    if (body.contains("serial")) {
+      if (!body.at("serial").is_string()) {
+        send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "serial must be a string");
+        return std::nullopt;
+      }
       creation.serial = body.at("serial").get<std::string>();
     }
-    if (body.contains("reportDescriptorBase64") && body.at("reportDescriptorBase64").is_string()) {
+    if (body.contains("reportDescriptorBase64")) {
+      if (!body.at("reportDescriptorBase64").is_string()) {
+        send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "reportDescriptorBase64 must be a string");
+        return std::nullopt;
+      }
       creation.report_descriptor_base64 = body.at("reportDescriptorBase64").get<std::string>();
     }
     for (const auto &capability : body.at("capabilities")) {
@@ -5894,10 +8055,6 @@ namespace nvhttp {
     if (!client) {
       return;
     }
-    if (!terra_peripheral_manager) {
-      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
-      return;
-    }
     const auto body = terra_request_json(response, request);
     if (!body) {
       return;
@@ -5906,18 +8063,32 @@ namespace nvhttp {
     if (!creation) {
       return;
     }
-    const auto created = terra_peripheral_manager->create_device(client->uuid, *creation);
-    if (created.status == terra_peripherals::status_t::invalid) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Peripheral registration fields are invalid");
+    if (replay_terra_operation(response, *client, request, "peripheral.create", *body)) {
       return;
     }
-    if (created.status == terra_peripherals::status_t::unsupported_configuration || !created.resource) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Peripheral class or capabilities are not supported by this host");
+    if (!terra_peripheral_manager) {
+      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
       return;
     }
-    terra_bump_peripheral_revision();
-    publish_terra_peripheral_event("peripheral.added", terra_peripherals::device_json(*created.resource));
-    send_terra_response(response, SimpleWeb::StatusCode::success_created, {{"peripheral", terra_peripherals::device_json(*created.resource)}});
+    submit_terra_operation(response, *client, request, "peripheral.create", *body, [creation = *creation](const verified_client_t &current_client) {
+      std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+      if (!terra_peripheral_manager) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "provider_unavailable"}, {"message", "Peripheral forwarding is unavailable"}}};
+      }
+      const auto created = terra_peripheral_manager->create_device(current_client.uuid, creation);
+      if (created.status == terra_peripherals::status_t::invalid) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "invalid_argument"}, {"message", "Peripheral registration fields are invalid"}}};
+      }
+      if (created.status == terra_peripherals::status_t::limit_reached) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "resource_limit"}, {"message", "Maximum registered peripheral count reached"}}};
+      }
+      if (created.status != terra_peripherals::status_t::success || !created.resource) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "unsupported_configuration"}, {"message", "Peripheral class or capabilities are not supported by this host"}}};
+      }
+      terra_bump_peripheral_revision(current_client.uuid);
+      publish_terra_peripheral_event("peripheral.added", terra_peripherals::device_json(*created.resource), current_client.uuid);
+      return terra_operation_completion_t {true, created.resource->id, {{"peripheral", terra_peripherals::device_json(*created.resource)}}, nullptr};
+    });
   }
 
   /**
@@ -5932,7 +8103,12 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
       return;
     }
-    const auto found = terra_peripheral_manager->get_device(terra_peripheral_owner_filter(*client), request->path_match[1].str());
+    const auto device_id = request->path_match[1].str();
+    if (!terra_canonical_uuid(device_id)) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Peripheral identifier must be a canonical UUID");
+      return;
+    }
+    const auto found = terra_peripheral_manager->get_device(terra_peripheral_owner_filter(*client), device_id);
     if (!found) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "peripheral_not_found", "Peripheral does not exist or is not visible to this client");
       return;
@@ -5948,18 +8124,55 @@ namespace nvhttp {
     if (!client) {
       return;
     }
+    const auto device_id = request->path_match[1].str();
+    if (!terra_canonical_uuid(device_id)) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Peripheral identifier must be a canonical UUID");
+      return;
+    }
+    const auto revision = terra_require_if_match_value(response, request, "Peripheral");
+    const auto body = revision ? terra_empty_request_json(response, request, "Peripheral deletion") : std::nullopt;
+    if (!revision || !body) {
+      return;
+    }
+    const auto operation_body = terra_operations::item_request_body(*body, device_id, *revision);
+    if (replay_terra_operation(response, *client, request, "peripheral.delete", operation_body)) {
+      return;
+    }
     if (!terra_peripheral_manager) {
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
       return;
     }
-    const auto removed = terra_peripheral_manager->delete_device(terra_peripheral_owner_filter(*client), request->path_match[1].str());
-    if (removed.status != terra_peripherals::status_t::success || !removed.resource) {
+    const auto current = terra_peripheral_manager->get_device(terra_peripheral_owner_filter(*client), device_id);
+    if (!current) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "peripheral_not_found", "Peripheral does not exist or is not visible to this client");
       return;
     }
-    terra_bump_peripheral_revision();
-    publish_terra_peripheral_event("peripheral.removed", {{"id", removed.resource->id}, {"revision", removed.resource->revision + 1}});
-    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"deleted", true}, {"id", removed.resource->id}});
+    if (!terra_require_if_match(response, request, current->first.revision, "Peripheral")) {
+      return;
+    }
+    submit_terra_operation(response, *client, request, "peripheral.delete", operation_body, [device_id, revision = *revision](const verified_client_t &current_client) {
+      std::vector<terra_peripherals::claim_t> released_claims;
+      terra_peripherals::result_t<terra_peripherals::device_t> removed;
+      {
+        std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+        removed = terra_peripheral_manager->delete_device(terra_peripheral_owner_filter(current_client), device_id, revision, released_claims);
+        if (removed.status == terra_peripherals::status_t::conflict) {
+          return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "revision_conflict"}, {"message", "Peripheral revision changed before deletion"}}};
+        }
+        if (removed.status != terra_peripherals::status_t::success || !removed.resource) {
+          return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "peripheral_not_found"}, {"message", "Peripheral no longer exists or is not visible to this client"}}};
+        }
+        terra_bump_peripheral_revision(removed.resource->owner_client_uuid.value_or(""));
+        for (const auto &claim : released_claims) {
+          publish_terra_peripheral_event("peripheral.updated", terra_peripherals::claim_json(claim), claim.owner_client_uuid.value_or(""));
+        }
+        publish_terra_peripheral_event("peripheral.removed", {{"id", removed.resource->id}, {"revision", removed.resource->revision + 1}}, removed.resource->owner_client_uuid.value_or(""));
+      }
+      for (const auto &claim : released_claims) {
+        terra_close_peripheral_channel(claim.id);
+      }
+      return terra_operation_completion_t {true, removed.resource->id, {{"deleted", true}, {"id", removed.resource->id}}, nullptr};
+    });
   }
 
   /**
@@ -5973,11 +8186,6 @@ namespace nvhttp {
     if (!terra_peripheral_manager) {
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
       return;
-    }
-    std::uint64_t revision = 0;
-    {
-      std::lock_guard lock {terra_peripheral_revision_mutex};
-      revision = terra_peripheral_collection_revision;
     }
     std::optional<std::uint64_t> since;
     const auto args = request->parse_query_string();
@@ -5993,19 +8201,29 @@ namespace nvhttp {
         return;
       }
     }
-    const bool changed = !since || *since != revision;
+    const auto owner_filter = terra_peripheral_owner_filter(*client);
+    std::uint64_t revision = 0;
+    bool changed = false;
     nlohmann::json claims = nlohmann::json::array();
-    if (changed) {
-      for (const auto &claim : terra_peripheral_manager->list_claims(terra_peripheral_owner_filter(*client))) {
-        claims.push_back(terra_peripherals::claim_json(claim));
+    {
+      std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+      {
+        std::lock_guard revision_lock {terra_peripheral_revision_mutex};
+        revision = terra_peripheral_collection_revisions[owner_filter];
+      }
+      changed = !since || *since != revision;
+      if (changed) {
+        for (const auto &claim : terra_peripheral_manager->list_claims(owner_filter)) {
+          claims.push_back(terra_peripherals::claim_json(claim));
+        }
       }
     }
     send_terra_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                         {"revision", revision},
-                                                                         {"changed", changed},
-                                                                         {"fullSnapshot", changed},
-                                                                         {"claims", std::move(claims)},
-                                                                       });
+                                                                       {"revision", revision},
+                                                                       {"changed", changed},
+                                                                       {"fullSnapshot", changed},
+                                                                       {"claims", std::move(claims)},
+                                                                     });
   }
 
   /**
@@ -6016,12 +8234,17 @@ namespace nvhttp {
     if (!client) {
       return;
     }
-    if (!terra_peripheral_manager) {
-      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
-      return;
-    }
     const auto body = terra_request_json(response, request);
     if (!body) {
+      return;
+    }
+    if (body->size() != 6 || !body->contains("target") || !body->at("target").is_object() || body->at("target").size() != 2 || std::ranges::any_of(body->items(), [](const auto &field) {
+          return field.key() != "schemaVersion" && field.key() != "deviceId" && field.key() != "target" && field.key() != "requestedCapabilities" && field.key() != "exclusive" && field.key() != "disconnectPolicy";
+        }) ||
+        std::ranges::any_of(body->at("target").items(), [](const auto &field) {
+          return field.key() != "type" && field.key() != "id";
+        })) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Claim creation contains unknown or missing fields");
       return;
     }
     for (const char *field : {"deviceId", "target", "requestedCapabilities", "exclusive", "disconnectPolicy"}) {
@@ -6047,57 +8270,68 @@ namespace nvhttp {
       }
       creation.requested_capabilities.push_back(capability.get<std::string>());
     }
-    if (!uuid_util::is_valid(creation.device_id) || !uuid_util::is_valid(creation.target.id)) {
+    if (!terra_canonical_uuid(creation.device_id) || !terra_canonical_uuid(creation.target.id)) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Claim identifiers must be canonical UUIDs");
       return;
     }
+    if (replay_terra_operation(response, *client, request, "peripheral.claim", *body)) {
+      return;
+    }
+    if (!terra_peripheral_manager) {
+      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
+      return;
+    }
+    submit_terra_operation(response, *client, request, "peripheral.claim", *body, [creation = std::move(creation)](const verified_client_t &current_client) {
+      std::lock_guard target_lock {terra_target_transaction_mutex};
+      if (!terra_peripheral_manager) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "provider_unavailable"}, {"message", "Peripheral forwarding is unavailable"}}};
+      }
+      const auto registered_device = terra_peripheral_manager->get_device(current_client.uuid, creation.device_id);
+      if (!registered_device) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "peripheral_not_found"}, {"message", "Peripheral no longer exists or is not visible to this client"}}};
+      }
+      if ((registered_device->first.device_class == "keyboard" && !current_client.permissions.input.keyboard) || (registered_device->first.device_class == "mouse" && !current_client.permissions.input.mouse)) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "permission_denied"}, {"message", "Client certificate does not permit this peripheral input class"}}};
+      }
+      if (!terra_peripheral_target_visible(current_client, creation.target)) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "claim_target_not_found"}, {"message", "Claim target no longer exists or is not visible to this client"}}};
+      }
 
-    // Bind to a visible target before granting anything.
-    bool target_visible = false;
-    if (creation.target.type == "session") {
-      const auto owner = scope_allowed(*client, "host.control") ? std::string_view {} : std::string_view {client->uuid};
-      target_visible = std::ranges::any_of(terra_session_snapshots(), [&](const auto &session) {
-        return session.id == creation.target.id && (owner.empty() || session.client_uuid == owner);
-      });
-    }
-#ifdef _WIN32
-    if (creation.target.type == "workspace" && terra_workspace_manager) {
-      const auto workspace = terra_workspace_manager->get(creation.target.id);
-      target_visible = workspace && terra_workspace_visible(*client, *workspace, true);
-    }
-    if (creation.target.type == "sandbox" && terra_sandbox_manager) {
-      const auto sandbox = terra_sandbox_manager->get(creation.target.id);
-      target_visible = sandbox && terra_sandbox_visible(*client, *sandbox);
-    }
-#endif
-    if (!target_visible) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "claim_target_not_found", "Claim target does not exist or is not visible to this client");
-      return;
-    }
-
-    const auto created = terra_peripheral_manager->create_claim(client->uuid, creation);
-    if (created.status == terra_peripherals::status_t::not_found) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "peripheral_not_found", "Peripheral does not exist or is not visible to this client");
-      return;
-    }
-    if (created.status == terra_peripherals::status_t::conflict) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_conflict, "resource_busy", "An exclusive claim already exists for this peripheral");
-      return;
-    }
-    if (created.status == terra_peripherals::status_t::invalid) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Claim fields are invalid");
-      return;
-    }
-    if (created.status != terra_peripherals::status_t::success || !created.resource) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Requested claim capabilities are not supported by this host");
-      return;
-    }
-    terra_bump_peripheral_revision();
-    const auto device = terra_peripheral_manager->get_device({}, creation.device_id);
-    if (device) {
-      publish_terra_peripheral_event("peripheral.updated", terra_peripherals::device_json(device->first, device->second));
-    }
-    send_terra_response(response, SimpleWeb::StatusCode::success_created, {{"claim", terra_peripherals::claim_json(*created.resource)}});
+      terra_peripherals::claim_result_t created;
+      {
+        std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+        created = terra_peripheral_manager->create_claim(current_client.uuid, creation);
+        publish_terra_peripheral_claim_changes(created.expired_claims);
+        if (created.status == terra_peripherals::status_t::success && created.resource) {
+          terra_bump_peripheral_revision(current_client.uuid);
+          publish_terra_peripheral_event("peripheral.updated", terra_peripherals::claim_json(*created.resource), current_client.uuid);
+          const auto device = terra_peripheral_manager->get_device({}, creation.device_id);
+          if (device) {
+            publish_terra_peripheral_event("peripheral.updated", terra_peripherals::device_json(device->first, device->second), current_client.uuid);
+          }
+        }
+      }
+      for (const auto &expired : created.expired_claims) {
+        terra_close_peripheral_channel(expired.id);
+      }
+      if (created.status == terra_peripherals::status_t::not_found) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "peripheral_not_found"}, {"message", "Peripheral no longer exists or is not visible to this client"}}};
+      }
+      if (created.status == terra_peripherals::status_t::conflict) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "resource_busy"}, {"message", "An exclusive claim already exists for this peripheral"}}};
+      }
+      if (created.status == terra_peripherals::status_t::limit_reached) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "resource_limit"}, {"message", "Maximum active peripheral claim count reached"}}};
+      }
+      if (created.status == terra_peripherals::status_t::invalid) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "invalid_argument"}, {"message", "Claim fields are invalid"}}};
+      }
+      if (created.status != terra_peripherals::status_t::success || !created.resource) {
+        return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "unsupported_configuration"}, {"message", "Requested claim capabilities are not supported by this host"}}};
+      }
+      auto claim = terra_peripherals::claim_creation_json(*created.resource, std::format("/eclipse/v1/peripherals/claims/{}/channel", created.resource->id));
+      return terra_operation_completion_t {true, created.resource->id, {{"claim", std::move(claim)}}, nullptr};
+    });
   }
 
   /**
@@ -6112,7 +8346,12 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
       return;
     }
-    const auto claim = terra_peripheral_manager->get_claim(terra_peripheral_owner_filter(*client), request->path_match[1].str());
+    const auto claim_id = request->path_match[1].str();
+    if (!terra_canonical_uuid(claim_id)) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Claim identifier must be a canonical UUID");
+      return;
+    }
+    const auto claim = terra_peripheral_manager->get_claim(terra_peripheral_owner_filter(*client), claim_id);
     if (!claim) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "claim_not_found", "Claim does not exist or is not visible to this client");
       return;
@@ -6128,21 +8367,50 @@ namespace nvhttp {
     if (!client) {
       return;
     }
+    const auto claim_id = request->path_match[1].str();
+    if (!terra_canonical_uuid(claim_id)) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Claim identifier must be a canonical UUID");
+      return;
+    }
+    const auto revision = terra_require_if_match_value(response, request, "Peripheral claim");
+    const auto body = revision ? terra_empty_request_json(response, request, "Peripheral claim release") : std::nullopt;
+    if (!revision || !body) {
+      return;
+    }
+    const auto operation_body = terra_operations::item_request_body(*body, claim_id, *revision);
+    if (replay_terra_operation(response, *client, request, "peripheral.release", operation_body)) {
+      return;
+    }
     if (!terra_peripheral_manager) {
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "feature_unavailable", "Peripheral forwarding is unavailable");
       return;
     }
-    const auto released = terra_peripheral_manager->release_claim(terra_peripheral_owner_filter(*client), request->path_match[1].str());
-    if (released.status != terra_peripherals::status_t::success || !released.resource) {
+    const auto current = terra_peripheral_manager->get_claim(terra_peripheral_owner_filter(*client), claim_id);
+    if (!current) {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "claim_not_found", "Claim does not exist or is not visible to this client");
       return;
     }
-    terra_bump_peripheral_revision();
-    publish_terra_peripheral_event("peripheral.updated", terra_peripherals::claim_json(*released.resource));
-    if (released.resource->state == terra_peripherals::claim_state_t::released) {
-      terra_close_peripheral_channel(request->path_match[1].str());
+    if (!terra_require_if_match(response, request, current->revision, "Peripheral claim")) {
+      return;
     }
-    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"released", true}, {"id", released.resource->id}});
+    submit_terra_operation(response, *client, request, "peripheral.release", operation_body, [claim_id, revision = *revision](const verified_client_t &current_client) {
+      terra_peripherals::result_t<terra_peripherals::claim_t> released;
+      {
+        std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+        released = terra_peripheral_manager->release_claim(terra_peripheral_owner_filter(current_client), claim_id, revision);
+        if (released.status == terra_peripherals::status_t::conflict) {
+          return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "revision_conflict"}, {"message", "Peripheral claim revision changed before release"}}};
+        }
+        if (released.status != terra_peripherals::status_t::success || !released.resource) {
+          return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", "claim_not_found"}, {"message", "Claim no longer exists or is not visible to this client"}}};
+        }
+        if (released.resource->revision != revision) {
+          publish_terra_peripheral_claim_changes({*released.resource});
+        }
+      }
+      terra_close_peripheral_channel(claim_id);
+      return terra_operation_completion_t {true, released.resource->id, {{"released", true}, {"id", released.resource->id}}, nullptr};
+    });
   }
 
   /**
@@ -6192,6 +8460,56 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Validate RFC 6455 close status and UTF-8 reason bytes.
+   *
+   * @param payload Unmasked close-frame payload.
+   * @return `true` for an empty payload or valid status-and-reason payload.
+   */
+  bool terra_valid_websocket_close_payload(const std::string_view payload) {
+    if (payload.empty()) {
+      return true;
+    }
+    if (payload.size() == 1) {
+      return false;
+    }
+    const auto code = (static_cast<std::uint16_t>(static_cast<unsigned char>(payload[0])) << 8) | static_cast<unsigned char>(payload[1]);
+    if (!((code >= 1000 && code <= 1014 && code != 1004 && code != 1005 && code != 1006) || (code >= 3000 && code <= 4999))) {
+      return false;
+    }
+    for (std::size_t index = 2; index < payload.size();) {
+      const auto first = static_cast<unsigned char>(payload[index]);
+      std::size_t continuation_count = 0;
+      if (first <= 0x7F) {
+        ++index;
+        continue;
+      }
+      if (first >= 0xC2 && first <= 0xDF) {
+        continuation_count = 1;
+      } else if (first >= 0xE0 && first <= 0xEF) {
+        continuation_count = 2;
+      } else if (first >= 0xF0 && first <= 0xF4) {
+        continuation_count = 3;
+      } else {
+        return false;
+      }
+      if (index + continuation_count >= payload.size()) {
+        return false;
+      }
+      const auto second = static_cast<unsigned char>(payload[index + 1]);
+      if ((first == 0xE0 && second < 0xA0) || (first == 0xED && second > 0x9F) || (first == 0xF0 && second < 0x90) || (first == 0xF4 && second > 0x8F)) {
+        return false;
+      }
+      for (std::size_t offset = 1; offset <= continuation_count; ++offset) {
+        if ((static_cast<unsigned char>(payload[index + offset]) & 0xC0) != 0x80) {
+          return false;
+        }
+      }
+      index += continuation_count + 1;
+    }
+    return true;
+  }
+
+  /**
    * @brief Decode one complete masked client WebSocket frame.
    *
    * @param frame Complete frame bytes.
@@ -6201,33 +8519,51 @@ namespace nvhttp {
     if (frame.size() < 2) {
       return std::nullopt;
     }
+    const bool final = (frame[0] & 0x80) != 0;
+    const int opcode = frame[0] & 0x0F;
+    if (!final || (frame[0] & 0x70) != 0 || (opcode != 0x1 && opcode != 0x8 && opcode != 0x9 && opcode != 0xA)) {
+      return std::nullopt;
+    }
     const bool masked = (frame[1] & 0x80) != 0;
-    std::size_t length = frame[1] & 0x7F;
+    const std::size_t encoded_length = frame[1] & 0x7F;
+    std::size_t length = encoded_length;
     std::size_t offset = 2;
     if (length == 126) {
       if (frame.size() < offset + 2) {
         return std::nullopt;
       }
       length = (static_cast<std::size_t>(frame[2]) << 8) | frame[3];
+      if (length < 126) {
+        return std::nullopt;
+      }
       offset += 2;
     } else if (length == 127) {
       if (frame.size() < offset + 8) {
+        return std::nullopt;
+      }
+      if ((frame[offset] & 0x80) != 0) {
         return std::nullopt;
       }
       length = 0;
       for (std::size_t index = 0; index < 8; ++index) {
         length = (length << 8) | frame[offset + index];
       }
+      if (length < 65536) {
+        return std::nullopt;
+      }
       offset += 8;
     }
-    if (!masked || frame.size() < offset + 4 + length) {
+    if (!masked || (opcode >= 0x8 && (encoded_length >= 126 || length > 125)) || length > terra_peripherals::MAX_MESSAGE_BYTES || frame.size() != offset + 4 + length) {
       return std::nullopt;
     }
     std::string payload(length, '\0');
     for (std::size_t index = 0; index < length; ++index) {
       payload[index] = static_cast<char>(frame[offset + 4 + index] ^ frame[offset + (index % 4)]);
     }
-    return std::pair {frame[0] & 0x0F, std::move(payload)};
+    if (opcode == 0x8 && !terra_valid_websocket_close_payload(payload)) {
+      return std::nullopt;
+    }
+    return std::pair {opcode, std::move(payload)};
   }
 
   /**
@@ -6235,7 +8571,10 @@ namespace nvhttp {
    */
   struct terra_peripheral_channel_t {
     std::shared_ptr<SolHTTPS> socket;  ///< Upgraded TLS socket.
+    std::shared_ptr<std::mutex> write_mutex {std::make_shared<std::mutex>()};  ///< Serializes writes and closure for this socket.
     std::shared_ptr<input::input_t> input;  ///< Injection context bound to claim identity.
+    std::string owner_uuid;  ///< Claim owner authenticated during upgrade.
+    std::string certificate;  ///< Exact paired certificate authenticated during upgrade.
     std::vector<std::uint8_t> keyboard_state {};  ///< Last keyboard boot report.
     std::uint8_t mouse_buttons = 0;  ///< Last mouse button bitmap.
   };
@@ -6244,6 +8583,23 @@ namespace nvhttp {
   std::map<std::string, terra_peripheral_channel_t> terra_peripheral_channels;  ///< Live channels keyed by claim UUID.
   std::map<std::string, std::jthread> terra_peripheral_channel_threads;  ///< Channel worker threads keyed by claim UUID.
 
+  void terra_inject_hid_keyboard(terra_peripheral_channel_t &channel, const std::vector<std::uint8_t> &report);
+  void terra_inject_hid_mouse(terra_peripheral_channel_t &channel, const std::vector<std::uint8_t> &report);
+
+  /**
+   * @brief Release keyboard and mouse state injected by one channel.
+   *
+   * @param channel Channel whose last HID reports must be neutralized.
+   */
+  void terra_neutralize_peripheral_channel(terra_peripheral_channel_t &channel) {
+    if (channel.keyboard_state.size() == 8) {
+      terra_inject_hid_keyboard(channel, std::vector<std::uint8_t>(8));
+    }
+    if (channel.mouse_buttons != 0) {
+      terra_inject_hid_mouse(channel, std::vector<std::uint8_t>(4));
+    }
+  }
+
   /**
    * @brief Release channel resources after its worker thread ends.
    *
@@ -6251,19 +8607,32 @@ namespace nvhttp {
    * @param socket Channel socket used for ownership comparison.
    */
   void terra_peripheral_channel_finish(const std::string &claim_id, const std::shared_ptr<SolHTTPS> &socket) {
-    static_cast<void>(terra_peripheral_manager->close_channel(claim_id));
-    terra_bump_peripheral_revision();
     std::jthread worker;
+    std::optional<terra_peripheral_channel_t> finished_channel;
     {
       std::lock_guard lock {terra_peripheral_channels_mutex};
       const auto channel = terra_peripheral_channels.find(claim_id);
       if (channel != terra_peripheral_channels.end() && channel->second.socket == socket) {
+        finished_channel = std::move(channel->second);
         terra_peripheral_channels.erase(channel);
       }
       const auto thread = terra_peripheral_channel_threads.find(claim_id);
-      if (thread != terra_peripheral_channel_threads.end()) {
+      if (finished_channel && thread != terra_peripheral_channel_threads.end()) {
         worker = std::move(thread->second);
         terra_peripheral_channel_threads.erase(thread);
+      }
+    }
+    if (!finished_channel) {
+      return;
+    }
+    terra_neutralize_peripheral_channel(*finished_channel);
+    input::terminate_gamepads("terra-claim-" + claim_id);
+    {
+      std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+      const auto before = terra_peripheral_manager->get_claim({}, claim_id);
+      const auto closed = terra_peripheral_manager->close_channel(claim_id);
+      if (before && closed && before->revision != closed->revision) {
+        publish_terra_peripheral_claim_changes({*closed});
       }
     }
     if (worker.joinable()) {
@@ -6279,6 +8648,38 @@ namespace nvhttp {
    * @return Virtual-key code, or zero when the usage has no mapping.
    */
   std::uint16_t terra_hid_usage_to_vk(std::uint8_t usage) {
+    constexpr std::uint16_t VKEY_BACK = 0x08;
+    constexpr std::uint16_t VKEY_TAB = 0x09;
+    constexpr std::uint16_t VKEY_RETURN = 0x0D;
+    constexpr std::uint16_t VKEY_PAUSE = 0x13;
+    constexpr std::uint16_t VKEY_CAPITAL = 0x14;
+    constexpr std::uint16_t VKEY_ESCAPE = 0x1B;
+    constexpr std::uint16_t VKEY_SPACE = 0x20;
+    constexpr std::uint16_t VKEY_PRIOR = 0x21;
+    constexpr std::uint16_t VKEY_NEXT = 0x22;
+    constexpr std::uint16_t VKEY_END = 0x23;
+    constexpr std::uint16_t VKEY_HOME = 0x24;
+    constexpr std::uint16_t VKEY_LEFT = 0x25;
+    constexpr std::uint16_t VKEY_UP = 0x26;
+    constexpr std::uint16_t VKEY_RIGHT = 0x27;
+    constexpr std::uint16_t VKEY_DOWN = 0x28;
+    constexpr std::uint16_t VKEY_SNAPSHOT = 0x2C;
+    constexpr std::uint16_t VKEY_INSERT = 0x2D;
+    constexpr std::uint16_t VKEY_DELETE = 0x2E;
+    constexpr std::uint16_t VKEY_NUMPAD0 = 0x60;
+    constexpr std::uint16_t VKEY_F1 = 0x70;
+    constexpr std::uint16_t VKEY_SCROLL = 0x91;
+    constexpr std::uint16_t VKEY_OEM_1 = 0xBA;
+    constexpr std::uint16_t VKEY_OEM_PLUS = 0xBB;
+    constexpr std::uint16_t VKEY_OEM_COMMA = 0xBC;
+    constexpr std::uint16_t VKEY_OEM_MINUS = 0xBD;
+    constexpr std::uint16_t VKEY_OEM_PERIOD = 0xBE;
+    constexpr std::uint16_t VKEY_OEM_2 = 0xBF;
+    constexpr std::uint16_t VKEY_OEM_3 = 0xC0;
+    constexpr std::uint16_t VKEY_OEM_4 = 0xDB;
+    constexpr std::uint16_t VKEY_OEM_5 = 0xDC;
+    constexpr std::uint16_t VKEY_OEM_6 = 0xDD;
+    constexpr std::uint16_t VKEY_OEM_7 = 0xDE;
     if (usage >= 0x04 && usage <= 0x1D) {
       return usage - 0x04 + 'A';
     }
@@ -6289,75 +8690,123 @@ namespace nvhttp {
       return '0';
     }
     if (usage >= 0x3A && usage <= 0x45) {
-      return usage - 0x3A + VK_F1;
-    }
-    if (usage >= 0x54 && usage <= 0x63) {
-      return usage - 0x54 + VK_NUMPAD0;
+      return usage - 0x3A + VKEY_F1;
     }
     switch (usage) {
       case 0x28:
-        return VK_RETURN;
+        return VKEY_RETURN;
       case 0x29:
-        return VK_ESCAPE;
+        return VKEY_ESCAPE;
       case 0x2A:
-        return VK_BACK;
+        return VKEY_BACK;
       case 0x2B:
-        return VK_TAB;
+        return VKEY_TAB;
       case 0x2C:
-        return VK_SPACE;
+        return VKEY_SPACE;
       case 0x2D:
-        return VK_OEM_MINUS;
+        return VKEY_OEM_MINUS;
       case 0x2E:
-        return VK_OEM_PLUS;
+        return VKEY_OEM_PLUS;
       case 0x2F:
-        return VK_OEM_4;
+        return VKEY_OEM_4;
       case 0x30:
-        return VK_OEM_6;
+        return VKEY_OEM_6;
       case 0x31:
-        return VK_OEM_5;
+        return VKEY_OEM_5;
       case 0x33:
-        return VK_OEM_1;
+        return VKEY_OEM_1;
       case 0x34:
-        return VK_OEM_7;
+        return VKEY_OEM_7;
       case 0x35:
-        return VK_OEM_3;
+        return VKEY_OEM_3;
       case 0x36:
-        return VK_OEM_COMMA;
+        return VKEY_OEM_COMMA;
       case 0x37:
-        return VK_OEM_PERIOD;
+        return VKEY_OEM_PERIOD;
       case 0x38:
-        return VK_OEM_2;
+        return VKEY_OEM_2;
       case 0x39:
-        return VK_CAPITAL;
+        return VKEY_CAPITAL;
       case 0x46:
-        return VK_PRIOR;
+        return VKEY_SNAPSHOT;
       case 0x47:
-        return VK_HOME;
+        return VKEY_SCROLL;
       case 0x48:
-        return VK_UP;
+        return VKEY_PAUSE;
       case 0x49:
-        return VK_NEXT;
+        return VKEY_INSERT;
       case 0x4A:
-        return VK_LEFT;
+        return VKEY_HOME;
       case 0x4B:
-        return VK_DOWN;
+        return VKEY_PRIOR;
       case 0x4C:
-        return VK_DELETE;
+        return VKEY_DELETE;
       case 0x4D:
-        return VK_RIGHT;
+        return VKEY_END;
       case 0x4E:
-        return VK_END;
+        return VKEY_NEXT;
       case 0x4F:
-        return VK_NEXT;
+        return VKEY_RIGHT;
       case 0x50:
-        return VK_LEFT;
+        return VKEY_LEFT;
       case 0x51:
-        return VK_DOWN;
+        return VKEY_DOWN;
       case 0x52:
-        return VK_UP;
+        return VKEY_UP;
+      case 0x54:
+        return 0x6F;
+      case 0x55:
+        return 0x6A;
+      case 0x56:
+        return 0x6D;
+      case 0x57:
+        return 0x6B;
+      case 0x58:
+        return VKEY_RETURN;
+      case 0x59:
+      case 0x5A:
+      case 0x5B:
+      case 0x5C:
+      case 0x5D:
+      case 0x5E:
+      case 0x5F:
+      case 0x60:
+      case 0x61:
+        return VKEY_NUMPAD0 + usage - 0x58;
+      case 0x62:
+        return VKEY_NUMPAD0;
+      case 0x63:
+        return 0x6E;
       default:
         return 0;
     }
+  }
+
+  /**
+   * @brief Translate HID boot-keyboard modifier bits into Moonlight modifiers.
+   *
+   * @param hid_modifiers HID left/right control, shift, alt, and GUI bitmap.
+   * @return Combined Moonlight shift, control, alt, and meta bitmap.
+   */
+  std::uint8_t terra_hid_modifiers(const std::uint8_t hid_modifiers) {
+    constexpr std::uint8_t MOONLIGHT_SHIFT = 0x01;
+    constexpr std::uint8_t MOONLIGHT_CTRL = 0x02;
+    constexpr std::uint8_t MOONLIGHT_ALT = 0x04;
+    constexpr std::uint8_t MOONLIGHT_META = 0x08;
+    std::uint8_t result = 0;
+    if (hid_modifiers & 0x22) {
+      result |= MOONLIGHT_SHIFT;
+    }
+    if (hid_modifiers & 0x11) {
+      result |= MOONLIGHT_CTRL;
+    }
+    if (hid_modifiers & 0x44) {
+      result |= MOONLIGHT_ALT;
+    }
+    if (hid_modifiers & 0x88) {
+      result |= MOONLIGHT_META;
+    }
+    return result;
   }
 
   /**
@@ -6367,14 +8816,9 @@ namespace nvhttp {
    * @param report Eight-byte HID boot keyboard report.
    */
   void terra_inject_hid_keyboard(terra_peripheral_channel_t &channel, const std::vector<std::uint8_t> &report) {
-    static constexpr std::uint8_t HID_MODIFIERS[8] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+    constexpr std::uint16_t MODIFIER_KEYS[8] = {0xA2, 0xA0, 0xA4, 0x5B, 0xA3, 0xA1, 0xA5, 0x5C};
     const auto &previous = channel.keyboard_state;
-    std::uint8_t modifiers = 0;
-    for (std::size_t bit = 0; bit < 8; ++bit) {
-      if (report[0] & (1u << bit)) {
-        modifiers = HID_MODIFIERS[bit];
-      }
-    }
+    const auto modifiers = terra_hid_modifiers(report[0]);
     if (previous.size() == report.size()) {
       for (std::size_t index = 2; index < report.size(); ++index) {
         const auto usage = previous[index];
@@ -6385,6 +8829,18 @@ namespace nvhttp {
             input::peripheral_forward_keyboard(channel.input, key, modifiers, true);
           }
         }
+      }
+    }
+    const auto previous_hid_modifiers = previous.empty() ? std::uint8_t {0} : previous[0];
+    const auto changed_modifiers = static_cast<std::uint8_t>(previous_hid_modifiers ^ report[0]);
+    for (std::size_t bit = 0; bit < std::size(MODIFIER_KEYS); ++bit) {
+      if ((changed_modifiers & (1u << bit)) && (previous_hid_modifiers & (1u << bit))) {
+        input::peripheral_forward_keyboard(channel.input, MODIFIER_KEYS[bit], modifiers, true);
+      }
+    }
+    for (std::size_t bit = 0; bit < std::size(MODIFIER_KEYS); ++bit) {
+      if ((changed_modifiers & (1u << bit)) && (report[0] & (1u << bit))) {
+        input::peripheral_forward_keyboard(channel.input, MODIFIER_KEYS[bit], modifiers, false);
       }
     }
     for (std::size_t index = 2; index < report.size(); ++index) {
@@ -6435,10 +8891,12 @@ namespace nvhttp {
    * @brief Write one text frame to a channel socket.
    *
    * @param socket Upgraded TLS socket.
+   * @param write_mutex Per-channel TLS write lock.
    * @param payload JSON text payload.
    * @return True when the frame was written completely.
    */
-  bool terra_channel_write(const std::shared_ptr<SolHTTPS> &socket, std::string_view payload) {
+  bool terra_channel_write(const std::shared_ptr<SolHTTPS> &socket, const std::shared_ptr<std::mutex> &write_mutex, std::string_view payload) {
+    std::lock_guard lock {*write_mutex};
     boost::system::error_code error;
     const auto frame = websocket_frame(0x1, payload);
     asio::write(*socket, asio::buffer(frame), error);
@@ -6449,13 +8907,19 @@ namespace nvhttp {
    * @brief Send a close frame and shut down the channel socket.
    *
    * @param socket Upgraded TLS socket.
+   * @param write_mutex Per-channel TLS write lock.
    * @param code RFC 6455 close status code.
    */
-  void terra_channel_close(const std::shared_ptr<SolHTTPS> &socket, std::uint16_t code) {
+  void terra_channel_close(const std::shared_ptr<SolHTTPS> &socket, const std::shared_ptr<std::mutex> &write_mutex, std::uint16_t code) {
     const std::string payload {static_cast<char>(code >> 8), static_cast<char>(code & 0xFF)};
     boost::system::error_code error;
     const auto frame = websocket_frame(0x8, payload);
-    asio::write(*socket, asio::buffer(frame), error);
+    std::unique_lock lock {*write_mutex, std::try_to_lock};
+    if (lock.owns_lock()) {
+      asio::write(*socket, asio::buffer(frame), error);
+    } else {
+      socket->lowest_layer().cancel(error);
+    }
     error.clear();
     socket->lowest_layer().shutdown(asio::ip::tcp::socket::shutdown_both, error);
   }
@@ -6487,59 +8951,81 @@ namespace nvhttp {
    * Control frames are answered inline; text frames are returned.
    *
    * @param socket Upgraded TLS socket.
-   * @return Opcode and raw (still masked) payload bytes, or empty on EOF or protocol failure.
+   * @param write_mutex Per-channel TLS write lock used for control replies.
+   * @return Opcode and decoded payload bytes, or empty on EOF or protocol failure.
    */
-  std::optional<std::pair<int, std::vector<std::uint8_t>>> terra_channel_read_frame(const std::shared_ptr<SolHTTPS> &socket) {
-    const auto header = terra_channel_read_exact(socket, 2);
-    if (header.size() < 2) {
-      return std::nullopt;
-    }
-    const int opcode = header[0] & 0x0F;
-    const bool masked = (header[1] & 0x80) != 0;
-    std::size_t length = header[1] & 0x7F;
-    if (length == 126) {
-      const auto extended = terra_channel_read_exact(socket, 2);
-      if (extended.size() < 2) {
+  std::optional<std::pair<int, std::vector<std::uint8_t>>> terra_channel_read_frame(const std::shared_ptr<SolHTTPS> &socket, const std::shared_ptr<std::mutex> &write_mutex) {
+    while (true) {
+      auto frame = terra_channel_read_exact(socket, 2);
+      if (frame.size() < 2) {
         return std::nullopt;
       }
-      length = (static_cast<std::size_t>(extended[0]) << 8) | extended[1];
-    } else if (length == 127) {
-      const auto extended = terra_channel_read_exact(socket, 8);
-      if (extended.size() < 8) {
+      const auto opcode = frame[0] & 0x0F;
+      const std::size_t encoded_length = frame[1] & 0x7F;
+      if ((frame[0] & 0x80) == 0 || (frame[0] & 0x70) != 0 || (frame[1] & 0x80) == 0 || (opcode != 0x1 && opcode != 0x8 && opcode != 0x9 && opcode != 0xA) || (opcode >= 0x8 && encoded_length >= 126)) {
+        terra_channel_close(socket, write_mutex, 1002);
         return std::nullopt;
       }
-      length = 0;
-      for (std::size_t index = 0; index < 8; ++index) {
-        length = (length << 8) | extended[index];
+      std::size_t length = encoded_length;
+      if (length == 126) {
+        const auto extended = terra_channel_read_exact(socket, 2);
+        if (extended.size() < 2) {
+          return std::nullopt;
+        }
+        length = (static_cast<std::size_t>(extended[0]) << 8) | extended[1];
+        frame.insert(frame.end(), extended.begin(), extended.end());
+      } else if (length == 127) {
+        const auto extended = terra_channel_read_exact(socket, 8);
+        if (extended.size() < 8 || (extended[0] & 0x80) != 0) {
+          if (extended.size() == 8) {
+            terra_channel_close(socket, write_mutex, 1002);
+          }
+          return std::nullopt;
+        }
+        length = 0;
+        for (std::size_t index = 0; index < 8; ++index) {
+          length = (length << 8) | extended[index];
+        }
+        frame.insert(frame.end(), extended.begin(), extended.end());
       }
-    }
-    if (length > 64 * 1024) {
-      terra_channel_close(socket, 1009);
-      return std::nullopt;
-    }
-    std::vector<std::uint8_t> mask;
-    if (masked) {
-      mask = terra_channel_read_exact(socket, 4);
+      if (length > terra_peripherals::MAX_MESSAGE_BYTES) {
+        terra_channel_close(socket, write_mutex, 1009);
+        return std::nullopt;
+      }
+      const auto mask = terra_channel_read_exact(socket, 4);
       if (mask.size() < 4) {
         return std::nullopt;
       }
-    }
-    auto payload = terra_channel_read_exact(socket, length);
-    if (payload.size() < length) {
-      return std::nullopt;
-    }
-    if (masked) {
-      for (std::size_t index = 0; index < payload.size(); ++index) {
-        payload[index] ^= mask[index % 4];
+      frame.insert(frame.end(), mask.begin(), mask.end());
+      const auto encoded_payload = terra_channel_read_exact(socket, length);
+      if (encoded_payload.size() < length) {
+        return std::nullopt;
       }
+      frame.insert(frame.end(), encoded_payload.begin(), encoded_payload.end());
+      const auto decoded = websocket_decode_frame(frame);
+      if (!decoded) {
+        terra_channel_close(socket, write_mutex, 1002);
+        return std::nullopt;
+      }
+      const auto decoded_opcode = decoded->first;
+      std::vector<std::uint8_t> payload(decoded->second.begin(), decoded->second.end());
+      if (decoded_opcode == 0x9) {
+        const auto pong = websocket_frame(0xA, std::string_view {reinterpret_cast<const char *>(payload.data()), payload.size()});
+        boost::system::error_code error;
+        {
+          std::lock_guard lock {*write_mutex};
+          asio::write(*socket, asio::buffer(pong), error);
+        }
+        if (error) {
+          return std::nullopt;
+        }
+        continue;
+      }
+      if (decoded_opcode == 0xA) {
+        continue;
+      }
+      return std::pair {decoded_opcode, std::move(payload)};
     }
-    if (opcode == 0x9) {
-      const auto pong = websocket_frame(0xA, std::string_view {reinterpret_cast<const char *>(payload.data()), payload.size()});
-      boost::system::error_code error;
-      asio::write(*socket, asio::buffer(pong), error);
-      return terra_channel_read_frame(socket);
-    }
-    return std::pair {opcode, std::move(payload)};
   }
 
   /**
@@ -6549,6 +9035,7 @@ namespace nvhttp {
    */
   void terra_close_peripheral_channel(const std::string &claim_id) {
     std::shared_ptr<SolHTTPS> socket;
+    std::shared_ptr<std::mutex> write_mutex;
     {
       std::lock_guard lock {terra_peripheral_channels_mutex};
       const auto found = terra_peripheral_channels.find(claim_id);
@@ -6556,8 +9043,53 @@ namespace nvhttp {
         return;
       }
       socket = found->second.socket;
+      write_mutex = found->second.write_mutex;
     }
-    terra_channel_close(socket, 1000);
+    terra_channel_close(socket, write_mutex, 1000);
+  }
+
+  /**
+   * @brief Close and join every peripheral channel during HTTPS shutdown.
+   */
+  void terra_close_all_peripheral_channels() {
+    std::vector<std::pair<std::shared_ptr<SolHTTPS>, std::shared_ptr<std::mutex>>> sockets;
+    {
+      std::lock_guard lock {terra_peripheral_channels_mutex};
+      for (const auto &entry : terra_peripheral_channels) {
+        sockets.emplace_back(entry.second.socket, entry.second.write_mutex);
+      }
+    }
+    for (const auto &[socket, write_mutex] : sockets) {
+      terra_channel_close(socket, write_mutex, 1001);
+    }
+
+    std::map<std::string, std::jthread> workers;
+    {
+      std::lock_guard lock {terra_peripheral_channels_mutex};
+      workers = std::move(terra_peripheral_channel_threads);
+      terra_peripheral_channel_threads.clear();
+    }
+    workers.clear();
+    {
+      std::lock_guard lock {terra_peripheral_channels_mutex};
+      terra_peripheral_channels.clear();
+    }
+  }
+
+  /**
+   * @brief Recheck certificate-bound authorization for an established channel.
+   *
+   * @param channel Live channel identity captured during upgrade.
+   * @param claim Current claim snapshot.
+   * @return `true` while owner, certificate, scope, and claim ownership remain valid.
+   */
+  bool terra_peripheral_channel_authorized(const terra_peripheral_channel_t &channel, const terra_peripherals::claim_t &claim) {
+    if (!claim.owner_client_uuid || *claim.owner_client_uuid != channel.owner_uuid) {
+      return false;
+    }
+    std::lock_guard lock {client_auth_mutex};
+    const auto client = std::ranges::find(client_root.named_devices, channel.owner_uuid, &named_cert_t::uuid);
+    return client != client_root.named_devices.end() && client->enabled && client->cert == channel.certificate && !permissions_expired(client->permissions) && client->permissions.scopes.contains("peripheral.forward") && ((claim.device_class == "keyboard" && client->permissions.input.keyboard) || (claim.device_class == "mouse" && client->permissions.input.mouse));
   }
 
   /**
@@ -6569,101 +9101,155 @@ namespace nvhttp {
    *
    * @param claim_id Canonical claim UUID.
    * @param socket Upgraded TLS socket.
+   * @param write_mutex Per-channel TLS write lock.
    */
-  void terra_peripheral_channel_loop(const std::string &claim_id, std::shared_ptr<SolHTTPS> socket) {
+  void terra_peripheral_channel_loop(const std::string &claim_id, std::shared_ptr<SolHTTPS> socket, std::shared_ptr<std::mutex> write_mutex) {
     bool activated = false;
+    std::uint64_t expected_sequence = 1;
     while (true) {
-      const auto frame = terra_channel_read_frame(socket);
+      const auto frame = terra_channel_read_frame(socket, write_mutex);
       if (!frame) {
         break;
       }
       const auto &[opcode, payload] = *frame;
       if (opcode == 0x8) {
+        terra_channel_close(socket, write_mutex, 1000);
         break;
       }
       if (opcode != 0x1) {
-        terra_channel_close(socket, 1002);
+        terra_channel_close(socket, write_mutex, 1002);
         break;
       }
       nlohmann::json message;
       try {
         message = nlohmann::json::parse(payload);
       } catch (const std::exception &) {
-        terra_channel_close(socket, 1002);
+        terra_channel_close(socket, write_mutex, 1002);
         break;
       }
-      const auto type = message.value("type", "");
+      std::optional<terra_peripheral_channel_t> channel;
+      {
+        std::lock_guard lock {terra_peripheral_channels_mutex};
+        const auto found = terra_peripheral_channels.find(claim_id);
+        if (found != terra_peripheral_channels.end() && found->second.socket == socket) {
+          channel = found->second;
+        }
+      }
+      const auto claim = channel ? terra_peripheral_manager->get_claim(channel->owner_uuid, claim_id) : std::nullopt;
+      if (!claim || !channel || !terra_peripheral_channel_authorized(*channel, *claim)) {
+        terra_channel_close(socket, write_mutex, 1008);
+        break;
+      }
+      if (!message.is_object() || message.size() != 5 || !message.contains("schemaVersion") || message.at("schemaVersion") != 1 || !message.contains("sequence") || !message.at("sequence").is_number_unsigned() || message.at("sequence").get<std::uint64_t>() != expected_sequence || !message.contains("type") || !message.at("type").is_string() || !message.contains("deviceId") || !message.at("deviceId").is_string() || message.at("deviceId").get<std::string>() != claim->device_id || !message.contains("payload") || !message.at("payload").is_object()) {
+        terra_channel_close(socket, write_mutex, 1002);
+        break;
+      }
+      if (expected_sequence == std::numeric_limits<std::uint64_t>::max()) {
+        terra_channel_close(socket, write_mutex, 1002);
+        break;
+      }
+      ++expected_sequence;
+      const auto type = message.at("type").get<std::string>();
+      const auto &message_payload = message.at("payload");
       if (type == "claim.open") {
-        std::shared_ptr<input::input_t> injected_input;
-        if (message.value("payload", nlohmann::json::object()).value("claimId", "") != claim_id) {
-          terra_channel_close(socket, 1002);
+        if (message_payload.size() != 1 || !message_payload.contains("claimId") || !message_payload.at("claimId").is_string() || message_payload.at("claimId") != claim_id) {
+          terra_channel_close(socket, write_mutex, 1002);
           break;
         }
+        if (activated || !channel->input) {
+          terra_channel_close(socket, write_mutex, 1002);
+          break;
+        }
+        terra_peripherals::result_t<terra_peripherals::claim_t> opened {terra_peripherals::status_t::not_found, std::nullopt};
         {
-          std::lock_guard lock {terra_peripheral_channels_mutex};
-          injected_input = terra_peripheral_channels[claim_id].input;
+          std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+          std::lock_guard channel_lock {terra_peripheral_channels_mutex};
+          const auto found = terra_peripheral_channels.find(claim_id);
+          const auto current_claim = found != terra_peripheral_channels.end() && found->second.socket == socket ? terra_peripheral_manager->get_claim(found->second.owner_uuid, claim_id) : std::nullopt;
+          if (current_claim && terra_peripheral_channel_authorized(found->second, *current_claim) && found->second.input) {
+            opened = terra_peripheral_manager->open_channel(claim_id);
+            if (opened.status == terra_peripherals::status_t::success && opened.resource) {
+              publish_terra_peripheral_claim_changes({*opened.resource});
+            }
+          }
         }
-        if (activated || !injected_input) {
-          terra_channel_close(socket, 1002);
-          break;
-        }
-        const auto opened = terra_peripheral_manager->open_channel(claim_id);
         if (opened.status != terra_peripherals::status_t::success || !opened.resource) {
-          terra_channel_close(socket, 1008);
+          terra_channel_close(socket, write_mutex, 1008);
           break;
         }
         activated = true;
-        terra_bump_peripheral_revision();
         nlohmann::json granted = nlohmann::json::array();
         for (const auto &capability : opened.resource->granted_capabilities) {
           granted.push_back(capability);
         }
         const nlohmann::json ready {{"schemaVersion", 1}, {"sequence", 1}, {"type", "claim.ready"}, {"deviceId", opened.resource->device_id}, {"payload", {{"claimId", claim_id}, {"grantedCapabilities", granted}}}};
-        if (!terra_channel_write(socket, ready.dump())) {
+        if (!terra_channel_write(socket, write_mutex, ready.dump())) {
           break;
         }
         const nlohmann::json attached {{"schemaVersion", 1}, {"sequence", 2}, {"type", "device.attached"}, {"deviceId", opened.resource->device_id}, {"payload", {{"claimId", claim_id}}}};
-        static_cast<void>(terra_channel_write(socket, attached.dump()));
+        if (!terra_channel_write(socket, write_mutex, attached.dump())) {
+          break;
+        }
         continue;
       }
       if (type == "hid.input") {
-        const auto payload_object = message.value("payload", nlohmann::json::object());
-        const auto encoded = payload_object.value("dataBase64", "");
-        if (encoded.empty() || !activated) {
-          continue;
+        if (!activated || claim->state != terra_peripherals::claim_state_t::active) {
+          terra_channel_close(socket, write_mutex, 1008);
+          break;
         }
+        if (message_payload.size() != 1 || !message_payload.contains("dataBase64") || !message_payload.at("dataBase64").is_string()) {
+          terra_channel_close(socket, write_mutex, 1002);
+          break;
+        }
+        const auto encoded = message_payload.at("dataBase64").get<std::string>();
         std::vector<std::uint8_t> report;
         try {
           const auto decoded = SimpleWeb::Crypto::Base64::decode(encoded);
+          if (decoded.empty() || SimpleWeb::Crypto::Base64::encode(decoded) != encoded || decoded.size() > terra_peripherals::MAX_PAYLOAD_BYTES) {
+            throw std::invalid_argument("invalid base64 payload");
+          }
           report.assign(decoded.begin(), decoded.end());
         } catch (const std::exception &) {
-          terra_channel_close(socket, 1002);
+          terra_channel_close(socket, write_mutex, 1002);
           break;
         }
-        const auto device = terra_peripheral_manager->get_claim({}, claim_id);
-        if (device && device->device_class == "keyboard" && report.size() >= 8) {
-          std::lock_guard lock {terra_peripheral_channels_mutex};
-          auto &channel = terra_peripheral_channels[claim_id];
-          if (channel.input) {
-            terra_inject_hid_keyboard(channel, report);
-          }
-        } else if (device && device->device_class == "mouse" && report.size() >= 3) {
-          std::lock_guard lock {terra_peripheral_channels_mutex};
-          auto &channel = terra_peripheral_channels[claim_id];
-          if (channel.input) {
-            terra_inject_hid_mouse(channel, report);
+        const auto capability = claim->device_class + ".hid";
+        if (!std::ranges::contains(claim->granted_capabilities, capability)) {
+          terra_channel_close(socket, write_mutex, 1008);
+          break;
+        }
+        if ((claim->device_class != "keyboard" || report.size() != 8) && (claim->device_class != "mouse" || report.size() != 4)) {
+          terra_channel_close(socket, write_mutex, 1002);
+          break;
+        }
+        bool injected = false;
+        {
+          std::lock_guard transaction_lock {terra_peripheral_transaction_mutex};
+          std::lock_guard channel_lock {terra_peripheral_channels_mutex};
+          const auto found = terra_peripheral_channels.find(claim_id);
+          const auto current_claim = found != terra_peripheral_channels.end() && found->second.socket == socket ? terra_peripheral_manager->get_claim(found->second.owner_uuid, claim_id) : std::nullopt;
+          if (current_claim && current_claim->state == terra_peripherals::claim_state_t::active && current_claim->device_class == claim->device_class && std::ranges::contains(current_claim->granted_capabilities, capability) && terra_peripheral_channel_authorized(found->second, *current_claim) && found->second.input) {
+            if (current_claim->device_class == "keyboard") {
+              terra_inject_hid_keyboard(found->second, report);
+            } else {
+              terra_inject_hid_mouse(found->second, report);
+            }
+            injected = true;
           }
         }
-        continue;
-      }
-      if (type == "device.error") {
-        BOOST_LOG(warning) << "Peripheral claim [" << claim_id << "] reported a device error";
+        if (!injected) {
+          terra_channel_close(socket, write_mutex, 1008);
+          break;
+        }
         continue;
       }
       if (type == "claim.closed") {
+        if (!activated || message_payload.size() != 1 || !message_payload.contains("claimId") || !message_payload.at("claimId").is_string() || message_payload.at("claimId") != claim_id) {
+          terra_channel_close(socket, write_mutex, 1002);
+        }
         break;
       }
-      terra_channel_close(socket, 1002);
+      terra_channel_close(socket, write_mutex, 1002);
       break;
     }
     terra_peripheral_channel_finish(claim_id, socket);
@@ -6676,7 +9262,7 @@ namespace nvhttp {
    * @param request Original upgrade request.
    */
   void terra_peripheral_channel_upgrade(std::unique_ptr<SolHTTPS> &socket, std::shared_ptr<SimpleWeb::ServerBase<SolHTTPS>::Request> request) {
-    static const std::regex CHANNEL_PATTERN {"^/eclipse/v1/peripherals/claims/([0-9a-fA-F-]+)/channel$"};
+    static const std::regex CHANNEL_PATTERN {"^/eclipse/v1/peripherals/claims/([0-9a-f-]+)/channel$"};
     const std::string path = request->path;
     std::smatch match;
     const auto client = verified_client(request);
@@ -6685,53 +9271,61 @@ namespace nvhttp {
     if (std::regex_match(path, match, CHANNEL_PATTERN)) {
       claim_id = match[1].str();
     }
-    const auto deny = [&](std::string_view code, std::string_view message) {
+    const auto deny = [&](std::string_view status, std::string_view code, std::string_view message) {
       const nlohmann::json body {{"schemaVersion", 1}, {"error", {{"code", code}, {"message", message}}}};
       const std::string text = body.dump();
-      const std::string response = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(text.size()) + "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + text;
+      const std::string response = "HTTP/1.1 " + std::string {status} + "\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(text.size()) + "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + text;
       boost::system::error_code write_error;
       asio::write(*socket, asio::buffer(response), write_error);
     };
     if (!client || !token) {
-      deny("authentication_required", "Peripheral channel requires a paired client and claim credential");
+      deny("401 Unauthorized", "authentication_required", "Peripheral channel requires a paired client and claim credential");
       return;
     }
-    if (claim_id.empty() || !terra_peripheral_manager || !terra_peripheral_manager->authenticate_claim(claim_id, *token)) {
-      deny("claim_not_found", "Claim does not exist or credential is invalid");
+    const auto claim = claim_id.empty() || !terra_peripheral_manager ? std::nullopt : terra_peripheral_manager->authenticate_claim(claim_id, *token, client->uuid);
+    if (!terra_canonical_uuid(claim_id) || !claim) {
+      deny("401 Unauthorized", "claim_not_found", "Claim does not exist or credential is invalid");
       return;
     }
     if (!scope_allowed(*client, "peripheral.forward")) {
-      deny("permission_denied", "Client certificate lacks peripheral.forward permission");
+      deny("403 Forbidden", "permission_denied", "Client certificate lacks peripheral.forward permission");
       return;
     }
-    const auto key_header = request->header.find("Sec-WebSocket-Key");
-    if (key_header == request->header.end()) {
+    const auto upgrade = terra_header(request, "Upgrade");
+    const auto connection = terra_header(request, "Connection");
+    const auto version = terra_header(request, "Sec-WebSocket-Version");
+    const auto protocol = terra_header(request, "Sec-WebSocket-Protocol");
+    const auto key = terra_header(request, "Sec-WebSocket-Key");
+    std::string decoded_key;
+    try {
+      decoded_key = key ? SimpleWeb::Crypto::Base64::decode(*key) : std::string {};
+    } catch (const std::exception &) {}
+    if (request->method != "GET" || !upgrade || !terra_header_contains_token(*upgrade, "websocket") || !connection || !terra_header_contains_token(*connection, "upgrade") || !version || *version != "13" || !protocol || !terra_header_contains_token(*protocol, "eclipse-peripheral-json") || !key || decoded_key.size() != 16 || SimpleWeb::Crypto::Base64::encode(decoded_key) != *key) {
+      deny("400 Bad Request", "invalid_upgrade", "Peripheral channel requires a valid RFC 6455 eclipse-peripheral-json upgrade");
       return;
     }
-    const std::string handshake = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + websocket_accept_key(key_header->second) + "\r\n\r\n";
+    auto channel = std::make_shared<terra_peripheral_channel_t>();
+    channel->input = input::alloc(std::make_shared<safe::mail_raw_t>(), "terra-claim-" + claim_id, client->permissions.input);
+    channel->owner_uuid = client->uuid;
+    channel->certificate = client->cert;
+    if (!channel->input) {
+      deny("503 Service Unavailable", "provider_unavailable", "Peripheral input provider is unavailable");
+      return;
+    }
+    const std::string handshake = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + websocket_accept_key(*key) + "\r\nSec-WebSocket-Protocol: eclipse-peripheral-json\r\n\r\n";
     boost::system::error_code error;
     asio::write(*socket, asio::buffer(handshake), error);
     if (error) {
       return;
     }
-    auto channel = std::make_shared<terra_peripheral_channel_t>();
     channel->socket = std::shared_ptr<SolHTTPS>(socket.release());
-    const auto claim = terra_peripheral_manager->authenticate_claim(claim_id, *token);
-    if (claim && claim->owner_client_uuid) {
-      std::lock_guard clients_lock {client_auth_mutex};
-      const auto found = std::find_if(client_root.named_devices.begin(), client_root.named_devices.end(), [&](const auto &entry) {
-        return entry.uuid == *claim->owner_client_uuid;
-      });
-      if (found != client_root.named_devices.end()) {
-        channel->input = input::alloc(std::make_shared<safe::mail_raw_t>(), "terra-claim-" + claim_id, found->permissions.input);
-      }
-    }
+    std::optional<terra_peripheral_channel_t> previous_channel;
     std::jthread previous_worker;
     {
       std::lock_guard lock {terra_peripheral_channels_mutex};
-      const auto previous_socket = terra_peripheral_channels[claim_id].socket;
-      if (previous_socket) {
-        terra_channel_close(previous_socket, 1000);
+      if (const auto previous = terra_peripheral_channels.find(claim_id); previous != terra_peripheral_channels.end()) {
+        previous_channel = previous->second;
+        terra_neutralize_peripheral_channel(*previous_channel);
       }
       terra_peripheral_channels[claim_id] = *channel;
       const auto thread = terra_peripheral_channel_threads.find(claim_id);
@@ -6739,58 +9333,167 @@ namespace nvhttp {
         previous_worker = std::move(thread->second);
         terra_peripheral_channel_threads.erase(thread);
       }
-      terra_peripheral_channel_threads.emplace(claim_id, std::jthread([claim_id, owned = channel->socket]() {
-                                                   platf::set_thread_name("terra-claim");
-                                                   terra_peripheral_channel_loop(claim_id, owned);
-                                                 }));
+      terra_peripheral_channel_threads.emplace(claim_id, std::jthread([claim_id, owned = channel->socket, write_mutex = channel->write_mutex]() {
+                                                 platf::set_thread_name("terra-claim");
+                                                 terra_peripheral_channel_loop(claim_id, owned, write_mutex);
+                                               }));
+    }
+    if (previous_channel) {
+      terra_channel_close(previous_channel->socket, previous_channel->write_mutex, 1000);
     }
     if (previous_worker.joinable()) {
       previous_worker.join();
     }
   }
 
-  void terra_disconnect_session(resp_https_t response, req_https_t request) {
-    const auto client = authorize_terra_request(response, request, "session.control");
-    if (!client) {
-      return;
-    }
-    const auto session_id = request->path_match[1].str();
-    const auto owner = scope_allowed(*client, "host.control") ? std::string_view {} : std::string_view {client->uuid};
-    const auto sessions = terra_session_snapshots();
-    const bool visible = std::ranges::any_of(sessions, [&](const auto &session) {
-      return session.id == session_id && (owner.empty() || session.client_uuid == owner);
+  /**
+   * @brief Disconnect or stop one session after deferred authorization.
+   *
+   * @param client Current calling-client authorization.
+   * @param session_id Canonical session UUID.
+   * @param stop Whether to terminate application and all owned resources.
+   * @return Deferred operation completion with resulting session resource.
+   */
+  terra_operation_completion_t terra_mutate_session(const verified_client_t &client, const std::string &session_id, const bool stop) {
+    const auto failure = [](std::string_view code, std::string_view message) {
+      return terra_operation_completion_t {false, std::nullopt, nullptr, {{"code", code}, {"message", message}}};
+    };
+    const auto owner = scope_allowed(client, "host.control") ? std::string_view {} : std::string_view {client.uuid};
+    const auto sessions = terra_session_snapshots(false);
+    const auto target = std::ranges::find_if(sessions, [&](const auto &session) {
+      return session.id == session_id && (owner.empty() || (session.client_uuid == owner && app_allowed(client, session.app_uuid)));
     });
-    if (!visible) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "session_not_found", "Session does not exist or is not owned by this client");
-      return;
+    if (target == sessions.end()) {
+      return failure("session_not_found", "Session no longer exists or is not visible to this client");
     }
-    static_cast<void>(rtsp_stream::terminate_session(session_id, owner));
-    if (terra_peripheral_manager) {
-      terra_peripheral_manager->target_ended("session", session_id, false);
-    }
+    const auto previous_tracking = terra_session_tracking_for(session_id);
+    const auto previous_display_id = terra_session_display_id(*target, previous_tracking ? &*previous_tracking : nullptr);
+    const auto previous_peripheral_claim_ids = terra_session_peripheral_claim_ids(*target, previous_tracking ? &*previous_tracking : nullptr);
+    bool terminate_application = stop;
 #ifdef _WIN32
     if (terra_workspace_manager) {
       for (const auto &workspace : terra_workspace_manager->list().workspaces) {
-        if (workspace.session_id == session_id && workspace.definition.cleanup_policy == terra_workspaces::cleanup_policy_t::on_disconnect) {
+        const bool clean_workspace = stop || workspace.definition.cleanup_policy == terra_workspaces::cleanup_policy_t::on_disconnect;
+        if (workspace.session_id == session_id && clean_workspace) {
           const auto stopped = terra_workspace_manager->stop(workspace.id, workspace.revision, true);
           if (stopped.status != terra_workspaces::status_t::success) {
-            send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Workspace resources could not be cleaned after disconnect");
-            return;
+            return failure("provider_unavailable", stop ? "Workspace resources could not be stopped" : "Workspace resources could not be cleaned after disconnect");
           }
+          terminate_application = true;
           if (terra_peripheral_manager) {
-            terra_peripheral_manager->target_ended("workspace", workspace.id, true);
+            transition_terra_peripheral_target("workspace", workspace.id, true);
+            terra_close_target_channels("workspace", workspace.id);
           }
           break;
         }
       }
     }
 #endif
-    BOOST_LOG(info) << "Audit: client ["sv << client->uuid << "] disconnected session ["sv << session_id << ']';
-    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"disconnected", true}, {"sessionId", session_id}});
+    if (terminate_application) {
+      if (previous_tracking && previous_tracking->binding.workspace_id.empty() && !terra_destroy_session_sandbox(previous_tracking->binding)) {
+        return failure("cleanup_failure", "Session sandbox could not be removed");
+      }
+    }
+    static_cast<void>(rtsp_stream::terminate_session(session_id, owner));
+    if (terra_peripheral_manager) {
+      transition_terra_peripheral_target("session", session_id, terminate_application);
+      terra_close_target_channels("session", session_id);
+    }
+    if (terminate_application) {
+#ifdef _WIN32
+      terra_end_session_virtual_displays(session_id);
+#endif
+      {
+        std::lock_guard lock {logical_session_mutex};
+        if (logical_session && logical_session->id == session_id && (owner.empty() || logical_session->client_uuid == owner)) {
+          if (proc::proc.running() > 0) {
+            proc::proc.terminate();
+          }
+          logical_session.reset();
+        }
+      }
+      display_device::revert_configuration();
+    }
+    auto result_session = *target;
+    result_session.state = terminate_application ? "stopped" : "disconnected";
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    terra_session_tracking_t tracking;
+    std::optional<nlohmann::json> created_session_json;
+    bool publish_update = false;
+    std::lock_guard event_order_lock {terra_session_event_mutex};
+    {
+      std::lock_guard lock {terra_session_tracking_mutex};
+      auto [entry, inserted] = terra_session_tracking.try_emplace(session_id);
+      if (inserted) {
+        entry->second.owner_client_uuid = target->client_uuid;
+        entry->second.app_uuid = target->app_uuid;
+        entry->second.state = target->state;
+        entry->second.updated_at = now_ms;
+        entry->second.announced = true;
+        ++terra_session_collection_revision;
+        created_session_json = terra_session_json(*target, &entry->second);
+      }
+      entry->second.retained_snapshot = result_session;
+      if (terminate_application) {
+        entry->second.display_id = previous_display_id;
+        entry->second.peripheral_claim_ids = previous_peripheral_claim_ids;
+      }
+      if (entry->second.state != result_session.state) {
+        entry->second.state = result_session.state;
+        entry->second.updated_at = now_ms;
+        entry->second.terminal_since = terminate_application ? std::optional<std::int64_t> {now_ms} : std::nullopt;
+        ++entry->second.revision;
+        ++terra_session_collection_revision;
+        publish_update = true;
+      }
+      tracking = entry->second;
+    }
+    const auto session_json = terra_session_json(result_session, &tracking);
+    if (created_session_json) {
+      publish_terra_event({"session.created", session_id, 1, std::move(*created_session_json)}, "session.control", target->client_uuid, {target->app_uuid});
+    }
+    if (publish_update) {
+      publish_terra_event({"session.updated", session_id, tracking.revision, session_json}, "session.control", target->client_uuid, {target->app_uuid});
+    }
+    return {true, session_id, {{"session", session_json}}, nullptr};
   }
 
   /**
-   * @brief Stop one logical session and its host application.
+   * @brief Submit idempotent session disconnect.
+   */
+  void terra_disconnect_session(resp_https_t response, req_https_t request) {
+    const auto client = authorize_terra_request(response, request, "session.control");
+    if (!client) {
+      return;
+    }
+    const auto session_id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, session_id, "Session")) {
+      return;
+    }
+    const auto body = terra_empty_request_json(response, request, "Session disconnect");
+    if (!body) {
+      return;
+    }
+    auto operation_body = *body;
+    operation_body["targetId"] = session_id;
+    if (replay_terra_operation(response, *client, request, "session.disconnect", operation_body)) {
+      return;
+    }
+    const auto sessions = terra_session_snapshots(false);
+    const auto target = std::ranges::find_if(sessions, [&](const auto &session) {
+      return session.id == session_id && (scope_allowed(*client, "host.control") || (session.client_uuid == client->uuid && app_allowed(*client, session.app_uuid)));
+    });
+    if (target == sessions.end()) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "session_not_found", "Session does not exist or is not visible to this client");
+      return;
+    }
+    submit_terra_operation(response, *client, request, "session.disconnect", operation_body, [session_id](const verified_client_t &current_client) {
+      return terra_mutate_session(current_client, session_id, false);
+    });
+  }
+
+  /**
+   * @brief Submit idempotent session stop.
    */
   void terra_stop_session(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "session.control");
@@ -6798,54 +9501,29 @@ namespace nvhttp {
       return;
     }
     const auto session_id = request->path_match[1].str();
-    const auto owner = scope_allowed(*client, "host.control") ? std::string_view {} : std::string_view {client->uuid};
-    const auto sessions = terra_session_snapshots();
-    const bool visible = std::ranges::any_of(sessions, [&](const auto &session) {
-      return session.id == session_id && (owner.empty() || session.client_uuid == owner);
-    });
-    if (!visible) {
-      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "session_not_found", "Session does not exist or is not owned by this client");
+    if (!terra_require_canonical_uuid(response, session_id, "Session")) {
       return;
     }
-    static_cast<void>(rtsp_stream::terminate_session(session_id, owner));
-    if (terra_peripheral_manager) {
-      terra_peripheral_manager->target_ended("session", session_id, true);
+    const auto body = terra_empty_request_json(response, request, "Session stop");
+    if (!body) {
+      return;
     }
-#ifdef _WIN32
-    if (terra_workspace_manager) {
-      for (const auto &workspace : terra_workspace_manager->list().workspaces) {
-        if (workspace.session_id == session_id) {
-          const auto stopped = terra_workspace_manager->stop(workspace.id, workspace.revision, true);
-          if (stopped.status != terra_workspaces::status_t::success) {
-            send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Workspace resources could not be stopped");
-            return;
-          }
-          if (terra_peripheral_manager) {
-            terra_peripheral_manager->target_ended("workspace", workspace.id, true);
-          }
-          break;
-        }
-      }
+    auto operation_body = *body;
+    operation_body["targetId"] = session_id;
+    if (replay_terra_operation(response, *client, request, "session.stop", operation_body)) {
+      return;
     }
-#endif
-    {
-      std::lock_guard lock {logical_session_mutex};
-      if (logical_session && logical_session->id == session_id && (owner.empty() || logical_session->client_uuid == owner)) {
-        if (proc::proc.running() > 0) {
-          proc::proc.terminate();
-        }
-        logical_session.reset();
-      }
+    const auto sessions = terra_session_snapshots(false);
+    const auto target = std::ranges::find_if(sessions, [&](const auto &session) {
+      return session.id == session_id && (scope_allowed(*client, "host.control") || (session.client_uuid == client->uuid && app_allowed(*client, session.app_uuid)));
+    });
+    if (target == sessions.end()) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "session_not_found", "Session does not exist or is not visible to this client");
+      return;
     }
-    {
-      const auto binding = terra_session_tracking_for(session_id);
-      if (binding && binding->binding.workspace_id.empty()) {
-        terra_destroy_session_sandbox(binding->binding);
-      }
-    }
-    display_device::revert_configuration();
-    BOOST_LOG(info) << "Audit: client ["sv << client->uuid << "] stopped session ["sv << session_id << ']';
-    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"stopped", true}, {"sessionId", session_id}});
+    submit_terra_operation(response, *client, request, "session.stop", operation_body, [session_id](const verified_client_t &current_client) {
+      return terra_mutate_session(current_client, session_id, true);
+    });
   }
 
   /**
@@ -6856,8 +9534,7 @@ namespace nvhttp {
     if (!client) {
       return;
     }
-    const bool administer = scope_allowed(*client, "host.control");
-    send_terra_response(response, SimpleWeb::StatusCode::success_ok, terra_telemetry_document(administer ? std::string {} : client->uuid));
+    send_terra_response(response, SimpleWeb::StatusCode::success_ok, terra_telemetry_document(&*client));
   }
 
   /**
@@ -6869,17 +9546,20 @@ namespace nvhttp {
       return;
     }
     const auto session_id = request->path_match[1].str();
+    if (!terra_require_canonical_uuid(response, session_id, "Session")) {
+      return;
+    }
     const bool administer = scope_allowed(*client, "host.control");
-    for (const auto &session : terra_session_snapshots()) {
-      if (session.id != session_id || (!administer && session.client_uuid != client->uuid)) {
+    for (const auto &session : terra_session_snapshots(true)) {
+      if (session.id != session_id || (!administer && (session.client_uuid != client->uuid || !app_allowed(*client, session.app_uuid)))) {
         continue;
       }
       const auto tracking = terra_session_tracking_for(session.id);
-      const auto document = terra_telemetry_document(std::string {});
+      const auto document = terra_telemetry_document(&*client);
       send_terra_response(response, SimpleWeb::StatusCode::success_ok, {
-                                                                           {"timestamp", document.at("timestamp")},
-                                                                           {"session", terra_telemetry_session_json(session, tracking ? &*tracking : nullptr)},
-                                                                         });
+                                                                         {"timestamp", document.at("timestamp")},
+                                                                         {"session", terra_telemetry_session_json(session, tracking ? &*tracking : nullptr)},
+                                                                       });
       return;
     }
     send_terra_error(response, SimpleWeb::StatusCode::client_error_not_found, "session_not_found", "Session does not exist or is not visible to this client");
@@ -6953,6 +9633,25 @@ namespace nvhttp {
         });
       },
     });
+    {
+      std::lock_guard lock {terra_peripheral_revision_mutex};
+      terra_peripheral_collection_revisions.clear();
+    }
+    {
+      std::lock_guard lock {terra_peripheral_publication_mutex};
+      terra_peripheral_published_revisions.clear();
+    }
+    terra_peripheral_manager = std::make_unique<terra_peripherals::manager_t>(
+      []() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+      },
+      []() {
+        return uuid_util::uuid_t::generate().string();
+      },
+      []() {
+        return uuid_util::uuid_t::generate().string() + uuid_util::uuid_t::generate().string();
+      }
+    );
 #ifdef _WIN32
     const auto sandbox_path = platf::appdata() / "eclipse_sandboxes.json";
     if (clean_slate) {
@@ -6975,7 +9674,9 @@ namespace nvhttp {
       [profile_path](const std::string &document) {
         return file_handler::write_file_atomic(profile_path.string().c_str(), document) == 0;
       },
-      {},
+      []() {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+      },
       []() {
         return uuid_util::uuid_t::generate().string();
       },
@@ -6988,16 +9689,43 @@ namespace nvhttp {
       },
       [sandbox_capable = sandbox_callbacks.provider_capable](const std::string &type, const nlohmann::json &configuration) {
         if (type == "display") {
-          return false;
+          if (!configuration.at("targetDisplayId").is_string() || !configuration.at("topology").is_null() || !configuration.at("virtualDisplays").empty() || configuration.at("rotation") != 0) {
+            return false;
+          }
+          const auto displays = terra_display_snapshot();
+          if (!displays) {
+            return false;
+          }
+          const auto target_id = configuration.at("targetDisplayId").get<std::string>();
+          const auto target = std::ranges::find_if(displays->second, [&](const auto &display) {
+            return display.at("id") == target_id;
+          });
+          return target != displays->second.end() && std::abs(configuration.at("scale").get<double>() - target->at("scale").at("numerator").get<double>() / target->at("scale").at("denominator").get<double>()) < 0.001 && (configuration.at("modeId").is_null() || !terra_resolve_display_mode(*target, configuration.at("modeId").get<std::string>()).is_null());
         }
         if (type == "sandbox") {
           std::string reason;
           return sandbox_capable && sandbox_capable({"", {}, configuration, std::nullopt, false}, reason);
         }
         if (type == "launch") {
-          return configuration.at("workingDirectory").is_null() && configuration.at("preLaunchPolicy").empty() && configuration.at("postExitPolicy").empty();
+          const auto safe_token = [](const std::string &value) {
+            return !value.empty() && std::ranges::all_of(value, [](const unsigned char character) {
+              return std::isalnum(character) || std::string_view {"_-./\\:=,@+"}.contains(character);
+            });
+          };
+          const auto environment_supported = std::ranges::all_of(configuration.at("environment").items(), [&](const auto &entry) {
+            return safe_token(entry.key()) && entry.value().is_string();
+          });
+          const auto working_directory = configuration.at("workingDirectory");
+          const auto working_directory_supported = working_directory.is_null() || (working_directory.is_string() && fs::path(working_directory.get<std::string>()).is_absolute() && fs::is_directory(working_directory.get<std::string>()));
+          return std::ranges::all_of(configuration.at("arguments"), [&](const auto &argument) {
+                   return argument.is_string() && safe_token(argument.get<std::string>());
+                 }) &&
+                 environment_supported && working_directory_supported && configuration.at("preLaunchPolicy").empty() && configuration.at("postExitPolicy").empty() && configuration.at("cleanupPolicy") == "on-stop" && configuration.at("concurrentLaunchPolicy") == "deny";
         }
-        return type == "stream";
+        if (type != "stream") {
+          return false;
+        }
+        return terra_stream_configuration_supported(configuration);
       },
       [](const terra::profiles::profile_t &profile) {
         return terra_profile_referenced(profile.id);
@@ -7007,29 +9735,39 @@ namespace nvhttp {
       const auto &sandbox = current ? *current : *previous;
       const auto owner = current && current->owner_client_uuid ? *current->owner_client_uuid : previous && previous->owner_client_uuid ? *previous->owner_client_uuid :
                                                                                                                                          std::string {};
-      if (current) {
-        publish_terra_sandbox_event(previous ? "sandbox.updated" : "sandbox.created", sandbox, terra_sandboxes::to_json(sandbox), owner);
+      if (current && current->owner_client_uuid) {
+        publish_terra_sandbox_event(previous ? "sandbox.updated" : "sandbox.created", sandbox, terra_sandboxes::to_json(sandbox), owner, previous);
       } else {
-        publish_terra_sandbox_event("sandbox.removed", sandbox, {{"id", sandbox.id}, {"revision", sandbox.revision + 1}}, owner);
+        const auto revision = current ? current->revision : sandbox.revision + 1;
+        auto removed = sandbox;
+        removed.revision = revision;
+        publish_terra_sandbox_event("sandbox.removed", removed, {{"id", sandbox.id}, {"revision", revision}}, owner);
       }
     };
     terra_sandbox_manager = std::make_unique<terra_sandboxes::manager_t>(std::move(sandbox_callbacks));
+    const auto virtual_display_path = platf::appdata() / "eclipse_virtual_displays.json";
+    if (clean_slate) {
+      std::error_code error;
+      fs::remove(virtual_display_path, error);
+    }
+    auto virtual_display_callbacks = terra::windows::virtual_display::make_callbacks(virtual_display_path);
+    auto virtual_display_ready_promise = std::make_shared<std::promise<void>>();
+    const auto virtual_display_ready = virtual_display_ready_promise->get_future().share();
+    virtual_display_callbacks.changed = [virtual_display_ready](const std::optional<terra_virtual_display::resource_t> &previous, const std::optional<terra_virtual_display::resource_t> &current) {
+      if (terra_operation_pool.running()) {
+        terra_operation_pool.push([previous, current, virtual_display_ready]() {
+          virtual_display_ready.wait();
+          publish_terra_virtual_display_change(previous, current);
+        });
+      }
+    };
+    terra_virtual_display_manager = std::make_unique<terra_virtual_display::manager_t>(std::move(virtual_display_callbacks));
+    virtual_display_ready_promise->set_value();
     const auto workspace_path = platf::appdata() / "eclipse_workspaces.json";
     if (clean_slate) {
       std::error_code error;
       fs::remove(workspace_path, error);
     }
-    terra_peripheral_manager = std::make_unique<terra_peripherals::manager_t>(
-      []() {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-      },
-      []() {
-        return uuid_util::uuid_t::generate().string();
-      },
-      []() {
-        return uuid_util::uuid_t::generate().string() + uuid_util::uuid_t::generate().string();
-      }
-    );
     terra_workspace_manager = std::make_unique<terra_workspaces::manager_t>(terra_workspaces::callbacks_t {
       [workspace_path]() -> std::optional<std::string> {
         if (!fs::exists(workspace_path)) {
@@ -7057,19 +9795,87 @@ namespace nvhttp {
       [](const std::string &type, const nlohmann::json &configuration) {
         return terra_profile_manager && terra_profile_manager->validate_configuration(type, configuration) == terra::profiles::status_t::success;
       },
-      [](const nlohmann::json &) {
-        return false;
+      [](const nlohmann::json &value) {
+        const auto specification = terra_virtual_specification(value);
+        return terra_virtual_display_manager && terra_virtual_display_manager->available() && specification && specification->scale == 1.0 && !specification->workspace_id;
       },
       [](const terra_workspaces::peripheral_policy_t &policy) {
-        return policy.required_device_ids.empty() && policy.required_classes.empty();
+        return terra_peripheral_manager && std::ranges::all_of(policy.required_device_ids, terra_canonical_uuid) && std::ranges::all_of(policy.required_classes, [](const auto &device_class) {
+                 return std::ranges::contains(terra_peripherals::SUPPORTED_CLASSES, device_class);
+               });
       },
-      [](const terra_workspaces::preparation_t &request) -> std::optional<terra_workspaces::prepared_t> {
+      [](const terra_workspaces::preparation_t &request, const std::function<bool(const terra_workspaces::prepared_t &)> &persist) -> std::optional<terra_workspaces::prepared_t> {
+        terra_workspaces::prepared_t runtime {true};
+        for (const auto &value : request.definition.virtual_displays) {
+          auto specification = terra_virtual_specification(value);
+          if (!specification || !terra_virtual_display_manager) {
+            runtime.success = false;
+            return runtime;
+          }
+          specification->workspace_id = request.workspace_id;
+          const auto created = terra_virtual_display_manager->create(request.owner_client_uuid, *specification);
+          if (created.status != terra_virtual_display::status_t::success || !created.resource) {
+            runtime.success = false;
+            return runtime;
+          }
+          runtime.display_ids.push_back(created.resource->id);
+          const auto attached = terra_virtual_display_manager->attach(created.resource->id, created.resource->revision, {.workspace_id = request.workspace_id});
+          if (attached.status != terra_virtual_display::status_t::success) {
+            runtime.success = false;
+            return runtime;
+          }
+          if (!persist(runtime)) {
+            runtime.success = false;
+            return runtime;
+          }
+        }
+        if (!terra_peripheral_manager) {
+          runtime.success = false;
+          return runtime;
+        }
+        const auto devices = terra_peripheral_manager->list_devices(request.owner_client_uuid);
+        std::set<std::string> selected;
+        const auto claim_device = [&](const terra_peripherals::device_t &device) {
+          const auto claimed = terra_peripheral_manager->create_claim(request.owner_client_uuid, {
+                                                                                                   device.id,
+                                                                                                   {"workspace", request.workspace_id},
+                                                                                                   device.capabilities,
+                                                                                                   true,
+                                                                                                   request.definition.peripheral_policy.disconnect_policy,
+                                                                                                 });
+          if (claimed.status != terra_peripherals::status_t::success || !claimed.resource) {
+            return false;
+          }
+          runtime.peripheral_claim_ids.push_back(claimed.resource->id);
+          publish_terra_peripheral_claim_changes(claimed.expired_claims);
+          publish_terra_peripheral_claim_changes({*claimed.resource});
+          return persist(runtime);
+        };
+        for (const auto &device_id : request.definition.peripheral_policy.required_device_ids) {
+          const auto found = std::ranges::find_if(devices, [&](const auto &entry) {
+            return entry.first.id == device_id;
+          });
+          if (found == devices.end() || !selected.emplace(device_id).second || !claim_device(found->first)) {
+            runtime.success = false;
+            return runtime;
+          }
+        }
+        for (const auto &device_class : request.definition.peripheral_policy.required_classes) {
+          const auto found = std::ranges::find_if(devices, [&](const auto &entry) {
+            return entry.first.device_class == device_class && !selected.contains(entry.first.id);
+          });
+          if (found == devices.end() || !selected.emplace(found->first.id).second || !claim_device(found->first)) {
+            runtime.success = false;
+            return runtime;
+          }
+        }
         if (!request.definition.sandbox_profile_id || (request.profile_overrides.sandbox && request.profile_overrides.sandbox->is_null())) {
-          return terra_workspaces::prepared_t {true};
+          return runtime;
         }
         const auto profile = terra_profile_manager ? terra_profile_manager->inspect(*request.definition.sandbox_profile_id) : std::nullopt;
         if (!profile || profile->type != "sandbox" || !terra_sandbox_manager) {
-          return std::nullopt;
+          runtime.success = false;
+          return runtime;
         }
         const auto &sandbox_configuration = request.profile_overrides.sandbox ? *request.profile_overrides.sandbox : profile->configuration;
         terra_sandboxes::start_t start {.app_uuid = request.app_uuid, .launch_profile_id = request.definition.launch_profile_id};
@@ -7078,11 +9884,13 @@ namespace nvhttp {
             start.launch_profile_id.reset();
           } else {
             if (!request.definition.launch_profile_id || !terra_sandbox_launch_configuration_supported(*request.profile_overrides.launch, request.app_uuid, *request.definition.sandbox_profile_id)) {
-              return std::nullopt;
+              runtime.success = false;
+              return runtime;
             }
             const auto application = terra_resolve_sandbox_application(request.app_uuid, std::nullopt);
             if (!application) {
-              return std::nullopt;
+              runtime.success = false;
+              return runtime;
             }
             auto launch_data = application->launch_data;
             for (const auto &argument : request.profile_overrides.launch->at("arguments")) {
@@ -7097,43 +9905,99 @@ namespace nvhttp {
         } else if (request.definition.launch_profile_id) {
           const auto launch_profile = terra_profile_manager->inspect(*request.definition.launch_profile_id);
           if (!launch_profile || !terra_sandbox_launch_profile_supported(*launch_profile, request.app_uuid, *request.definition.sandbox_profile_id)) {
-            return std::nullopt;
+            runtime.success = false;
+            return runtime;
           }
         }
         const auto created = terra_sandbox_manager->create(request.owner_client_uuid, {
-                                                                                          *request.definition.sandbox_profile_id,
-                                                                                          request.workspace_id,
-                                                                                          request.app_uuid,
-                                                                                          request.definition.persistent,
-                                                                                          request.definition.name,
-                                                                                          sandbox_configuration,
-                                                                                        });
+                                                                                        *request.definition.sandbox_profile_id,
+                                                                                        request.workspace_id,
+                                                                                        request.app_uuid,
+                                                                                        request.definition.persistent,
+                                                                                        request.definition.name,
+                                                                                        sandbox_configuration,
+                                                                                      });
         if (created.status != terra_sandboxes::status_t::success || !created.resource) {
-          return std::nullopt;
+          runtime.success = false;
+          return runtime;
+        }
+        runtime.sandbox_id = created.resource->id;
+        if (!persist(runtime)) {
+          runtime.success = false;
+          return runtime;
         }
         const auto started = terra_sandbox_manager->start(created.resource->id, created.resource->revision, start);
         if (started.status != terra_sandboxes::status_t::success || !started.resource) {
-          const auto cleaned = terra_destroy_workspace_sandbox(created.resource->id);
-          return terra_workspaces::prepared_t {false, std::nullopt, cleaned ? std::nullopt : std::optional {created.resource->id}};
+          runtime.success = false;
+          return runtime;
         }
-        return terra_workspaces::prepared_t {true, std::nullopt, started.resource->id, started.resource->display_ids, started.resource->peripheral_claim_ids};
+        runtime.display_ids.insert(runtime.display_ids.end(), started.resource->display_ids.begin(), started.resource->display_ids.end());
+        runtime.peripheral_claim_ids.insert(runtime.peripheral_claim_ids.end(), started.resource->peripheral_claim_ids.begin(), started.resource->peripheral_claim_ids.end());
+        if (!persist(runtime)) {
+          runtime.success = false;
+        }
+        return runtime;
       },
       [](const terra_workspaces::prepared_t &runtime) {
+        terra_workspaces::prepared_t unresolved {false};
         if (runtime.sandbox_id && !terra_destroy_workspace_sandbox(*runtime.sandbox_id)) {
+          unresolved.sandbox_id = runtime.sandbox_id;
           BOOST_LOG(error) << "Failed to clean workspace sandbox [" << *runtime.sandbox_id << ']';
         }
+        for (const auto &claim_id : runtime.peripheral_claim_ids) {
+          const auto claim = terra_peripheral_manager ? terra_peripheral_manager->get_claim({}, claim_id) : std::nullopt;
+          if (claim) {
+            const auto released = terra_peripheral_manager->release_claim({}, claim_id, claim->revision);
+            if (released.status != terra_peripherals::status_t::success) {
+              unresolved.peripheral_claim_ids.push_back(claim_id);
+              continue;
+            }
+            if (released.resource) {
+              publish_terra_peripheral_claim_changes({*released.resource});
+            }
+          }
+        }
+        for (const auto &display_id : runtime.display_ids) {
+          auto display = terra_virtual_display_manager ? terra_virtual_display_manager->get(display_id) : std::nullopt;
+          if (display && display->state == terra_virtual_display::state_t::attached) {
+            const auto detached = terra_virtual_display_manager->detach(display_id, display->revision);
+            if (detached.status != terra_virtual_display::status_t::success || !detached.resource) {
+              unresolved.display_ids.push_back(display_id);
+              continue;
+            }
+            display = detached.resource;
+          }
+          if (display && !display->persistent && terra_virtual_display_manager->remove(display_id, display->revision).status != terra_virtual_display::status_t::success) {
+            unresolved.display_ids.push_back(display_id);
+          }
+        }
+        return unresolved;
       },
       [](const terra_workspaces::resource_t &workspace, const bool terminate_application) {
-        if (!workspace.display_ids.empty() || !workspace.peripheral_claim_ids.empty()) {
-          return false;
-        }
         bool stopped = true;
-        if (workspace.session_id) {
+        auto runtime_session_id = workspace.session_id;
+        if (!runtime_session_id && terminate_application) {
+          std::string candidate;
+          {
+            std::lock_guard lock {logical_session_mutex};
+            if (logical_session) {
+              candidate = logical_session->id;
+            }
+          }
+          const auto tracking = candidate.empty() ? std::nullopt : terra_session_tracking_for(candidate);
+          if (tracking && tracking->binding.workspace_id == workspace.id) {
+            runtime_session_id = std::move(candidate);
+          }
+        }
+        if (runtime_session_id) {
           const auto owner = workspace.owner_client_uuid ? std::string_view {*workspace.owner_client_uuid} : std::string_view {};
-          stopped = rtsp_stream::terminate_session(*workspace.session_id, owner);
+          stopped = rtsp_stream::terminate_session(*runtime_session_id, owner);
+          stopped = stopped || std::ranges::none_of(terra_session_snapshots(false), [&](const auto &session) {
+                      return session.id == *runtime_session_id;
+                    });
           if (terminate_application) {
             std::lock_guard lock {logical_session_mutex};
-            if (logical_session && logical_session->id == *workspace.session_id) {
+            if (logical_session && logical_session->id == *runtime_session_id) {
               if (proc::proc.running() > 0) {
                 proc::proc.terminate();
               }
@@ -7143,14 +10007,60 @@ namespace nvhttp {
             display_device::revert_configuration();
           } else {
             std::lock_guard lock {logical_session_mutex};
-            stopped = stopped || (logical_session && logical_session->id == *workspace.session_id);
+            stopped = stopped || (logical_session && logical_session->id == *runtime_session_id);
           }
         }
         stopped = (!terminate_application || !workspace.sandbox_id || terra_stop_workspace_sandbox(*workspace.sandbox_id, true)) && stopped;
+        if (terminate_application && stopped) {
+          for (const auto &claim_id : workspace.peripheral_claim_ids) {
+            const auto claim = terra_peripheral_manager ? terra_peripheral_manager->get_claim({}, claim_id) : std::nullopt;
+            if (!claim) {
+              continue;
+            }
+            const auto released = terra_peripheral_manager->release_claim({}, claim_id, claim->revision);
+            if (released.status != terra_peripherals::status_t::success) {
+              stopped = false;
+              break;
+            }
+            if (released.resource) {
+              publish_terra_peripheral_claim_changes({*released.resource});
+            }
+          }
+        }
+        if (terminate_application && stopped) {
+          for (const auto &display_id : workspace.display_ids) {
+            auto display = terra_virtual_display_manager ? terra_virtual_display_manager->get(display_id) : std::nullopt;
+            if (!display) {
+              continue;
+            }
+            if (display->state == terra_virtual_display::state_t::attached) {
+              const auto detached = terra_virtual_display_manager->detach(display_id, display->revision);
+              if (detached.status != terra_virtual_display::status_t::success || !detached.resource) {
+                stopped = false;
+                break;
+              }
+              display = detached.resource;
+            }
+            if (!display->persistent && terra_virtual_display_manager->remove(display_id, display->revision).status != terra_virtual_display::status_t::success) {
+              stopped = false;
+              break;
+            }
+          }
+        }
         return stopped;
       },
       [](const terra_workspaces::resource_t &workspace) {
-        if (workspace.session_id || !workspace.display_ids.empty() || !workspace.peripheral_claim_ids.empty()) {
+        if (workspace.session_id) {
+          return false;
+        }
+        if (std::ranges::any_of(workspace.display_ids, [&](const auto &id) {
+              const auto display = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
+              return !display || display->workspace_id != workspace.id;
+            }) ||
+            std::ranges::any_of(workspace.peripheral_claim_ids, [&](const auto &id) {
+              const auto claim = terra_peripheral_manager ? terra_peripheral_manager->get_claim({}, id) : std::nullopt;
+              return !claim || claim->target.type != "workspace" || claim->target.id != workspace.id || claim->state == terra_peripherals::claim_state_t::released;
+            })) {
           return false;
         }
         if (!workspace.sandbox_id) {
@@ -7176,7 +10086,14 @@ namespace nvhttp {
         return restarted.status == terra_sandboxes::status_t::success;
       },
       [](const terra_workspaces::resource_t &workspace) {
-        if (!workspace.display_ids.empty() || !workspace.peripheral_claim_ids.empty()) {
+        if (std::ranges::any_of(workspace.display_ids, [&](const auto &id) {
+              const auto display = terra_virtual_display_manager ? terra_virtual_display_manager->get(id) : std::nullopt;
+              return !display || display->workspace_id != workspace.id;
+            }) ||
+            std::ranges::any_of(workspace.peripheral_claim_ids, [&](const auto &id) {
+              const auto claim = terra_peripheral_manager ? terra_peripheral_manager->get_claim({}, id) : std::nullopt;
+              return !claim || claim->target.id != workspace.id;
+            })) {
           return false;
         }
         if (workspace.sandbox_id) {
@@ -7188,31 +10105,194 @@ namespace nvhttp {
         if (workspace.state != terra_workspaces::state_t::active) {
           return true;
         }
-        return workspace.session_id && std::ranges::any_of(terra_session_snapshots(), [&](const auto &session) {
+        return workspace.session_id && std::ranges::any_of(terra_session_snapshots(false), [&](const auto &session) {
                  return session.id == *workspace.session_id;
                });
       },
       [](const std::optional<terra_workspaces::resource_t> &previous, const std::optional<terra_workspaces::resource_t> &current) {
+        ++terra_catalog_change_generation;
         if (previous && previous->sandbox_id && (!current || current->sandbox_id != previous->sandbox_id) && !terra_destroy_workspace_sandbox(*previous->sandbox_id)) {
           BOOST_LOG(error) << "Failed to remove committed workspace sandbox [" << *previous->sandbox_id << ']';
         }
+        if (previous && (!current || current->display_ids != previous->display_ids)) {
+          for (const auto &display_id : previous->display_ids) {
+            if (current && std::ranges::contains(current->display_ids, display_id)) {
+              continue;
+            }
+            auto display = terra_virtual_display_manager ? terra_virtual_display_manager->get(display_id) : std::nullopt;
+            if (display && display->state == terra_virtual_display::state_t::attached) {
+              display = terra_virtual_display_manager->detach(display_id, display->revision).resource;
+            }
+            if (display && !display->persistent) {
+              static_cast<void>(terra_virtual_display_manager->remove(display_id, display->revision));
+            }
+          }
+        }
+        if (previous && (!current || current->peripheral_claim_ids != previous->peripheral_claim_ids)) {
+          for (const auto &claim_id : previous->peripheral_claim_ids) {
+            if (current && std::ranges::contains(current->peripheral_claim_ids, claim_id)) {
+              continue;
+            }
+            const auto claim = terra_peripheral_manager ? terra_peripheral_manager->get_claim({}, claim_id) : std::nullopt;
+            if (claim) {
+              const auto released = terra_peripheral_manager->release_claim({}, claim_id, claim->revision);
+              if (released.resource) {
+                publish_terra_peripheral_claim_changes({*released.resource});
+              }
+            }
+          }
+        }
         if (current) {
           if (!current->owner_client_uuid) {
+            if (previous) {
+              publish_terra_event({"workspace.removed", previous->id, current->revision, {{"id", previous->id}, {"revision", current->revision}}}, "catalog.read", previous->definition.shared ? std::string {} : previous->owner_client_uuid.value_or(""), terra_workspace_apps(previous->definition));
+            }
             return;
           }
-          publish_terra_workspace_event(previous ? "workspace.updated" : "workspace.created", *current, terra_workspaces::to_json(*current));
+          publish_terra_workspace_event(previous ? "workspace.updated" : "workspace.created", *current, terra_workspaces::to_json(*current), previous);
         } else if (previous) {
-          publish_terra_workspace_event("workspace.removed", *previous, {{"id", previous->id}, {"revision", previous->revision + 1}});
+          auto tombstone = *previous;
+          ++tombstone.revision;
+          publish_terra_workspace_event("workspace.removed", tombstone, {{"id", previous->id}, {"revision", tombstone.revision}});
         }
       },
     });
-    const auto virtual_display_path = platf::appdata() / "eclipse_virtual_displays.json";
-    if (clean_slate) {
-      std::error_code error;
-      fs::remove(virtual_display_path, error);
+
+    if (terra_workspace_manager->available()) {
+      std::map<std::string, terra_workspaces::resource_t, std::less<>> workspaces;
+      for (const auto &workspace : terra_workspace_manager->list().workspaces) {
+        workspaces.emplace(workspace.id, workspace);
+      }
+      if (terra_sandbox_manager && terra_sandbox_manager->available()) {
+        for (const auto &sandbox : terra_sandbox_manager->list().resources) {
+          const auto workspace = sandbox.workspace_id ? workspaces.find(*sandbox.workspace_id) : workspaces.end();
+          if (sandbox.workspace_id && (workspace == workspaces.end() || workspace->second.sandbox_id != sandbox.id) && !terra_destroy_workspace_sandbox(sandbox.id)) {
+            BOOST_LOG(error) << "Failed to reconcile orphaned workspace sandbox [" << sandbox.id << ']';
+          }
+        }
+      }
+      if (terra_virtual_display_manager && terra_virtual_display_manager->available()) {
+        for (auto display : terra_virtual_display_manager->list().resources) {
+          const auto workspace = display.workspace_id ? workspaces.find(*display.workspace_id) : workspaces.end();
+          if (!display.workspace_id || (workspace != workspaces.end() && std::ranges::contains(workspace->second.display_ids, display.id))) {
+            continue;
+          }
+          if (display.state == terra_virtual_display::state_t::attached) {
+            const auto detached = terra_virtual_display_manager->detach(display.id, display.revision);
+            if (detached.status != terra_virtual_display::status_t::success || !detached.resource) {
+              BOOST_LOG(error) << "Failed to detach orphaned workspace display [" << display.id << ']';
+              continue;
+            }
+            display = *detached.resource;
+          } else {
+            terra_virtual_display::patch_t clear_workspace;
+            clear_workspace.workspace_id.emplace();
+            const auto patched = terra_virtual_display_manager->patch(display.id, display.revision, clear_workspace);
+            if (patched.status != terra_virtual_display::status_t::success || !patched.resource) {
+              BOOST_LOG(error) << "Failed to clear orphaned workspace display [" << display.id << ']';
+              continue;
+            }
+            display = *patched.resource;
+          }
+          if (!display.persistent && terra_virtual_display_manager->remove(display.id, display.revision).status != terra_virtual_display::status_t::success) {
+            BOOST_LOG(error) << "Failed to remove orphaned workspace display [" << display.id << ']';
+          }
+        }
+      }
+      if (terra_peripheral_manager) {
+        for (const auto &claim : terra_peripheral_manager->list_claims({})) {
+          const auto workspace = workspaces.find(claim.target.id);
+          if (claim.target.type != "workspace" || (workspace != workspaces.end() && std::ranges::contains(workspace->second.peripheral_claim_ids, claim.id)) || claim.state == terra_peripherals::claim_state_t::released) {
+            continue;
+          }
+          const auto released = terra_peripheral_manager->release_claim({}, claim.id, claim.revision);
+          if (released.status != terra_peripherals::status_t::success) {
+            BOOST_LOG(error) << "Failed to release orphaned workspace peripheral claim [" << claim.id << ']';
+          } else if (released.resource) {
+            publish_terra_peripheral_claim_changes({*released.resource});
+          }
+        }
+      }
     }
-    terra_virtual_display_manager = std::make_unique<terra_virtual_display::manager_t>(terra::windows::virtual_display::make_callbacks(virtual_display_path));
+
+    {
+      std::set<std::string> persisted_owners;
+      if (terra_profile_manager) {
+        terra::profiles::actor_t administrator {.scopes = {"host.control"}};
+        for (const auto &profile : terra_profile_manager->list(administrator).profiles) {
+          if (profile.owner_client_uuid) {
+            persisted_owners.emplace(*profile.owner_client_uuid);
+          }
+        }
+      }
+      if (terra_workspace_manager) {
+        for (const auto &workspace : terra_workspace_manager->list().workspaces) {
+          if (workspace.owner_client_uuid) {
+            persisted_owners.emplace(*workspace.owner_client_uuid);
+          }
+        }
+      }
+      if (terra_sandbox_manager) {
+        for (const auto &sandbox : terra_sandbox_manager->list().resources) {
+          if (sandbox.owner_client_uuid) {
+            persisted_owners.emplace(*sandbox.owner_client_uuid);
+          }
+        }
+      }
+      if (terra_virtual_display_manager) {
+        for (const auto &display : terra_virtual_display_manager->list().resources) {
+          if (display.owner_client_uuid) {
+            persisted_owners.emplace(*display.owner_client_uuid);
+          }
+        }
+      }
+
+      std::lock_guard lock {client_auth_mutex};
+      const auto valid_owner = [&](const std::string &owner) {
+        return std::ranges::any_of(client_root.named_devices, [&](const auto &client) {
+          return client.uuid == owner && client.enabled && !permissions_expired(client.permissions);
+        });
+      };
+      bool changed = false;
+      for (const auto &owner : persisted_owners) {
+        if (!valid_owner(owner)) {
+          auto &pending = client_root.pending_revocations[owner];
+          pending.domains |= TERRA_FULL_REVOCATION;
+          ++pending.generation;
+          changed = true;
+        }
+      }
+      if (changed && !save_state()) {
+        BOOST_LOG(error) << "Failed to persist startup Terra owner reconciliation";
+      }
+    }
 #endif
+
+    proc::set_external_runtime_probe([]() {
+#ifdef _WIN32
+      std::string session_id;
+      {
+        std::lock_guard lock {logical_session_mutex};
+        if (!logical_session) {
+          return false;
+        }
+        session_id = logical_session->id;
+      }
+      std::string sandbox_id;
+      {
+        std::lock_guard lock {terra_session_tracking_mutex};
+        const auto tracking = terra_session_tracking.find(session_id);
+        if (tracking == terra_session_tracking.end()) {
+          return false;
+        }
+        sandbox_id = tracking->second.binding.sandbox_id;
+      }
+      const auto sandbox = terra_sandbox_manager && !sandbox_id.empty() ? terra_sandbox_manager->get(sandbox_id) : std::nullopt;
+      return sandbox && (sandbox->state == terra_sandboxes::state_t::starting || sandbox->state == terra_sandboxes::state_t::running);
+#else
+      return false;
+#endif
+    });
 
     auto pkey = file_handler::read_file(config::nvhttp.pkey.c_str());
     auto cert = file_handler::read_file(config::nvhttp.cert.c_str());
@@ -7280,6 +10360,14 @@ namespace nvhttp {
     };
 
     https_server.on_verify_failed = [](resp_https_t resp, req_https_t req) {
+      if (terra_api_path(req->path)) {
+        begin_terra_mutation_audit(req);
+        auto cleanup = util::fail_guard([]() {
+          terra_mutation_audit_context.reset();
+        });
+        send_terra_error(resp, SimpleWeb::StatusCode::client_error_unauthorized, "authentication_required", "Valid paired client certificate is required");
+        return;
+      }
       pt::ptree tree;
       auto g = util::fail_guard([&]() {
         std::ostringstream data;
@@ -7294,7 +10382,21 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message"s, "The client is not authorized. Certificate verification failed."s);
     };
 
-    https_server.default_resource["GET"] = not_found<SolHTTPS>;
+    for (const std::string_view method : {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE"}) {
+      https_server.default_resource[std::string {method}] = [&https_server](const resp_https_t &response, const req_https_t &request) {
+        begin_terra_mutation_audit(request);
+        auto cleanup = util::fail_guard([]() {
+          terra_mutation_audit_context.reset();
+        });
+        if (terra_mutation_audit_context) {
+          const auto client = verified_client(request);
+          if (client) {
+            terra_mutation_audit_context->client_uuid = client->uuid;
+          }
+        }
+        terra_or_legacy_not_found(https_server, response, request);
+      };
+    }
     https_server.resource["^/serverinfo$"]["GET"] = serverinfo<SolHTTPS>;
     https_server.on_upgrade = terra_peripheral_channel_upgrade;
     https_server.resource["^/pair$"]["GET"] = [](auto resp, auto req) {
@@ -7312,59 +10414,59 @@ namespace nvhttp {
     https_server.resource["^/eclipse/v1/capabilities$"]["GET"] = terra_capabilities;
     https_server.resource["^/eclipse/v1/events$"]["GET"] = terra_events_stream;
     https_server.resource["^/eclipse/v1/apps$"]["GET"] = terra_apps;
-    https_server.resource["^/eclipse/v1/apps/([0-9a-fA-F-]+)/assets/([A-Za-z0-9._-]+)$"]["GET"] = terra_app_asset;
+    https_server.resource["^/eclipse/v1/apps/([^/]+)/assets/([A-Za-z0-9._-]+)$"]["GET"] = terra_app_asset;
 #ifdef _WIN32
     https_server.resource["^/eclipse/v1/profiles$"]["GET"] = terra_profiles;
-    https_server.resource["^/eclipse/v1/profiles$"]["POST"] = terra_create_profile;
-    https_server.resource["^/eclipse/v1/profiles/([0-9a-fA-F-]+)$"]["GET"] = terra_profile;
-    https_server.resource["^/eclipse/v1/profiles/([0-9a-fA-F-]+)$"]["PATCH"] = terra_patch_profile;
-    https_server.resource["^/eclipse/v1/profiles/([0-9a-fA-F-]+)$"]["DELETE"] = terra_delete_profile;
-    https_server.resource["^/eclipse/v1/profiles/([0-9a-fA-F-]+)/adopt$"]["POST"] = terra_adopt_profile;
+    https_server.resource["^/eclipse/v1/profiles$"]["POST"] = audited_terra_mutation(terra_create_profile);
+    https_server.resource["^/eclipse/v1/profiles/([^/]+)$"]["GET"] = terra_profile;
+    https_server.resource["^/eclipse/v1/profiles/([^/]+)$"]["PATCH"] = audited_terra_mutation(terra_patch_profile);
+    https_server.resource["^/eclipse/v1/profiles/([^/]+)$"]["DELETE"] = audited_terra_mutation(terra_delete_profile);
+    https_server.resource["^/eclipse/v1/profiles/([^/]+)/adopt$"]["POST"] = audited_terra_mutation(terra_adopt_profile);
     https_server.resource["^/eclipse/v1/workspaces$"]["GET"] = terra_workspaces;
-    https_server.resource["^/eclipse/v1/workspaces$"]["POST"] = terra_create_workspace;
-    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)$"]["GET"] = terra_workspace;
-    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)$"]["PATCH"] = terra_patch_workspace;
-    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)$"]["DELETE"] = terra_delete_workspace;
-    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)/start$"]["POST"] = terra_start_workspace;
-    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)/stop$"]["POST"] = terra_stop_workspace;
-    https_server.resource["^/eclipse/v1/workspaces/([0-9a-fA-F-]+)/adopt$"]["POST"] = terra_adopt_workspace;
+    https_server.resource["^/eclipse/v1/workspaces$"]["POST"] = audited_terra_mutation(terra_create_workspace);
+    https_server.resource["^/eclipse/v1/workspaces/([^/]+)$"]["GET"] = terra_workspace;
+    https_server.resource["^/eclipse/v1/workspaces/([^/]+)$"]["PATCH"] = audited_terra_mutation(terra_patch_workspace);
+    https_server.resource["^/eclipse/v1/workspaces/([^/]+)$"]["DELETE"] = audited_terra_mutation(terra_delete_workspace);
+    https_server.resource["^/eclipse/v1/workspaces/([^/]+)/start$"]["POST"] = audited_terra_mutation(terra_start_workspace);
+    https_server.resource["^/eclipse/v1/workspaces/([^/]+)/stop$"]["POST"] = audited_terra_mutation(terra_stop_workspace);
+    https_server.resource["^/eclipse/v1/workspaces/([^/]+)/adopt$"]["POST"] = audited_terra_mutation(terra_adopt_workspace);
     https_server.resource["^/eclipse/v1/sandboxes$"]["GET"] = terra_sandboxes_route;
-    https_server.resource["^/eclipse/v1/sandboxes$"]["POST"] = terra_create_sandbox;
-    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)$"]["GET"] = terra_sandbox_route;
-    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)$"]["DELETE"] = terra_delete_sandbox;
-    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)/start$"]["POST"] = terra_start_sandbox;
-    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)/stop$"]["POST"] = terra_stop_sandbox;
-    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)/restart$"]["POST"] = terra_restart_sandbox;
-    https_server.resource["^/eclipse/v1/sandboxes/([0-9a-fA-F-]+)/adopt$"]["POST"] = terra_adopt_sandbox;
+    https_server.resource["^/eclipse/v1/sandboxes$"]["POST"] = audited_terra_mutation(terra_create_sandbox);
+    https_server.resource["^/eclipse/v1/sandboxes/([^/]+)$"]["GET"] = terra_sandbox_route;
+    https_server.resource["^/eclipse/v1/sandboxes/([^/]+)$"]["DELETE"] = audited_terra_mutation(terra_delete_sandbox);
+    https_server.resource["^/eclipse/v1/sandboxes/([^/]+)/start$"]["POST"] = audited_terra_mutation(terra_start_sandbox);
+    https_server.resource["^/eclipse/v1/sandboxes/([^/]+)/stop$"]["POST"] = audited_terra_mutation(terra_stop_sandbox);
+    https_server.resource["^/eclipse/v1/sandboxes/([^/]+)/restart$"]["POST"] = audited_terra_mutation(terra_restart_sandbox);
+    https_server.resource["^/eclipse/v1/sandboxes/([^/]+)/adopt$"]["POST"] = audited_terra_mutation(terra_adopt_sandbox);
     https_server.resource["^/eclipse/v1/displays$"]["GET"] = terra_displays;
-    https_server.resource["^/eclipse/v1/displays/([0-9a-fA-F-]+)$"]["GET"] = terra_display;
-    https_server.resource["^/eclipse/v1/displays/([0-9a-fA-F-]+)$"]["PATCH"] = terra_patch_display;
+    https_server.resource["^/eclipse/v1/displays/([^/]+)$"]["GET"] = terra_display;
+    https_server.resource["^/eclipse/v1/displays/([^/]+)$"]["PATCH"] = audited_terra_mutation(terra_patch_display);
     https_server.resource["^/eclipse/v1/display-topology$"]["GET"] = terra_display_topology_get;
-    https_server.resource["^/eclipse/v1/display-topology$"]["PUT"] = terra_display_topology_put;
+    https_server.resource["^/eclipse/v1/display-topology$"]["PUT"] = audited_terra_mutation(terra_display_topology_put);
     https_server.resource["^/eclipse/v1/virtual-displays$"]["GET"] = terra_virtual_displays;
-    https_server.resource["^/eclipse/v1/virtual-displays$"]["POST"] = terra_create_virtual_display;
-    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)$"]["GET"] = terra_virtual_display;
-    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)$"]["PATCH"] = terra_patch_virtual_display;
-    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)$"]["DELETE"] = terra_delete_virtual_display;
-    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)/attach$"]["POST"] = terra_attach_virtual_display;
-    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)/detach$"]["POST"] = terra_detach_virtual_display;
-    https_server.resource["^/eclipse/v1/virtual-displays/([0-9a-fA-F-]+)/adopt$"]["POST"] = terra_adopt_virtual_display;
+    https_server.resource["^/eclipse/v1/virtual-displays$"]["POST"] = audited_terra_mutation(terra_create_virtual_display);
+    https_server.resource["^/eclipse/v1/virtual-displays/([^/]+)$"]["GET"] = terra_virtual_display;
+    https_server.resource["^/eclipse/v1/virtual-displays/([^/]+)$"]["PATCH"] = audited_terra_mutation(terra_patch_virtual_display);
+    https_server.resource["^/eclipse/v1/virtual-displays/([^/]+)$"]["DELETE"] = audited_terra_mutation(terra_delete_virtual_display);
+    https_server.resource["^/eclipse/v1/virtual-displays/([^/]+)/attach$"]["POST"] = audited_terra_mutation(terra_attach_virtual_display);
+    https_server.resource["^/eclipse/v1/virtual-displays/([^/]+)/detach$"]["POST"] = audited_terra_mutation(terra_detach_virtual_display);
+    https_server.resource["^/eclipse/v1/virtual-displays/([^/]+)/adopt$"]["POST"] = audited_terra_mutation(terra_adopt_virtual_display);
 #endif
-    https_server.resource["^/eclipse/v1/operations/([0-9a-fA-F-]+)$"]["GET"] = terra_operation;
+    https_server.resource["^/eclipse/v1/operations/([^/]+)$"]["GET"] = terra_operation;
     https_server.resource["^/eclipse/v1/peripherals$"]["GET"] = terra_peripherals_list;
-    https_server.resource["^/eclipse/v1/peripherals$"]["POST"] = terra_peripherals_create;
+    https_server.resource["^/eclipse/v1/peripherals$"]["POST"] = audited_terra_mutation(terra_peripherals_create);
     https_server.resource["^/eclipse/v1/peripherals/claims$"]["GET"] = terra_peripheral_claims_list;
-    https_server.resource["^/eclipse/v1/peripherals/claims$"]["POST"] = terra_peripheral_claims_create;
-    https_server.resource["^/eclipse/v1/peripherals/claims/([0-9a-fA-F-]+)$"]["GET"] = terra_peripheral_claim_get;
-    https_server.resource["^/eclipse/v1/peripherals/claims/([0-9a-fA-F-]+)$"]["DELETE"] = terra_peripheral_claim_delete;
-    https_server.resource["^/eclipse/v1/peripherals/([0-9a-fA-F-]+)$"]["GET"] = terra_peripheral_get;
-    https_server.resource["^/eclipse/v1/peripherals/([0-9a-fA-F-]+)$"]["DELETE"] = terra_peripheral_delete;
+    https_server.resource["^/eclipse/v1/peripherals/claims$"]["POST"] = audited_terra_mutation(terra_peripheral_claims_create);
+    https_server.resource["^/eclipse/v1/peripherals/claims/([^/]+)$"]["GET"] = terra_peripheral_claim_get;
+    https_server.resource["^/eclipse/v1/peripherals/claims/([^/]+)$"]["DELETE"] = audited_terra_mutation(terra_peripheral_claim_delete);
+    https_server.resource["^/eclipse/v1/peripherals/(?!claims$)([^/]+)$"]["GET"] = terra_peripheral_get;
+    https_server.resource["^/eclipse/v1/peripherals/(?!claims$)([^/]+)$"]["DELETE"] = audited_terra_mutation(terra_peripheral_delete);
     https_server.resource["^/eclipse/v1/sessions$"]["GET"] = terra_sessions;
     https_server.resource["^/eclipse/v1/telemetry$"]["GET"] = terra_telemetry;
-    https_server.resource["^/eclipse/v1/sessions/([0-9a-fA-F-]+)/telemetry$"]["GET"] = terra_session_telemetry;
-    https_server.resource["^/eclipse/v1/sessions/([0-9a-fA-F-]+)$"]["GET"] = terra_session;
-    https_server.resource["^/eclipse/v1/sessions/([0-9a-fA-F-]+)/disconnect$"]["POST"] = terra_disconnect_session;
-    https_server.resource["^/eclipse/v1/sessions/([0-9a-fA-F-]+)/stop$"]["POST"] = terra_stop_session;
+    https_server.resource["^/eclipse/v1/sessions/([^/]+)/telemetry$"]["GET"] = terra_session_telemetry;
+    https_server.resource["^/eclipse/v1/sessions/([^/]+)$"]["GET"] = terra_session;
+    https_server.resource["^/eclipse/v1/sessions/([^/]+)/disconnect$"]["POST"] = audited_terra_mutation(terra_disconnect_session);
+    https_server.resource["^/eclipse/v1/sessions/([^/]+)/stop$"]["POST"] = audited_terra_mutation(terra_stop_session);
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);
@@ -7379,6 +10481,59 @@ namespace nvhttp {
     http_server.config.reuse_address = true;
     http_server.config.address = net::get_bind_address(address_family);
     http_server.config.port = port_http;
+
+    const bool manage_discovery_publication = !port_http_override && !port_https_override;
+    std::mutex discovery_mutex;
+    std::condition_variable discovery_condition;
+    bool discovery_http_ready = false;
+    std::mutex capability_event_mutex;
+    bool published_discovery_available = false;
+    nlohmann::json initial_capabilities = nlohmann::json::array();
+    for (const auto capability : terra_operational_capabilities(false)) {
+      initial_capabilities.push_back(capability);
+    }
+    std::string initial_capabilities_state = initial_capabilities.dump();
+    std::jthread discovery_thread;
+    if (manage_discovery_publication) {
+      platf::publish::set_http_available(false);
+      platf::publish::set_availability_callback([&capability_event_mutex, &published_discovery_available](const bool available) {
+        try {
+          std::lock_guard lock {capability_event_mutex};
+          published_discovery_available = available;
+          nlohmann::json capabilities = nlohmann::json::array();
+          for (const auto capability : terra_operational_capabilities(available)) {
+            capabilities.push_back(capability);
+          }
+          publish_terra_event({"capabilities.changed", std::nullopt, std::nullopt, {{"capabilities", std::move(capabilities)}}});
+        } catch (const std::exception &exception) {
+          BOOST_LOG(error) << "Discovery capability event publication failed: " << exception.what();
+        }
+      });
+      discovery_thread = std::jthread([&](const std::stop_token stop) {
+        platf::set_thread_name("publish::service");
+        {
+          std::unique_lock lock {discovery_mutex};
+          discovery_condition.wait(lock, [&] {
+            return discovery_http_ready || stop.stop_requested();
+          });
+          if (stop.stop_requested()) {
+            return;
+          }
+        }
+
+        platf::publish::set_http_available(true);
+        auto publication = platf::publish::start();
+
+        std::unique_lock lock {discovery_mutex};
+        discovery_condition.wait(lock, [&] {
+          return stop.stop_requested();
+        });
+        lock.unlock();
+
+        publication.reset();
+        platf::publish::set_http_available(false);
+      });
+    }
 
     auto accept_and_run = [&](auto *server, const std::function<void()> &start_server) {
       try {
@@ -7396,6 +10551,8 @@ namespace nvhttp {
         return;
       }
     };
+    terra_catalog_process_revision = proc::catalog_revision();
+    terra_catalog_change_generation = 0;
     std::jthread ssl {accept_and_run, &https_server, std::function<void()> {[&] {
                         https_server.start([&](const unsigned short port) {
                           if (https_ready) {
@@ -7404,50 +10561,79 @@ namespace nvhttp {
                         });
                       }}};
     std::jthread tcp {accept_and_run, &http_server, std::function<void()> {[&] {
-                        http_server.start();
+                        http_server.start([&](const unsigned short) {
+                          if (!manage_discovery_publication) {
+                            return;
+                          }
+                          std::lock_guard lock {discovery_mutex};
+                          discovery_http_ready = true;
+                          discovery_condition.notify_one();
+                        });
                       }}};
 
-    std::jthread change_monitor([](const std::stop_token stop) {
-      auto catalog_revision = proc::catalog_revision();
+    std::jthread change_monitor([capabilities_state = std::move(initial_capabilities_state), &capability_event_mutex, &published_discovery_available](const std::stop_token stop) mutable {
+      auto catalog_revision = terra_catalog_process_revision.load();
+      std::uint64_t catalog_change_generation = 0;
       std::set<std::string> expired_clients;
       std::uint64_t monitor_tick = 0;
+      auto next_monitor_tick = std::chrono::steady_clock::now();
       std::string host_name_state = config::nvhttp.sol_name;
-      std::string capabilities_state;
 #ifdef _WIN32
-      std::uint64_t display_revision = 0;
-      if (const auto snapshot = terra_display_snapshot()) {
-        display_revision = snapshot->first;
-      }
+      publish_terra_display_changes();
 #endif
       while (!stop.stop_requested()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds {250});
+        next_monitor_tick += std::chrono::milliseconds {250};
+        std::this_thread::sleep_until(next_monitor_tick);
         ++monitor_tick;
-        std::vector<std::pair<std::string, std::string>> newly_expired;
+        if (monitor_tick % 4 == 0 && terra_operation_store && !terra_operation_store->available()) {
+          static_cast<void>(terra_operation_store->reprobe());
+        }
+        if (terra_peripheral_manager) {
+          const auto expired = expire_terra_peripheral_credentials();
+          for (const auto &claim : expired) {
+            terra_close_peripheral_channel(claim.id);
+          }
+        }
+        std::vector<std::string> expiry_candidates;
         {
           std::lock_guard lock {client_auth_mutex};
           for (const auto &client : client_root.named_devices) {
             if (permissions_expired(client.permissions)) {
-              if (expired_clients.emplace(client.uuid).second) {
-                newly_expired.emplace_back(client.uuid, client.cert);
-              }
+              expiry_candidates.emplace_back(client.uuid);
             } else {
               expired_clients.erase(client.uuid);
             }
           }
-          if (!newly_expired.empty()) {
+        }
+        for (const auto &client_uuid : expiry_candidates) {
+          std::lock_guard client_mutation_lock {terra_client_mutation_mutex(client_uuid)};
+          std::lock_guard revocation_lock {terra_revocation_mutex};
+          std::string certificate;
+          {
+            std::lock_guard lock {client_auth_mutex};
+            const auto client = std::ranges::find(client_root.named_devices, client_uuid, &named_cert_t::uuid);
+            if (client == client_root.named_devices.end() || !permissions_expired(client->permissions) || !expired_clients.emplace(client_uuid).second) {
+              continue;
+            }
+            certificate = client->cert;
+            auto &pending = client_root.pending_revocations[client_uuid];
+            pending.domains |= TERRA_FULL_REVOCATION;
+            ++pending.generation;
             std::erase_if(verified_clients, [&](const auto &entry) {
-              return expired_clients.contains(entry.second.uuid);
+              return entry.second.uuid == client_uuid;
             });
             rebuild_client_cert_chain();
+            if (!save_state()) {
+              BOOST_LOG(error) << "Failed to persist expired-client revocation work";
+            }
           }
-        }
-        for (const auto &[client_uuid, certificate] : newly_expired) {
           if (terra_event_hub) {
-            terra_event_hub->disconnect_client(client_uuid);
+            terra_event_hub->reset_client(client_uuid);
           }
           rtsp_stream::terminate_sessions_by_cert(certificate);
           if (terra_peripheral_manager) {
-            terra_peripheral_manager->revoke_owner(client_uuid);
+            static_cast<void>(revoke_terra_peripheral_owner(client_uuid));
+            terra_close_owner_channels(client_uuid);
           }
 #ifdef _WIN32
           if (terra_virtual_display_manager) {
@@ -7458,10 +10644,19 @@ namespace nvhttp {
           revoke_terra_workspaces(client_uuid);
 #endif
         }
+        retry_terra_revocations();
         const auto current_catalog_revision = proc::catalog_revision();
         if (current_catalog_revision != catalog_revision) {
           catalog_revision = current_catalog_revision;
-          publish_terra_event({"catalog.changed", std::nullopt, catalog_revision, {{"revision", catalog_revision}}}, "catalog.read");
+          const auto previous_process_revision = terra_catalog_process_revision.exchange(current_catalog_revision);
+          if (previous_process_revision != 0 && previous_process_revision != current_catalog_revision) {
+            ++terra_catalog_change_generation;
+          }
+        }
+        const auto current_catalog_change_generation = terra_catalog_change_generation.load();
+        if (current_catalog_change_generation != catalog_change_generation) {
+          catalog_change_generation = current_catalog_change_generation;
+          publish_terra_catalog_changes();
         }
 #ifdef _WIN32
         if (terra_sandbox_manager) {
@@ -7470,46 +10665,55 @@ namespace nvhttp {
             BOOST_LOG(error) << "Sandbox runtime reconciliation failed";
           }
         }
-        if (const auto snapshot = terra_display_snapshot(); snapshot && snapshot->first != display_revision) {
-          display_revision = snapshot->first;
-          publish_terra_event({"displays.changed", std::nullopt, display_revision, {{"revision", display_revision}}}, "display.read");
+        if (monitor_tick % 4 == 0 && terra_workspace_manager && terra_sandbox_manager && terra_workspace_manager->available() && terra_sandbox_manager->available()) {
+          for (const auto &sandbox : terra_sandbox_manager->list().resources) {
+            if (!sandbox.workspace_id) {
+              continue;
+            }
+            const auto workspace = terra_workspace_manager->get(*sandbox.workspace_id);
+            if ((!workspace || (workspace->state != terra_workspaces::state_t::preparing && workspace->sandbox_id != sandbox.id)) && !terra_destroy_workspace_sandbox(sandbox.id)) {
+              BOOST_LOG(error) << "Failed to retry orphaned workspace sandbox cleanup [" << sandbox.id << ']';
+            }
+          }
         }
+        publish_terra_display_changes();
 #endif
         if (config::nvhttp.sol_name != host_name_state) {
           host_name_state = config::nvhttp.sol_name;
           publish_terra_event({"host.changed", std::nullopt, std::nullopt, {{"name", host_name_state}}});
         }
         if (monitor_tick % 8 == 0) {
-          bool sandbox_ok = true;
-#ifdef _WIN32
-          sandbox_ok = terra::windows::sandbox::health().available;
-#endif
-          nlohmann::json capabilities = nlohmann::json::array();
-          for (const auto capability : terra_api::CAPABILITIES) {
-            capabilities.push_back(capability);
+          std::lock_guard capability_lock {capability_event_mutex};
+          nlohmann::json monitored_capabilities = nlohmann::json::array();
+          for (const auto capability : terra_operational_capabilities(false)) {
+            monitored_capabilities.push_back(capability);
           }
-          if (sandbox_ok) {
-            capabilities.push_back("sandboxes-v1");
-          }
-          if (terra_peripheral_manager) {
-            capabilities.push_back("peripherals-v1");
-          }
-#ifdef _WIN32
-          capabilities.push_back("displays-v1");
-#endif
-          std::string signature = capabilities.dump();
-          if (capabilities_state.empty()) {
+          std::string signature = monitored_capabilities.dump();
+          if (signature != capabilities_state) {
             capabilities_state = signature;
-          } else if (signature != capabilities_state) {
-            capabilities_state = signature;
+            nlohmann::json capabilities = nlohmann::json::array();
+            for (const auto capability : terra_operational_capabilities(published_discovery_available)) {
+              capabilities.push_back(capability);
+            }
             publish_terra_event({"capabilities.changed", std::nullopt, std::nullopt, {{"capabilities", std::move(capabilities)}}});
           }
         }
         {
-          const auto snapshots = terra_session_snapshots();
+          std::lock_guard event_order_lock {terra_session_event_mutex};
+          const auto snapshots = terra_session_snapshots(false);
           const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+          std::string logical_session_id;
+          {
+            std::lock_guard lock {logical_session_mutex};
+            if (logical_session) {
+              logical_session_id = logical_session->id;
+            }
+          }
+          const bool logical_runtime_running = !logical_session_id.empty() && proc::runtime_running();
           std::vector<std::pair<terra_events::event_t, std::pair<std::string, std::vector<std::string>>>> pending_events;
           std::vector<terra_session_binding_t> doomed_bindings;
+          std::vector<std::pair<std::string, bool>> ended_sessions;
+          std::vector<std::pair<terra_session_binding_t, bool>> ended_bindings;
           {
             std::lock_guard lock {terra_session_tracking_mutex};
             std::set<std::string> seen;
@@ -7522,12 +10726,33 @@ namespace nvhttp {
                 entry->second.app_uuid = session.app_uuid;
                 entry->second.state = session.state;
                 entry->second.updated_at = now_ms;
+                entry->second.display_id = terra_session_display_id(session, &entry->second);
+                entry->second.peripheral_claim_ids = terra_session_peripheral_claim_ids(session, &entry->second);
                 entry->second.announced = true;
                 ++terra_session_collection_revision;
+                pending_events.emplace_back(
+                  terra_events::event_t {"session.created", session.id, entry->second.revision, terra_session_json(session, &entry->second)},
+                  std::pair {session.client_uuid, std::vector<std::string> {session.app_uuid}}
+                );
               }
+              entry->second.retained_snapshot = session;
               entry->second.terminal_since.reset();
+              bool session_changed = false;
               if (entry->second.state != session.state) {
                 entry->second.state = session.state;
+                session_changed = true;
+              }
+              const auto display_id = terra_session_display_id(session, &entry->second);
+              if (entry->second.display_id != display_id) {
+                entry->second.display_id = display_id;
+                session_changed = true;
+              }
+              const auto peripheral_claim_ids = terra_session_peripheral_claim_ids(session, &entry->second);
+              if (entry->second.peripheral_claim_ids != peripheral_claim_ids) {
+                entry->second.peripheral_claim_ids = peripheral_claim_ids;
+                session_changed = true;
+              }
+              if (session_changed) {
                 ++entry->second.revision;
                 entry->second.updated_at = now_ms;
                 ++terra_session_collection_revision;
@@ -7546,15 +10771,28 @@ namespace nvhttp {
               const auto event_apps = entry->second.app_uuid.empty() ? std::vector<std::string> {} : std::vector<std::string> {entry->second.app_uuid};
               const auto &event_owner = entry->second.owner_client_uuid;
               if (!terminal) {
-                entry->second.state = "stopped";
+                const bool runtime_ended = entry->first != logical_session_id || !logical_runtime_running;
+                const auto next_state = runtime_ended ? "stopped" : "disconnected";
+                if (entry->second.state == next_state) {
+                  ++entry;
+                  continue;
+                }
+                entry->second.state = next_state;
                 ++entry->second.revision;
                 entry->second.updated_at = now_ms;
-                entry->second.terminal_since = now_ms;
+                entry->second.terminal_since = runtime_ended ? std::optional<std::int64_t> {now_ms} : std::nullopt;
                 ++terra_session_collection_revision;
-                pending_events.emplace_back(
-                  terra_events::event_t {"session.updated", entry->first, entry->second.revision, {{"id", entry->first}, {"state", "stopped"}, {"stateReason", "terminated"}, {"revision", entry->second.revision}}},
-                  std::pair {event_owner, event_apps}
-                );
+                ended_sessions.emplace_back(entry->first, runtime_ended);
+                ended_bindings.emplace_back(entry->second.binding, runtime_ended);
+                if (entry->second.binding.workspace_id.empty() && !entry->second.binding.sandbox_id.empty()) {
+                  doomed_bindings.push_back(entry->second.binding);
+                }
+                auto retained = entry->second.retained_snapshot.value_or(rtsp_stream::session_info_t {});
+                retained.id = entry->first;
+                retained.client_uuid = event_owner;
+                retained.app_uuid = entry->second.app_uuid;
+                retained.state = next_state;
+                pending_events.emplace_back(terra_events::event_t {"session.updated", entry->first, entry->second.revision, terra_session_json(retained, &entry->second)}, std::pair {event_owner, event_apps});
                 ++entry;
                 continue;
               }
@@ -7566,9 +10804,6 @@ namespace nvhttp {
               if (now_ms - *entry->second.terminal_since < 60'000) {
                 ++entry;
                 continue;
-              }
-              if (entry->second.binding.workspace_id.empty()) {
-                doomed_bindings.push_back(entry->second.binding);
               }
               pending_events.emplace_back(
                 terra_events::event_t {"session.removed", entry->first, entry->second.revision + 1, {{"id", entry->first}, {"revision", entry->second.revision + 1}}},
@@ -7582,34 +10817,74 @@ namespace nvhttp {
             const auto &[owner, apps] = visibility;
             publish_terra_event(event, "session.control", owner, apps);
           }
+          if (terra_peripheral_manager) {
+            for (const auto &[session_id, runtime_ended] : ended_sessions) {
+              transition_terra_peripheral_target("session", session_id, runtime_ended);
+              terra_close_target_channels("session", session_id);
+            }
+            for (const auto &[binding, runtime_ended] : ended_bindings) {
+              if (!binding.sandbox_id.empty()) {
+                transition_terra_peripheral_target("sandbox", binding.sandbox_id, runtime_ended);
+                terra_close_target_channels("sandbox", binding.sandbox_id);
+              }
+            }
+          }
+#ifdef _WIN32
+          for (const auto &[session_id, runtime_ended] : ended_sessions) {
+            (void) runtime_ended;
+            terra_end_session_virtual_displays(session_id);
+          }
+          if (terra_workspace_manager) {
+            for (const auto &[binding, runtime_ended] : ended_bindings) {
+              if (binding.workspace_id.empty()) {
+                continue;
+              }
+              const auto workspace = terra_workspace_manager->get(binding.workspace_id);
+              if (workspace) {
+                const bool terminate = runtime_ended ? workspace->definition.cleanup_policy != terra_workspaces::cleanup_policy_t::retain : workspace->definition.cleanup_policy == terra_workspaces::cleanup_policy_t::on_disconnect;
+                if (terra_workspace_manager->stop(workspace->id, workspace->revision, terminate).status != terra_workspaces::status_t::success) {
+                  BOOST_LOG(error) << "Failed to stop workspace [" << workspace->id << "] after unexpected session loss";
+                  continue;
+                }
+                if (terra_peripheral_manager) {
+                  transition_terra_peripheral_target("workspace", workspace->id, terminate || workspace->definition.peripheral_policy.disconnect_policy == "release");
+                  terra_close_target_channels("workspace", workspace->id);
+                }
+              }
+            }
+          }
+#endif
           for (const auto &binding : doomed_bindings) {
             terra_destroy_session_sandbox(binding);
           }
         }
         if (monitor_tick % 4 == 0) {
+          rtsp_stream::sample_telemetry();
           for (const auto &recipient : terra_event_recipients("telemetry.read")) {
             if (!terra_event_hub) {
               continue;
             }
-            std::string owner_filter;
+            std::optional<verified_client_t> telemetry_client;
             {
               std::lock_guard lock {client_auth_mutex};
               const auto found = std::find_if(client_root.named_devices.begin(), client_root.named_devices.end(), [&](const auto &entry) {
                 return entry.uuid == recipient;
               });
-              if (found != client_root.named_devices.end() && found->permissions.scopes.contains("host.control")) {
-                owner_filter.clear();
-              } else {
-                owner_filter = recipient;
+              if (found != client_root.named_devices.end() && found->enabled && !permissions_expired(found->permissions) && found->permissions.scopes.contains("telemetry.read")) {
+                telemetry_client = verified_client_t {found->uuid, found->name, found->cert, found->permissions};
               }
             }
+            if (!telemetry_client) {
+              continue;
+            }
             try {
-              terra_event_hub->publish({"telemetry.sample", std::nullopt, std::nullopt, terra_telemetry_document(owner_filter)}, {recipient});
+              terra_event_hub->publish({"telemetry.sample", std::nullopt, std::nullopt, terra_telemetry_document(&*telemetry_client)}, {recipient});
             } catch (const std::exception &exception) {
               BOOST_LOG(error) << "Terra telemetry event publication failed: " << exception.what();
             }
           }
         }
+        stream::session::runtime_stopped();
       }
     });
 
@@ -7620,6 +10895,12 @@ namespace nvhttp {
 
     change_monitor.request_stop();
     change_monitor.join();
+    if (manage_discovery_publication) {
+      discovery_thread.request_stop();
+      discovery_condition.notify_one();
+      discovery_thread.join();
+      platf::publish::set_availability_callback({});
+    }
     publish_terra_event({"host.stopping", std::nullopt, std::nullopt, nlohmann::json::object()});
     std::this_thread::sleep_for(std::chrono::milliseconds {50});
     terra_event_hub->disconnect_all();
@@ -7629,12 +10910,14 @@ namespace nvhttp {
 
     ssl.join();
     tcp.join();
+    terra_close_all_peripheral_channels();
     terra_operation_pool.stop();
     terra_operation_pool.join();
     {
       std::lock_guard stream_lock {terra_event_stream_mutex};
       terra_event_streams.clear();
     }
+    proc::set_external_runtime_probe({});
   }
 
   void start() {
@@ -7642,6 +10925,12 @@ namespace nvhttp {
   }
 
   void erase_all_clients() {
+    std::vector<std::unique_lock<std::recursive_mutex>> client_mutation_locks;
+    client_mutation_locks.reserve(terra_client_mutation_mutexes.size());
+    for (auto &mutex : terra_client_mutation_mutexes) {
+      client_mutation_locks.emplace_back(mutex);
+    }
+    std::lock_guard revocation_lock {terra_revocation_mutex};
     bool erased = false;
     std::vector<std::string> removed_owners;
     {
@@ -7651,6 +10940,9 @@ namespace nvhttp {
         removed_owners.push_back(client.uuid);
       }
       client_root = {};
+      for (const auto &owner : removed_owners) {
+        client_root.pending_revocations[owner] = {TERRA_FULL_REVOCATION, 1};
+      }
       cert_chain.clear();
       verified_clients.clear();
       if (!save_state()) {
@@ -7664,13 +10956,14 @@ namespace nvhttp {
     if (erased) {
       if (terra_event_hub) {
         for (const auto &owner : removed_owners) {
-          terra_event_hub->disconnect_client(owner);
+          terra_event_hub->reset_client(owner);
         }
       }
       rtsp_stream::terminate_sessions();
       if (terra_peripheral_manager) {
         for (const auto &owner : removed_owners) {
-          terra_peripheral_manager->revoke_owner(owner);
+          static_cast<void>(revoke_terra_peripheral_owner(owner));
+          terra_close_owner_channels(owner);
         }
       }
 #ifdef _WIN32
@@ -7689,6 +10982,8 @@ namespace nvhttp {
   }
 
   bool unpair_client(const std::string_view uuid) {
+    std::lock_guard client_mutation_lock {terra_client_mutation_mutex(uuid)};
+    std::lock_guard revocation_lock {terra_revocation_mutex};
     std::string certificate;
     bool removed = false;
     {
@@ -7697,6 +10992,9 @@ namespace nvhttp {
       for (auto it = client_root.named_devices.begin(); it != client_root.named_devices.end();) {
         if ((*it).uuid == uuid) {
           certificate = it->cert;
+          auto &pending = client_root.pending_revocations[it->uuid];
+          pending.domains |= TERRA_FULL_REVOCATION;
+          ++pending.generation;
           it = client_root.named_devices.erase(it);
           removed = true;
         } else {
@@ -7716,9 +11014,13 @@ namespace nvhttp {
     }
     if (removed) {
       if (terra_event_hub) {
-        terra_event_hub->disconnect_client(std::string {uuid});
+        terra_event_hub->reset_client(std::string {uuid});
       }
       rtsp_stream::terminate_sessions_by_cert(certificate);
+      if (terra_peripheral_manager) {
+        static_cast<void>(revoke_terra_peripheral_owner(std::string {uuid}));
+        terra_close_owner_channels(std::string {uuid});
+      }
 #ifdef _WIN32
       if (terra_virtual_display_manager) {
         static_cast<void>(terra_virtual_display_manager->revoke_owner(std::string {uuid}));
@@ -7728,7 +11030,10 @@ namespace nvhttp {
       revoke_terra_workspaces(std::string {uuid});
 #endif
     }
-    return removed;
+    if (!removed) {
+      return false;
+    }
+    return true;
   }
 
   bool set_client_enabled(const std::string_view uuid, bool enabled) {
@@ -7738,6 +11043,8 @@ namespace nvhttp {
   }
 
   bool update_client(const std::string_view uuid, client_update_t update) {
+    std::lock_guard client_mutation_lock {terra_client_mutation_mutex(uuid)};
+    std::lock_guard revocation_lock {terra_revocation_mutex};
     if (update.permissions && (update.permissions->expires_at < 0 || std::ranges::any_of(update.permissions->scopes, [](const auto &scope) {
                                  return !terra_api::is_known_scope(scope);
                                }) ||
@@ -7760,7 +11067,13 @@ namespace nvhttp {
     bool revoke_profile_owner = false;
     bool revoke_sandbox_owner = false;
     bool revoke_workspace_owner = false;
+    bool revoke_peripheral_owner = false;
+    bool full_identity_revocation = false;
+    bool reset_event_history = false;
+    std::vector<std::string> revoke_peripheral_classes;
     std::optional<terra_api::client_permissions_t> current_profile_permissions;
+    std::optional<terra_api::client_permissions_t> previous_visibility_permissions;
+    std::optional<terra_api::client_permissions_t> current_visibility_permissions;
     {
       std::lock_guard lock {client_auth_mutex};
       const auto client = std::ranges::find(client_root.named_devices, uuid, &named_cert_t::uuid);
@@ -7775,6 +11088,10 @@ namespace nvhttp {
 
       previous_certificate = client->cert;
       const auto previous_client = *client;
+      if (previous_client.enabled && !permissions_expired(previous_client.permissions)) {
+        previous_visibility_permissions = previous_client.permissions;
+      }
+      const auto previous_pending_revocations = client_root.pending_revocations;
       if (update.enabled) {
         client->enabled = *update.enabled;
         terminate_sessions = !*update.enabled;
@@ -7782,19 +11099,33 @@ namespace nvhttp {
         revoke_profile_owner = !*update.enabled;
         revoke_sandbox_owner = !*update.enabled;
         revoke_workspace_owner = !*update.enabled;
+        revoke_peripheral_owner = !*update.enabled;
+        full_identity_revocation = !*update.enabled;
+        reset_event_history = !*update.enabled;
       }
       if (update.permissions) {
         client->permissions = std::move(*update.permissions);
         terminate_sessions = true;
+        reset_event_history = true;
         revoke_resources = !client->permissions.scopes.contains("virtual-display.manage") || permissions_expired(client->permissions);
         current_profile_permissions = client->permissions;
         revoke_sandbox_owner = true;
         revoke_workspace_owner = true;
+        full_identity_revocation = full_identity_revocation || permissions_expired(client->permissions);
+        reset_event_history = reset_event_history || permissions_expired(client->permissions);
+        if (previous_client.permissions.input.keyboard && !client->permissions.input.keyboard) {
+          revoke_peripheral_classes.emplace_back("keyboard");
+        }
+        if (previous_client.permissions.input.mouse && !client->permissions.input.mouse) {
+          revoke_peripheral_classes.emplace_back("mouse");
+        }
+        revoke_peripheral_owner = !client->permissions.scopes.contains("peripheral.forward") || permissions_expired(client->permissions);
         BOOST_LOG(info) << "Audit: changed permissions for client ["sv << uuid << ']';
       }
       if (update.certificate && client->cert != *update.certificate) {
         client->cert = std::move(*update.certificate);
         terminate_sessions = true;
+        reset_event_history = true;
         BOOST_LOG(info) << "Audit: rotated certificate for client ["sv << uuid << ']';
       }
 
@@ -7802,24 +11133,69 @@ namespace nvhttp {
       std::erase_if(verified_clients, [&](const auto &entry) {
         return entry.second.uuid == uuid;
       });
+      if (revoke_resources || revoke_profile_owner || revoke_sandbox_owner || revoke_workspace_owner || revoke_peripheral_owner || !revoke_peripheral_classes.empty()) {
+        auto &pending = client_root.pending_revocations[std::string {uuid}];
+        if (full_identity_revocation) {
+          pending.domains |= TERRA_FULL_REVOCATION;
+        } else {
+          pending.domains |= revoke_resources ? terra_revoke_virtual_displays : 0;
+          pending.domains |= revoke_profile_owner || current_profile_permissions ? terra_revoke_profiles : 0;
+          pending.domains |= revoke_sandbox_owner ? terra_revoke_sandboxes : 0;
+          pending.domains |= revoke_workspace_owner ? terra_revoke_workspaces : 0;
+          pending.domains |= revoke_peripheral_owner || !revoke_peripheral_classes.empty() ? terra_revoke_peripherals : 0;
+        }
+        ++pending.generation;
+      }
+      if (client->enabled && !permissions_expired(client->permissions)) {
+        const auto pending = client_root.pending_revocations.find(client->uuid);
+        if (pending != client_root.pending_revocations.end() && (pending->second.domains & terra_revoke_full_identity) != 0) {
+          pending->second.domains &= ~terra_revoke_full_identity;
+          ++pending->second.generation;
+        }
+      }
       if (!save_state()) {
         *client = previous_client;
+        client_root.pending_revocations = previous_pending_revocations;
         rebuild_client_cert_chain();
         return false;
+      }
+      if (client->enabled && !permissions_expired(client->permissions)) {
+        current_visibility_permissions = client->permissions;
       }
     }
     if (terminate_sessions) {
       if (terra_event_hub) {
-        terra_event_hub->disconnect_client(std::string {uuid});
+        if (reset_event_history) {
+          terra_event_hub->reset_client(std::string {uuid});
+        } else {
+          terra_event_hub->disconnect_client(std::string {uuid});
+        }
       }
       rtsp_stream::terminate_sessions_by_cert(previous_certificate);
+    }
+    if (update.permissions) {
+      ++terra_catalog_change_generation;
+    }
+#ifdef _WIN32
+    if (previous_visibility_permissions) {
+      publish_terra_policy_visibility_losses(std::string {uuid}, *previous_visibility_permissions, current_visibility_permissions);
+    }
+#endif
+    if (revoke_peripheral_owner && terra_peripheral_manager) {
+      static_cast<void>(revoke_terra_peripheral_owner(std::string {uuid}));
+      terra_close_owner_channels(std::string {uuid});
+    } else if (!revoke_peripheral_classes.empty() && terra_peripheral_manager) {
+      const auto revoked = revoke_terra_peripheral_owner(std::string {uuid}, revoke_peripheral_classes);
+      for (const auto &claim : revoked.claims) {
+        terra_close_peripheral_channel(claim.id);
+      }
     }
 #ifdef _WIN32
     if (revoke_resources && terra_virtual_display_manager) {
       static_cast<void>(terra_virtual_display_manager->revoke_owner(std::string {uuid}));
     }
     if (revoke_sandbox_owner) {
-      revoke_terra_sandboxes(std::string {uuid});
+      revoke_terra_sandboxes(std::string {uuid}, full_identity_revocation ? std::optional<terra_api::client_permissions_t> {} : current_profile_permissions);
     }
     if (revoke_profile_owner) {
       revoke_terra_profiles(std::string {uuid});
@@ -7827,7 +11203,7 @@ namespace nvhttp {
       revoke_terra_profiles(std::string {uuid}, current_profile_permissions);
     }
     if (revoke_workspace_owner) {
-      revoke_terra_workspaces(std::string {uuid});
+      revoke_terra_workspaces(std::string {uuid}, full_identity_revocation ? std::optional<terra_api::client_permissions_t> {} : current_profile_permissions);
     }
 #endif
     return true;
@@ -7882,6 +11258,26 @@ namespace nvhttp {
 
 #ifdef SOL_TESTS
   namespace test_support {
+    bool is_terra_api_path(const std::string_view path) {
+      return terra_api_path(path);
+    }
+
+    std::uint16_t hid_usage_to_virtual_key(const std::uint8_t usage) {
+      return terra_hid_usage_to_vk(usage);
+    }
+
+    std::uint8_t hid_keyboard_modifiers(const std::uint8_t modifiers) {
+      return terra_hid_modifiers(modifiers);
+    }
+
+    bool http_header_contains_token(const std::string_view value, const std::string_view token) {
+      return terra_header_contains_token(value, token);
+    }
+
+    std::string operational_capabilities_csv() {
+      return terra_operational_capabilities_csv();
+    }
+
     nlohmann::json capabilities_document(
       const std::string_view client_uuid,
       const std::string_view client_name,

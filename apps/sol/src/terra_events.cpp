@@ -301,6 +301,14 @@ namespace terra_events {
     impl_->changed.notify_all();
   }
 
+  void hub_t::reset_client(const std::string &client_id) {
+    {
+      std::scoped_lock lock {impl_->mutex};
+      impl_->clients.erase(client_id);
+    }
+    impl_->changed.notify_all();
+  }
+
   void hub_t::disconnect_all() {
     {
       std::scoped_lock lock {impl_->mutex};

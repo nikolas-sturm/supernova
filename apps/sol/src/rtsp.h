@@ -7,15 +7,28 @@
 // standard includes
 #include <atomic>
 #include <chrono>
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
 // local includes
 #include "crypto.h"
+#include "input.h"
 #include "terra_api.h"
 #include "thread_safe.h"
 
 namespace rtsp_stream {
+  /**
+   * @brief Display restoration trigger selected by an applied display profile.
+   */
+  enum class display_restore_e {
+    host_default,  ///< Follow host display-device configuration.
+    always,  ///< Restore after every transport end.
+    on_stop,  ///< Restore only after application runtime termination.
+    never,  ///< Keep applied display state after transport and runtime end.
+  };
+
   constexpr auto RTSP_SETUP_PORT = 21;  ///< GameStream base-port offset used for the RTSP setup listener.
 
   /**
@@ -47,6 +60,21 @@ namespace rtsp_stream {
     bool enable_hdr;  ///< Whether HDR streaming is requested.
     bool enable_sops;  ///< Whether sequence output protection is requested.
     std::string client_name;  ///< Friendly client name from initial pairing.
+    std::optional<int> profile_bitrate_kbps;  ///< Stream-profile bitrate override.
+    std::optional<int> profile_video_format;  ///< Stream-profile codec override, using GameStream format IDs.
+    std::optional<int> profile_chroma_sampling;  ///< Stream-profile chroma override.
+    std::optional<int> profile_audio_channels;  ///< Stream-profile channel-count override.
+    std::optional<int> profile_audio_mask;  ///< Stream-profile channel-mask override.
+    input::mouse_mode_e profile_mouse_mode {input::mouse_mode_e::any};  ///< Stream-profile mouse-coordinate mode.
+    bool profile_stream_applied {};  ///< Whether dimensions, frame rate, and HDR came from a stream profile.
+    bool profile_encryption_required {};  ///< Whether negotiated audio and video encryption are mandatory.
+    std::string capture_output_name;  ///< Exact display-device identifier selected by profile or workspace attachment.
+    std::vector<std::string> app_arguments;  ///< Validated launch-profile arguments appended to application command.
+    std::map<std::string, std::string, std::less<>> app_environment;  ///< Launch-profile environment overrides.
+    std::optional<std::string> app_working_directory;  ///< Launch-profile working-directory override.
+    std::optional<bool> app_elevated;  ///< Launch-profile elevation override.
+    display_restore_e display_restore {display_restore_e::host_default};  ///< Applied display-profile restoration trigger.
+    std::uint64_t telemetry_generation {1};  ///< Generation incremented whenever transport counters reset.
 
     std::optional<crypto::cipher::gcm_t> rtsp_cipher;  ///< AES-GCM cipher used once encrypted RTSP is negotiated.
     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.
@@ -68,6 +96,29 @@ namespace rtsp_stream {
     int height;  ///< Negotiated capture height.
     int fps;  ///< Negotiated refresh rate.
     bool hdr;  ///< Whether HDR was requested.
+    std::uint64_t telemetry_generation;  ///< Current counter generation.
+    std::string codec;  ///< Active encoded video codec.
+    int bitrate_kbps;  ///< Average transmitted video bitrate.
+    std::uint64_t captured_frames;  ///< Fresh frames received from capture provider.
+    std::uint64_t encoded_frames;  ///< Frames successfully produced by encoder.
+    std::uint64_t dropped_frames;  ///< Captured frames dropped before encoding.
+    std::uint64_t transmitted_frames;  ///< Frames transmitted to client.
+    std::uint64_t video_bytes;  ///< Encoded video payload bytes transmitted.
+    std::uint64_t audio_bytes;  ///< Encoded audio payload bytes transmitted.
+    std::uint64_t control_bytes;  ///< Control transport bytes received.
+    std::uint64_t input_bytes;  ///< Authenticated input plaintext bytes received.
+    std::uint64_t queue_depth;  ///< Latest captured-frame queue depth.
+    std::uint64_t queue_drops;  ///< Captured frames discarded by queue overflow.
+    bool interval_sampled;  ///< Whether interval rates have a complete observation window.
+    bool capture_active;  ///< Whether capture provider reported during latest interval.
+    bool audio_active;  ///< Whether encoded audio advanced during latest interval.
+    bool capture_latency_sampled;  ///< Whether capture provider supplied a frame timestamp.
+    bool encode_latency_sampled;  ///< Whether one encoder invocation latency was observed.
+    double capture_fps;  ///< Fresh capture frame rate over latest interval.
+    double encode_fps;  ///< Encoded frame rate over latest interval.
+    double transmit_fps;  ///< Transmitted frame rate over latest interval.
+    double capture_latency_ms;  ///< Latest capture-to-encode frame age.
+    double encode_latency_ms;  ///< Latest encoder-only processing latency.
   };
 
   /**
@@ -95,6 +146,8 @@ namespace rtsp_stream {
    * @return Active session snapshots.
    */
   std::vector<session_info_t> sessions();
+  /** @brief Advance fixed-window telemetry rates for every active stream. */
+  void sample_telemetry();
   /**
    * @brief Terminate active streams for one logical Terra session.
    *

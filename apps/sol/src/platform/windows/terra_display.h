@@ -189,10 +189,10 @@ namespace terra::windows::display {
   [[nodiscard]] std::vector<Snapshot> enumerate_snapshot(std::string_view host_uuid, const display_device::EnumeratedDeviceList &devices);
 
   /**
-   * @brief Return stable API text for display kind.
+   * @brief Collapse OS display classification into the Terra display kind.
    *
-   * @param kind Display kind.
-   * @return Lowercase contract value.
+   * @param kind OS-derived display classification.
+   * @return `virtual` for virtual outputs, otherwise `physical`.
    */
   [[nodiscard]] std::string_view kind_name(Kind kind);
 

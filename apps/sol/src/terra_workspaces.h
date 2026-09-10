@@ -106,6 +106,14 @@ namespace terra_workspaces {
   };
 
   /**
+   * @brief Resolved start-time selections retained while workspace runtime exists.
+   */
+  struct runtime_selection_t {
+    std::string app_uuid;  ///< Application UUID selected when workspace was prepared.
+    profile_overrides_t profile_overrides;  ///< Validated effective start-time profile overrides.
+  };
+
+  /**
    * @brief Parse exact workspace creation object.
    *
    * @param value JSON creation object without `schemaVersion`.
@@ -145,6 +153,7 @@ namespace terra_workspaces {
     std::int64_t updated_at;  ///< Last published change Unix time in milliseconds.
     nlohmann::json error;  ///< Standard error object or JSON null.
     std::uint64_t revision;  ///< Monotonic resource revision.
+    std::optional<runtime_selection_t> runtime_selection;  ///< Persisted start-time selections consumed by launch and resume.
   };
 
   /**
@@ -186,8 +195,8 @@ namespace terra_workspaces {
     std::function<bool(const std::string &, const nlohmann::json &)> validate_profile_configuration;  ///< Validate complete override by kind.
     std::function<bool(const nlohmann::json &)> validate_virtual_display;  ///< Validate one creation object.
     std::function<bool(const peripheral_policy_t &)> validate_peripheral_policy;  ///< Validate peripheral availability and policy.
-    std::function<std::optional<prepared_t>(const preparation_t &)> prepare;  ///< Prepare resources; failed results may contain partial actual IDs for cleanup.
-    std::function<void(const prepared_t &)> cleanup_failed_prepare;  ///< Clean resources left by failed provider preparation.
+    std::function<std::optional<prepared_t>(const preparation_t &, const std::function<bool(const prepared_t &)> &)> prepare;  ///< Prepare resources and durably report cumulative acquired IDs before acquiring another.
+    std::function<prepared_t(const prepared_t &)> cleanup_failed_prepare;  ///< Clean failed preparation and return unresolved IDs for retry.
     std::function<bool(const resource_t &, bool)> stop;  ///< Disconnect or terminate runtime resources.
     std::function<bool(const resource_t &)> restore_after_failed_stop;  ///< Restore runtime and confirm success after transactional stop rollback.
     std::function<bool(const resource_t &)> reconcile;  ///< Confirm persisted runtime resources still exist after restart.
@@ -273,6 +282,8 @@ namespace terra_workspaces {
     result_t stop(const std::string &id, std::uint64_t expected_revision, bool terminate_application);
     /** @brief Revoke owner, stopping runtime and orphaning persistent definitions. @param owner_client_uuid Revoked owner UUID. @return Operation status. */
     status_t revoke_owner(const std::string &owner_client_uuid);
+    /** @brief Revoke only owned workspaces absent from current authorization. @param owner_client_uuid Owner UUID. @param authorized_ids Workspace UUIDs owner may retain. @param expected_collection_revision Revision used to build authorized IDs, or empty for unconditional owner revocation. @return Operation status. */
+    status_t revoke_unauthorized(const std::string &owner_client_uuid, const std::vector<std::string> &authorized_ids, std::optional<std::uint64_t> expected_collection_revision = std::nullopt);
 
   private:
     struct impl_t;  ///< Hidden implementation.

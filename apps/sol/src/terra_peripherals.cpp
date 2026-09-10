@@ -124,10 +124,46 @@ namespace terra_peripherals {
     };
   }
 
+  nlohmann::json claim_creation_json(const claim_t &claim, const std::string_view endpoint) {
+    auto result = claim_json(claim);
+    result["channel"] = {
+      {"endpoint", endpoint},
+      {"protocol", "eclipse-peripheral-json"},
+      {"protocolVersion", 1},
+      {"credential", claim.credential},
+      {"expiresAt", claim.credential_expires_at},
+    };
+    return result;
+  }
+
+  std::size_t active_claim_count(const std::vector<claim_t> &claims) {
+    return static_cast<std::size_t>(std::ranges::count_if(claims, [](const claim_t &claim) {
+      return claim.state != claim_state_t::released;
+    }));
+  }
+
   manager_t::manager_t(std::function<std::int64_t()> now, std::function<std::string()> uuid, std::function<std::string()> token):
       now_(std::move(now)),
       uuid_(std::move(uuid)),
       token_(std::move(token)) {
+  }
+
+  std::optional<std::string> manager_t::active_claim_id_locked(const std::string &device_id) const {
+    std::optional<std::string> active_claim;
+    for (const auto &[claim_id, claim] : claims_) {
+      if (claim.device_id == device_id && claim.state != claim_state_t::released) {
+        active_claim = claim_id;
+      }
+    }
+    return active_claim;
+  }
+
+  void manager_t::touch_device_locked(const std::string &device_id, const std::int64_t now) {
+    const auto device = devices_.find(device_id);
+    if (device != devices_.end()) {
+      device->second.updated_at = now;
+      ++device->second.revision;
+    }
   }
 
   std::vector<std::pair<device_t, std::optional<std::string>>> manager_t::list_devices(const std::string &owner_uuid) const {
@@ -137,13 +173,7 @@ namespace terra_peripherals {
       if (!owner_uuid.empty() && (!device.owner_client_uuid || *device.owner_client_uuid != owner_uuid)) {
         continue;
       }
-      std::optional<std::string> active_claim;
-      for (const auto &[claim_id, claim] : claims_) {
-        if (claim.device_id == id && (claim.state == claim_state_t::active || claim.state == claim_state_t::suspended)) {
-          active_claim = claim_id;
-        }
-      }
-      result.emplace_back(device, active_claim);
+      result.emplace_back(device, active_claim_id_locked(id));
     }
     return result;
   }
@@ -167,11 +197,17 @@ namespace terra_peripherals {
     if (request.capabilities.empty() || !supported_values(request.capabilities, SUPPORTED_CAPABILITIES) || !unique_values(request.capabilities)) {
       return {status_t::unsupported_configuration, std::nullopt};
     }
+    if (request.report_descriptor_base64) {
+      return {status_t::unsupported_configuration, std::nullopt};
+    }
     for (const auto &capability : request.capabilities) {
       if (capability.starts_with(request.device_class)) {
         continue;
       }
       return {status_t::unsupported_configuration, std::nullopt};
+    }
+    if (devices_.size() >= MAX_DEVICES) {
+      return {status_t::limit_reached, std::nullopt};
     }
     const auto now = now_();
     device_t device {
@@ -193,8 +229,9 @@ namespace terra_peripherals {
     return {status_t::success, std::move(device)};
   }
 
-  result_t<device_t> manager_t::delete_device(const std::string &owner_uuid, const std::string &device_id) {
+  result_t<device_t> manager_t::delete_device(const std::string &owner_uuid, const std::string &device_id, const std::uint64_t expected_revision, std::vector<claim_t> &released_claims) {
     std::scoped_lock lock {mutex_};
+    released_claims.clear();
     const auto found = devices_.find(device_id);
     if (found == devices_.end()) {
       return {status_t::not_found, std::nullopt};
@@ -202,7 +239,9 @@ namespace terra_peripherals {
     if (!owner_uuid.empty() && (!found->second.owner_client_uuid || *found->second.owner_client_uuid != owner_uuid)) {
       return {status_t::not_found, std::nullopt};
     }
-    std::vector<claim_t> released;
+    if (found->second.revision != expected_revision) {
+      return {status_t::conflict, std::nullopt};
+    }
     for (auto &[claim_id, claim] : claims_) {
       if (claim.device_id != device_id || claim.state == claim_state_t::released) {
         continue;
@@ -210,11 +249,10 @@ namespace terra_peripherals {
       claim.state = claim_state_t::released;
       claim.updated_at = now_();
       ++claim.revision;
-      released.push_back(claim);
+      released_claims.push_back(claim);
     }
     auto device = found->second;
     devices_.erase(found);
-    static_cast<void>(released);
     return {status_t::success, std::move(device)};
   }
 
@@ -242,37 +280,42 @@ namespace terra_peripherals {
     return found->second;
   }
 
-  result_t<claim_t> manager_t::create_claim(const std::string &owner_uuid, const create_claim_t &request) {
+  claim_result_t manager_t::create_claim(const std::string &owner_uuid, const create_claim_t &request) {
     std::scoped_lock lock {mutex_};
+    auto expired_claims = expire_credentials_locked(now_());
     const auto device = devices_.find(request.device_id);
     if (device == devices_.end()) {
-      return {status_t::not_found, std::nullopt};
+      return {status_t::not_found, std::nullopt, std::move(expired_claims)};
     }
     if (!owner_uuid.empty() && (!device->second.owner_client_uuid || *device->second.owner_client_uuid != owner_uuid)) {
-      return {status_t::not_found, std::nullopt};
+      return {status_t::not_found, std::nullopt, std::move(expired_claims)};
     }
     if (request.target.type != "session" && request.target.type != "workspace" && request.target.type != "sandbox") {
-      return {status_t::invalid, std::nullopt};
+      return {status_t::invalid, std::nullopt, std::move(expired_claims)};
     }
     if (request.disconnect_policy != "release" && request.disconnect_policy != "suspend") {
-      return {status_t::invalid, std::nullopt};
+      return {status_t::invalid, std::nullopt, std::move(expired_claims)};
     }
     if (request.requested_capabilities.empty() || !supported_values(request.requested_capabilities, SUPPORTED_CAPABILITIES) || !unique_values(request.requested_capabilities)) {
-      return {status_t::unsupported_configuration, std::nullopt};
+      return {status_t::unsupported_configuration, std::nullopt, std::move(expired_claims)};
     }
     for (const auto &capability : request.requested_capabilities) {
       if (std::ranges::contains(device->second.capabilities, capability)) {
         continue;
       }
-      return {status_t::unsupported_configuration, std::nullopt};
+      return {status_t::unsupported_configuration, std::nullopt, std::move(expired_claims)};
     }
-    if (request.exclusive) {
-      for (const auto &[claim_id, claim] : claims_) {
-        if (claim.device_id == request.device_id && claim.state != claim_state_t::released) {
-          return {status_t::conflict, std::nullopt};
-        }
+    for (const auto &[claim_id, claim] : claims_) {
+      if (claim.device_id == request.device_id && claim.state != claim_state_t::released && (request.exclusive || claim.exclusive)) {
+        return {status_t::conflict, std::nullopt, std::move(expired_claims)};
       }
     }
+    if (std::ranges::count_if(claims_, [](const auto &entry) {
+          return entry.second.state != claim_state_t::released;
+        }) >= static_cast<std::ptrdiff_t>(MAX_CLAIMS)) {
+      return {status_t::limit_reached, std::nullopt, std::move(expired_claims)};
+    }
+    prune_released_claims_locked();
     const auto now = now_();
     claim_t claim {
       .id = uuid_(),
@@ -288,12 +331,14 @@ namespace terra_peripherals {
       .updated_at = now,
       .revision = 1,
       .credential = token_(),
+      .credential_expires_at = now + CLAIM_CREDENTIAL_TTL_MS,
     };
     claims_.emplace(claim.id, claim);
-    return {status_t::success, std::move(claim)};
+    touch_device_locked(request.device_id, now);
+    return {status_t::success, std::move(claim), std::move(expired_claims)};
   }
 
-  result_t<claim_t> manager_t::release_claim(const std::string &owner_uuid, const std::string &claim_id) {
+  result_t<claim_t> manager_t::release_claim(const std::string &owner_uuid, const std::string &claim_id, const std::uint64_t expected_revision) {
     std::scoped_lock lock {mutex_};
     const auto found = claims_.find(claim_id);
     if (found == claims_.end()) {
@@ -302,18 +347,22 @@ namespace terra_peripherals {
     if (!owner_uuid.empty() && (!found->second.owner_client_uuid || *found->second.owner_client_uuid != owner_uuid)) {
       return {status_t::not_found, std::nullopt};
     }
+    if (found->second.revision != expected_revision) {
+      return {status_t::conflict, std::nullopt};
+    }
     if (found->second.state != claim_state_t::released) {
       found->second.state = claim_state_t::released;
       found->second.updated_at = now_();
       ++found->second.revision;
+      touch_device_locked(found->second.device_id, found->second.updated_at);
     }
     return {status_t::success, found->second};
   }
 
-  std::optional<claim_t> manager_t::authenticate_claim(const std::string &claim_id, const std::string &credential) const {
+  std::optional<claim_t> manager_t::authenticate_claim(const std::string &claim_id, const std::string &credential, const std::string &owner_uuid) const {
     std::scoped_lock lock {mutex_};
     const auto found = claims_.find(claim_id);
-    if (found == claims_.end() || found->second.credential != credential || found->second.state == claim_state_t::released) {
+    if (found == claims_.end() || found->second.credential != credential || found->second.state == claim_state_t::released || !found->second.owner_client_uuid || *found->second.owner_client_uuid != owner_uuid || now_() >= found->second.credential_expires_at) {
       return std::nullopt;
     }
     return found->second;
@@ -329,6 +378,7 @@ namespace terra_peripherals {
       found->second.state = claim_state_t::active;
       found->second.updated_at = now_();
       ++found->second.revision;
+      touch_device_locked(found->second.device_id, found->second.updated_at);
     }
     return {status_t::success, found->second};
   }
@@ -347,34 +397,95 @@ namespace terra_peripherals {
       }
       found->second.updated_at = now_();
       ++found->second.revision;
+      touch_device_locked(found->second.device_id, found->second.updated_at);
     }
     return found->second;
   }
 
-  void manager_t::target_ended(const std::string &target_type, const std::string &target_id, bool release) {
+  std::vector<claim_t> manager_t::expire_credentials() {
     std::scoped_lock lock {mutex_};
+    return expire_credentials_locked(now_());
+  }
+
+  std::vector<claim_t> manager_t::expire_credentials_locked(const std::int64_t now) {
+    std::vector<claim_t> changed;
+    std::set<std::string> changed_devices;
+    for (auto &[claim_id, claim] : claims_) {
+      if ((claim.state == claim_state_t::pending || claim.state == claim_state_t::suspended) && now >= claim.credential_expires_at) {
+        changed_devices.emplace(claim.device_id);
+        claim.state = claim_state_t::released;
+        claim.updated_at = now;
+        ++claim.revision;
+        changed.push_back(claim);
+      }
+    }
+    for (const auto &device_id : changed_devices) {
+      touch_device_locked(device_id, now);
+    }
+    return changed;
+  }
+
+  void manager_t::prune_released_claims_locked() {
+    while (claims_.size() >= MAX_RETAINED_CLAIMS) {
+      auto oldest = claims_.end();
+      for (auto claim = claims_.begin(); claim != claims_.end(); ++claim) {
+        if (claim->second.state == claim_state_t::released && (oldest == claims_.end() || std::pair {claim->second.updated_at, claim->first} < std::pair {oldest->second.updated_at, oldest->first})) {
+          oldest = claim;
+        }
+      }
+      if (oldest == claims_.end()) {
+        return;
+      }
+      claims_.erase(oldest);
+    }
+  }
+
+  std::vector<claim_t> manager_t::target_ended(const std::string &target_type, const std::string &target_id, bool release) {
+    std::scoped_lock lock {mutex_};
+    std::vector<claim_t> changed;
+    std::set<std::string> changed_devices;
+    const auto now = now_();
     for (auto &[claim_id, claim] : claims_) {
       if (claim.target.type != target_type || claim.target.id != target_id || claim.state == claim_state_t::released) {
         continue;
       }
-      if (release || claim.disconnect_policy != "suspend") {
-        claim.state = claim_state_t::released;
-      } else {
-        claim.state = claim_state_t::suspended;
+      const auto state = release || claim.disconnect_policy != "suspend" ? claim_state_t::released : claim_state_t::suspended;
+      if (claim.state == state) {
+        continue;
       }
-      claim.updated_at = now_();
+      changed_devices.emplace(claim.device_id);
+      claim.state = state;
+      claim.updated_at = now;
       ++claim.revision;
+      changed.push_back(claim);
     }
+    for (const auto &device_id : changed_devices) {
+      touch_device_locked(device_id, now);
+    }
+    return changed;
   }
 
-  void manager_t::revoke_owner(const std::string &owner_uuid) {
+  owner_revocation_t manager_t::revoke_owner(const std::string &owner_uuid, const std::vector<std::string> &device_classes) {
     std::scoped_lock lock {mutex_};
+    owner_revocation_t revoked;
     for (auto &[claim_id, claim] : claims_) {
-      if (claim.owner_client_uuid && *claim.owner_client_uuid == owner_uuid && claim.state != claim_state_t::released) {
+      const bool selected_class = device_classes.empty() || std::ranges::contains(device_classes, claim.device_class);
+      if (selected_class && claim.owner_client_uuid && *claim.owner_client_uuid == owner_uuid && claim.state != claim_state_t::released) {
         claim.state = claim_state_t::released;
         claim.updated_at = now_();
         ++claim.revision;
+        revoked.claims.push_back(claim);
       }
     }
+    for (auto device = devices_.begin(); device != devices_.end();) {
+      const bool selected_class = device_classes.empty() || std::ranges::contains(device_classes, device->second.device_class);
+      if (selected_class && device->second.owner_client_uuid && *device->second.owner_client_uuid == owner_uuid) {
+        revoked.devices.push_back(device->second);
+        device = devices_.erase(device);
+      } else {
+        ++device;
+      }
+    }
+    return revoked;
   }
 }  // namespace terra_peripherals

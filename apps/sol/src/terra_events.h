@@ -175,6 +175,13 @@ namespace terra_events {
     void disconnect_client(const std::string &client_id);
 
     /**
+     * @brief Disconnect one client and discard replay history after authorization changes.
+     *
+     * @param client_id Authenticated client identity.
+     */
+    void reset_client(const std::string &client_id);
+
+    /**
      * @brief Disconnect all current streams and wake all waiters.
      */
     void disconnect_all();

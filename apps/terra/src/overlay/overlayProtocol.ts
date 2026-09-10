@@ -3,6 +3,7 @@ import { z } from 'zod'
 export const overlayRequestStorageKey = 'terra_stream_overlay_request'
 export const overlayClosedStorageKey = 'terra_stream_overlay_closed'
 export const overlayReadyStorageKey = 'terra_stream_overlay_ready'
+export const overlayHiddenStorageKey = 'terra_stream_overlay_hidden'
 export const overlayStatisticsStorageKey = 'terra_stream_overlay_statistics'
 
 export const overlayCloseActionSchema = z.enum(['resume', 'disconnect', 'quit'])
@@ -69,6 +70,8 @@ export const streamOverlayRequestSchema = z.object({
   appId: z.number().int().nonnegative(),
   appName: z.string(),
   generation: z.string().regex(/^\d+$/),
+  revision: z.string().regex(/^\d+$/),
+  visible: z.boolean(),
   bounds: z.object({
     x: z.number().int(),
     y: z.number().int(),
@@ -83,13 +86,18 @@ export const streamOverlayRequestSchema = z.object({
 
 export const storedOverlayRequestSchema = streamOverlayRequestSchema.extend({
   requestId: z.string().min(1),
-  visible: z.boolean(),
 })
 
 export const overlayClosedSchema = z.object({
   schemaVersion: z.literal(1),
   requestId: z.string().min(1),
   action: overlayCloseActionSchema.optional().default('resume'),
+})
+
+export const overlayPresentationSchema = z.object({
+  schemaVersion: z.literal(1),
+  requestId: z.string().min(1),
+  revision: z.string().regex(/^\d+$/),
 })
 
 export type StreamOverlayRequest = z.infer<typeof streamOverlayRequestSchema>

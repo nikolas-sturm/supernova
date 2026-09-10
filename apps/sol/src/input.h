@@ -14,12 +14,21 @@
 #include <vector>
 
 // local includes
-#include "terra_api.h"
 #include "platform/common.h"
+#include "terra_api.h"
 #include "thread_safe.h"
 
 namespace input {
   struct input_t;
+
+  /**
+   * @brief Optional mouse-coordinate mode enforced for one stream.
+   */
+  enum class mouse_mode_e {
+    any,  ///< Accept relative and absolute mouse movement.
+    relative,  ///< Accept relative movement only.
+    absolute,  ///< Accept absolute movement only.
+  };
 
   /**
    * @brief Write a debug log representation of the input packet.
@@ -120,7 +129,7 @@ namespace input {
    * @param permissions Input classes permitted for this paired client.
    * @return Shared input state bound to the stream mailbox.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, terra_api::input_permissions_t permissions = {});
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, terra_api::input_permissions_t permissions = {}, mouse_mode_e mouse_mode = mouse_mode_e::any);
 
 #ifdef SOL_TESTS
   namespace testing {

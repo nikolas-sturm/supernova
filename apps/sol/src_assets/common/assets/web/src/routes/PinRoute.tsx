@@ -136,7 +136,9 @@ function PinContent() {
                   <strong>{t('pin.requested_permissions')}:</strong>{' '}
                   {selectedPairing.requested_scopes.length > 0
                     ? selectedPairing.requested_scopes.join(', ')
-                    : t('pin.legacy_permissions')}
+                    : selectedPairing.explicit_policy
+                      ? t('pin.no_permissions')
+                      : t('pin.legacy_permissions')}
                 </div>
                 {selectedPairing.requested_inputs.length > 0 && (
                   <div>

@@ -200,11 +200,16 @@ int main() {
     terra::InputForwarder input;
     int statisticsToggles = 0;
     int fullscreenToggles = 0;
-    int overlayOpens = 0;
+    std::vector<std::pair<std::uint64_t, bool>> overlayStates;
+    std::vector<std::pair<std::uint64_t, bool>> overlayCaptureStates;
     input.start(window, settings, 1920, 1080, 60, [&] { ++statisticsToggles; }, [&] {
         ++fullscreenToggles;
         return fullscreenToggles % 2 != 0;
-    }, [&] { ++overlayOpens; });
+    }, [&](std::uint64_t revision, bool visible) {
+        overlayStates.emplace_back(revision, visible);
+    }, [&](std::uint64_t revision, bool suspended) {
+        overlayCaptureStates.emplace_back(revision, suspended);
+    });
     input.setEnabled(true);
     SDL_Event event{};
 #if SDL_VERSION_ATLEAST(2, 24, 0)
@@ -387,10 +392,155 @@ int main() {
     event.key.state = SDL_RELEASED;
     event.key.repeat = 0;
     input.handleEvent(event);
-    expect(overlayOpens == 1, "Local stream-overlay shortcut was not consumed once.");
+    expect(overlayStates == std::vector<std::pair<std::uint64_t, bool>>{{1, true}},
+           "Local stream-overlay shortcut did not publish visible revision 1 once.");
     expect(keyboardEvents == keyboardEventsBeforeOverlay,
            "Local stream-overlay shortcut leaked to remote keyboard.");
-    input.resumeAfterOverlay();
+
+    const int mouseButtonsBeforeOverlayInput = mouseButtonEvents;
+    event = {};
+    event.type = SDL_MOUSEBUTTONUP;
+    event.button.windowID = SDL_GetWindowID(window);
+    event.button.state = SDL_RELEASED;
+    event.button.button = SDL_BUTTON_LEFT;
+    input.handleEvent(event);
+    event.type = SDL_MOUSEBUTTONDOWN;
+    event.button.state = SDL_PRESSED;
+    input.handleEvent(event);
+    expect(mouseButtonEvents == mouseButtonsBeforeOverlayInput,
+           "Mouse click recaptured input or leaked while stream overlay was open.");
+
+    event = {};
+    event.type = SDL_KEYDOWN;
+    event.key.windowID = SDL_GetWindowID(window);
+    event.key.state = SDL_PRESSED;
+    event.key.keysym.scancode = SDL_SCANCODE_A;
+    input.handleEvent(event);
+    expect(keyboardEvents == keyboardEventsBeforeOverlay,
+           "Keyboard input leaked to the host while stream overlay was open.");
+
+    const std::array overlayModifiers{
+        SDL_SCANCODE_LCTRL,
+        SDL_SCANCODE_LALT,
+        SDL_SCANCODE_LSHIFT,
+    };
+    for (const auto modifier : overlayModifiers) {
+        event = {};
+        event.type = SDL_KEYDOWN;
+        event.key.windowID = SDL_GetWindowID(window);
+        event.key.state = SDL_PRESSED;
+        event.key.keysym.scancode = modifier;
+        input.handleEvent(event);
+    }
+    event = {};
+    event.type = SDL_KEYDOWN;
+    event.key.windowID = SDL_GetWindowID(window);
+    event.key.state = SDL_PRESSED;
+    event.key.keysym.scancode = SDL_SCANCODE_O;
+    event.key.keysym.mod = static_cast<SDL_Keymod>(KMOD_LCTRL | KMOD_LALT | KMOD_LSHIFT);
+    input.handleEvent(event);
+    expect(overlayStates.back() == std::pair<std::uint64_t, bool>{2, false},
+           "Stream-overlay shortcut did not publish hidden revision 2 on key press.");
+    expect(input.acknowledgeOverlayHidden(2),
+           "Matching hidden revision was not acknowledged.");
+    expect(overlayCaptureStates.empty(),
+           "Capture suspension cleared before overlay toggle key was released.");
+    event = {};
+    event.type = SDL_KEYDOWN;
+    event.key.windowID = SDL_GetWindowID(window);
+    event.key.state = SDL_PRESSED;
+    event.key.keysym.scancode = SDL_SCANCODE_B;
+    input.handleEvent(event);
+    event.type = SDL_KEYUP;
+    event.key.state = SDL_RELEASED;
+    input.handleEvent(event);
+    expect(keyboardEvents == keyboardEventsBeforeOverlay,
+           "Stream input resumed before overlay toggle key was released.");
+    event = {};
+    event.type = SDL_KEYUP;
+    event.key.windowID = SDL_GetWindowID(window);
+    event.key.state = SDL_RELEASED;
+    event.key.keysym.scancode = SDL_SCANCODE_O;
+    input.handleEvent(event);
+    expect(overlayCaptureStates ==
+               std::vector<std::pair<std::uint64_t, bool>>{{2, false}},
+           "Capture restoration was not reported after overlay toggle key release.");
+
+    event = {};
+    event.type = SDL_KEYDOWN;
+    event.key.windowID = SDL_GetWindowID(window);
+    event.key.state = SDL_PRESSED;
+    event.key.keysym.scancode = SDL_SCANCODE_O;
+    event.key.keysym.mod = static_cast<SDL_Keymod>(KMOD_LCTRL | KMOD_LALT | KMOD_LSHIFT);
+    input.handleEvent(event);
+    expect(overlayStates.back() == std::pair<std::uint64_t, bool>{3, true},
+           "Held overlay modifiers did not publish visible revision 3.");
+    expect(!input.acknowledgeOverlayHidden(2),
+           "Stale hidden revision was accepted after reopening overlay.");
+    event.type = SDL_KEYUP;
+    event.key.state = SDL_RELEASED;
+    input.handleEvent(event);
+
+    event = {};
+    event.type = SDL_KEYDOWN;
+    event.key.windowID = SDL_GetWindowID(window);
+    event.key.state = SDL_PRESSED;
+    event.key.keysym.scancode = SDL_SCANCODE_O;
+    event.key.keysym.mod = static_cast<SDL_Keymod>(KMOD_LCTRL | KMOD_LALT | KMOD_LSHIFT);
+    input.handleEvent(event);
+    expect(overlayStates.back() == std::pair<std::uint64_t, bool>{4, false},
+           "Held overlay modifiers did not publish hidden revision 4.");
+    expect(input.acknowledgeOverlayHidden(4),
+           "Latest hidden revision was not acknowledged.");
+    event.type = SDL_KEYUP;
+    event.key.state = SDL_RELEASED;
+    input.handleEvent(event);
+    expect(overlayCaptureStates ==
+               std::vector<std::pair<std::uint64_t, bool>>{{2, false}, {4, false}},
+           "Latest overlay capture restoration was not reported.");
+
+    for (const auto modifier : overlayModifiers) {
+        event = {};
+        event.type = SDL_KEYUP;
+        event.key.windowID = SDL_GetWindowID(window);
+        event.key.state = SDL_RELEASED;
+        event.key.keysym.scancode = modifier;
+        input.handleEvent(event);
+    }
+
+    event = {};
+    event.type = SDL_KEYDOWN;
+    event.key.windowID = SDL_GetWindowID(window);
+    event.key.state = SDL_PRESSED;
+    event.key.keysym.scancode = SDL_SCANCODE_Z;
+    event.key.keysym.mod = static_cast<SDL_Keymod>(KMOD_LCTRL | KMOD_LALT | KMOD_LSHIFT);
+    input.handleEvent(event);
+    event.type = SDL_KEYUP;
+    event.key.state = SDL_RELEASED;
+    input.handleEvent(event);
+
+    event = {};
+    event.type = SDL_KEYDOWN;
+    event.key.windowID = SDL_GetWindowID(window);
+    event.key.state = SDL_PRESSED;
+    event.key.keysym.scancode = SDL_SCANCODE_O;
+    event.key.keysym.mod = static_cast<SDL_Keymod>(KMOD_LCTRL | KMOD_LALT | KMOD_LSHIFT);
+    input.handleEvent(event);
+    expect(overlayStates.back() == std::pair<std::uint64_t, bool>{5, true},
+           "Overlay shortcut did not remain armed after automatic capture was lost.");
+    event.type = SDL_KEYUP;
+    event.key.state = SDL_RELEASED;
+    input.handleEvent(event);
+    event.type = SDL_KEYDOWN;
+    event.key.state = SDL_PRESSED;
+    input.handleEvent(event);
+    expect(overlayStates.back() == std::pair<std::uint64_t, bool>{6, false},
+           "Armed overlay shortcut did not close without mouse recapture.");
+    expect(input.acknowledgeOverlayHidden(6),
+           "Armed overlay close did not accept matching hidden revision.");
+    event.type = SDL_KEYUP;
+    event.key.state = SDL_RELEASED;
+    input.handleEvent(event);
 
     event = {};
     event.type = SDL_KEYDOWN;
@@ -512,7 +662,8 @@ int main() {
     input.stop();
     settings.absoluteMouseMode = true;
     int ignoredOverlayOpens = 0;
-    input.start(window, settings, 1920, 1080, 60, {}, {}, [&] { ++ignoredOverlayOpens; });
+    input.start(window, settings, 1920, 1080, 60, {}, {},
+                [&](std::uint64_t, bool) { ++ignoredOverlayOpens; });
     input.setEnabled(true);
     event = {};
     event.type = SDL_KEYDOWN;

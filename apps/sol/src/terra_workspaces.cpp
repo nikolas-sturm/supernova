@@ -166,6 +166,7 @@ namespace terra_workspaces {
       resource.sandbox_id.reset();
       resource.display_ids.clear();
       resource.peripheral_claim_ids.clear();
+      resource.runtime_selection.reset();
     }
 
   }  // namespace
@@ -324,7 +325,21 @@ namespace terra_workspaces {
       nlohmann::json records = nlohmann::json::array();
       for (const auto &[id, resource] : values) {
         if (resource.definition.persistent) {
-          records.push_back(to_json(resource));
+          auto record = to_json(resource);
+          if (resource.runtime_selection) {
+            nlohmann::json overrides = nlohmann::json::object();
+            const auto append = [&](const char *name, const std::optional<nlohmann::json> &value) {
+              if (value) {
+                overrides[name] = *value;
+              }
+            };
+            append("display", resource.runtime_selection->profile_overrides.display);
+            append("stream", resource.runtime_selection->profile_overrides.stream);
+            append("launch", resource.runtime_selection->profile_overrides.launch);
+            append("sandbox", resource.runtime_selection->profile_overrides.sandbox);
+            record["runtimeSelection"] = {{"appUuid", resource.runtime_selection->app_uuid}, {"profileOverrides", std::move(overrides)}};
+          }
+          records.push_back(std::move(record));
         }
       }
       return {{"version", DOCUMENT_VERSION}, {"collectionRevision", revision}, {"workspaces", std::move(records)}};
@@ -410,6 +425,7 @@ namespace terra_workspaces {
       }
       impl_->collection_revision = document.at("collectionRevision").get<std::uint64_t>();
       bool reconciled = false;
+      std::vector<std::pair<resource_t, resource_t>> reconciliation_changes;
       for (const auto &value : document.at("workspaces")) {
         try {
           static const std::set<std::string, std::less<>> resource_keys {
@@ -436,16 +452,30 @@ namespace terra_workspaces {
             "state",
             "streamProfileId",
             "updatedAt",
-            "virtualDisplays"
+            "virtualDisplays",
+            "runtimeSelection"
           };
-          if (!exact_keys(value, resource_keys)) {
-            continue;
+          auto legacy_resource_keys = resource_keys;
+          legacy_resource_keys.erase("runtimeSelection");
+          if (!exact_keys(value, resource_keys) && !exact_keys(value, legacy_resource_keys)) {
+            throw std::invalid_argument("workspace record shape");
           }
           const auto parsed_state = parse_state(value.at("state").get<std::string>());
           if (!parsed_state) {
-            continue;
+            throw std::invalid_argument("workspace state");
           }
           resource_t resource {value.at("id").get<std::string>(), std::nullopt, definition_from_json(value), *parsed_state, std::nullopt, std::nullopt, value.at("displayIds").get<std::vector<std::string>>(), value.at("peripheralClaimIds").get<std::vector<std::string>>(), value.at("createdAt").get<std::int64_t>(), value.at("updatedAt").get<std::int64_t>(), value.at("error"), value.at("revision").get<std::uint64_t>()};
+          if (value.contains("runtimeSelection")) {
+            const auto &selection = value.at("runtimeSelection");
+            if (!selection.is_object() || selection.size() != 2 || !selection.at("appUuid").is_string() || !selection.at("profileOverrides").is_object()) {
+              throw std::invalid_argument("workspace runtime selection");
+            }
+            const auto parsed = parse_start_request({{"appUuid", selection.at("appUuid")}, {"profileOverrides", selection.at("profileOverrides")}});
+            if (!parsed || !parsed->app_uuid) {
+              throw std::invalid_argument("workspace runtime selection values");
+            }
+            resource.runtime_selection = runtime_selection_t {*parsed->app_uuid, parsed->profile_overrides};
+          }
           if (!value.at("ownerClientUuid").is_null()) {
             resource.owner_client_uuid = value.at("ownerClientUuid").get<std::string>();
           }
@@ -457,19 +487,25 @@ namespace terra_workspaces {
           }
           const bool ids_valid = valid_uuid(resource.id) && (!resource.owner_client_uuid || valid_uuid(*resource.owner_client_uuid)) && (!resource.session_id || valid_uuid(*resource.session_id)) && (!resource.sandbox_id || valid_uuid(*resource.sandbox_id)) && valid_uuids(resource.display_ids) && valid_uuids(resource.peripheral_claim_ids);
           if (!ids_valid || !resource.definition.persistent || resource.revision == 0 || resource.created_at < 0 || resource.updated_at < resource.created_at || !impl_->validate(resource.definition) || impl_->resources.contains(resource.id)) {
-            continue;
+            throw std::invalid_argument("workspace record");
           }
           if (resource.state == state_t::preparing || resource.state == state_t::stopping || ((resource.state == state_t::ready || resource.state == state_t::active) && (!impl_->callbacks.reconcile || !impl_->callbacks.reconcile(resource)))) {
+            const auto previous = resource;
+            if ((resource.session_id || resource.sandbox_id || !resource.display_ids.empty() || !resource.peripheral_claim_ids.empty()) && (!impl_->callbacks.stop || !impl_->callbacks.stop(resource, true))) {
+              return;
+            }
             resource.state = state_t::failed;
             resource.error = error_json("runtime_unavailable", "Persisted workspace runtime could not be reconciled");
             clear_runtime(resource);
             resource.updated_at = impl_->callbacks.now();
             ++resource.revision;
             reconciled = true;
+            reconciliation_changes.emplace_back(previous, resource);
           }
           impl_->resources.emplace(resource.id, std::move(resource));
         } catch (...) {
-          // Optional malformed records are isolated from valid definitions.
+          impl_->resources.clear();
+          return;
         }
       }
       if (reconciled) {
@@ -479,6 +515,11 @@ namespace terra_workspaces {
         }
       }
       impl_->usable = true;
+      if (impl_->callbacks.changed) {
+        for (const auto &[previous, current] : reconciliation_changes) {
+          impl_->callbacks.changed(previous, current);
+        }
+      }
     } catch (...) {
     }
   }
@@ -604,6 +645,9 @@ namespace terra_workspaces {
     if (found->second.owner_client_uuid) {
       return {status_t::resource_busy, std::nullopt};
     }
+    if (!found->second.definition.persistent) {
+      return {status_t::invalid, std::nullopt};
+    }
     if (found->second.revision != expected_revision) {
       return {status_t::conflict, std::nullopt};
     }
@@ -632,7 +676,7 @@ namespace terra_workspaces {
     if (found->second.state == state_t::active && found->second.revision == expected_revision) {
       return {status_t::success, found->second};
     }
-    if (found->second.revision != expected_revision || (found->second.state != state_t::stopped && found->second.state != state_t::failed) || !found->second.owner_client_uuid) {
+    if (found->second.revision != expected_revision || (found->second.state != state_t::stopped && found->second.state != state_t::failed) || !found->second.owner_client_uuid || found->second.sandbox_id || !found->second.display_ids.empty() || !found->second.peripheral_claim_ids.empty()) {
       return {status_t::conflict, std::nullopt};
     }
     const auto app = request.app_uuid.value_or(found->second.definition.desktop_app_uuid);
@@ -648,6 +692,7 @@ namespace terra_workspaces {
     const auto original = found->second;
     auto preparing_resource = original;
     preparing_resource.state = state_t::preparing;
+    preparing_resource.runtime_selection = runtime_selection_t {app, request.profile_overrides};
     preparing_resource.error = nullptr;
     preparing_resource.updated_at = impl_->callbacks.now();
     ++preparing_resource.revision;
@@ -656,16 +701,29 @@ namespace terra_workspaces {
     if (impl_->publish(std::move(preparing_candidate)) != status_t::success) {
       return {status_t::persistence_error, std::nullopt};
     }
+    const auto persist_preparation = [&](const prepared_t &prepared) {
+      if (prepared.session_id || (prepared.sandbox_id && !valid_uuid(*prepared.sandbox_id)) || !valid_uuids(prepared.display_ids) || !valid_uuids(prepared.peripheral_claim_ids)) {
+        return false;
+      }
+      auto candidate = impl_->resources;
+      auto &current = candidate.at(id);
+      current.sandbox_id = prepared.sandbox_id;
+      current.display_ids = prepared.display_ids;
+      current.peripheral_claim_ids = prepared.peripheral_claim_ids;
+      current.updated_at = impl_->callbacks.now();
+      ++current.revision;
+      return impl_->publish(std::move(candidate)) == status_t::success;
+    };
     std::optional<prepared_t> runtime;
     try {
-      runtime = impl_->callbacks.prepare ? impl_->callbacks.prepare({id, *preparing_resource.owner_client_uuid, app, preparing_resource.definition, request.profile_overrides}) : std::nullopt;
+      runtime = impl_->callbacks.prepare ? impl_->callbacks.prepare({id, *preparing_resource.owner_client_uuid, app, preparing_resource.definition, request.profile_overrides}, persist_preparation) : std::nullopt;
     } catch (...) {
     }
     const auto runtime_valid = runtime && runtime->success && !runtime->session_id && (!runtime->sandbox_id || valid_uuid(*runtime->sandbox_id)) && valid_uuids(runtime->display_ids) && valid_uuids(runtime->peripheral_claim_ids);
-    const auto rollback_to_stopped = [&](const std::uint64_t revision) -> std::optional<resource_t> {
+    const auto rollback_to_stopped = [&]() -> std::optional<resource_t> {
       auto rollback = impl_->resources;
       auto stopped = original;
-      stopped.revision = revision;
+      stopped.revision = rollback.at(id).revision + 1;
       stopped.updated_at = impl_->callbacks.now();
       rollback[id] = stopped;
       if (impl_->publish(std::move(rollback)) != status_t::success) {
@@ -675,19 +733,36 @@ namespace terra_workspaces {
       return stopped;
     };
     if (!runtime_valid) {
+      auto unresolved = runtime.value_or(prepared_t {false});
       try {
         if (impl_->callbacks.cleanup_failed_prepare) {
-          impl_->callbacks.cleanup_failed_prepare(runtime.value_or(prepared_t {false}));
+          unresolved = impl_->callbacks.cleanup_failed_prepare(unresolved);
         }
       } catch (...) {
       }
-      const auto stopped = rollback_to_stopped(preparing_resource.revision + 1);
+      if (unresolved.sandbox_id || !unresolved.display_ids.empty() || !unresolved.peripheral_claim_ids.empty()) {
+        auto failed = impl_->resources;
+        auto &resource = failed.at(id);
+        resource.state = state_t::failed;
+        resource.sandbox_id = unresolved.sandbox_id;
+        resource.display_ids = std::move(unresolved.display_ids);
+        resource.peripheral_claim_ids = std::move(unresolved.peripheral_claim_ids);
+        resource.error = error_json("cleanup_failed", "Workspace preparation cleanup requires retry");
+        resource.updated_at = impl_->callbacks.now();
+        ++resource.revision;
+        if (impl_->publish(std::move(failed)) != status_t::success) {
+          impl_->usable = false;
+          return {status_t::unavailable, std::nullopt};
+        }
+        return {status_t::preparation_error, impl_->resources.at(id)};
+      }
+      const auto stopped = rollback_to_stopped();
       if (!stopped) {
         return {status_t::unavailable, std::nullopt};
       }
       return {status_t::preparation_error, stopped};
     }
-    auto resource = preparing_resource;
+    auto resource = impl_->resources.at(id);
     resource.session_id.reset();
     resource.sandbox_id = runtime->sandbox_id;
     resource.display_ids = runtime->display_ids;
@@ -699,13 +774,30 @@ namespace terra_workspaces {
     candidate[id] = resource;
     const auto status = impl_->publish(std::move(candidate));
     if (status != status_t::success) {
+      auto unresolved = *runtime;
       try {
         if (impl_->callbacks.cleanup_failed_prepare) {
-          impl_->callbacks.cleanup_failed_prepare(*runtime);
+          unresolved = impl_->callbacks.cleanup_failed_prepare(unresolved);
         }
       } catch (...) {
       }
-      if (!rollback_to_stopped(resource.revision + 1)) {
+      if (unresolved.sandbox_id || !unresolved.display_ids.empty() || !unresolved.peripheral_claim_ids.empty()) {
+        auto failed = impl_->resources;
+        auto &failed_resource = failed.at(id);
+        failed_resource.state = state_t::failed;
+        failed_resource.sandbox_id = unresolved.sandbox_id;
+        failed_resource.display_ids = std::move(unresolved.display_ids);
+        failed_resource.peripheral_claim_ids = std::move(unresolved.peripheral_claim_ids);
+        failed_resource.error = error_json("cleanup_failed", "Workspace preparation cleanup requires retry");
+        failed_resource.updated_at = impl_->callbacks.now();
+        ++failed_resource.revision;
+        if (impl_->publish(std::move(failed)) != status_t::success) {
+          impl_->usable = false;
+          return {status_t::unavailable, std::nullopt};
+        }
+        return {status_t::persistence_error, impl_->resources.at(id)};
+      }
+      if (!rollback_to_stopped()) {
         return {status_t::unavailable, std::nullopt};
       }
       return {status_t::persistence_error, std::nullopt};
@@ -821,75 +913,55 @@ namespace terra_workspaces {
   }
 
   status_t manager_t::revoke_owner(const std::string &owner_client_uuid) {
+    return revoke_unauthorized(owner_client_uuid, {}, std::nullopt);
+  }
+
+  status_t manager_t::revoke_unauthorized(const std::string &owner_client_uuid, const std::vector<std::string> &authorized_ids, const std::optional<std::uint64_t> expected_collection_revision) {
     std::lock_guard lock(impl_->mutex);
     if (!impl_->usable) {
       return status_t::unavailable;
     }
-    std::vector<resource_t> runtimes;
+    if (expected_collection_revision && *expected_collection_revision != impl_->collection_revision) {
+      return status_t::conflict;
+    }
+    std::vector<std::string> owned;
     for (const auto &[id, resource] : impl_->resources) {
-      if (resource.owner_client_uuid == owner_client_uuid && resource.state != state_t::stopped) {
-        runtimes.push_back(resource);
+      if (resource.owner_client_uuid == owner_client_uuid && !std::ranges::contains(authorized_ids, id)) {
+        owned.push_back(id);
       }
     }
-    if (!runtimes.empty() && (!impl_->callbacks.stop || !impl_->callbacks.restore_after_failed_stop)) {
-      return status_t::provider_error;
-    }
-    std::vector<resource_t> stopped;
-    const auto restore_stopped = [&]() {
-      bool restored = true;
-      for (auto iterator = stopped.rbegin(); iterator != stopped.rend(); ++iterator) {
-        try {
-          restored = impl_->callbacks.restore_after_failed_stop(*iterator) && restored;
-        } catch (...) {
-          restored = false;
-        }
-      }
-      if (!restored) {
-        impl_->usable = false;
-      }
-      return restored;
-    };
-    for (const auto &resource : runtimes) {
-      try {
-        if (!impl_->callbacks.stop(resource, true)) {
-          restore_stopped();
+    for (const auto &id : owned) {
+      const auto resource = impl_->resources.at(id);
+      if (resource.state != state_t::stopped) {
+        if (!impl_->callbacks.stop) {
           return status_t::provider_error;
         }
-        stopped.push_back(resource);
-      } catch (...) {
-        restore_stopped();
-        return status_t::provider_error;
+        try {
+          if (!impl_->callbacks.stop(resource, true)) {
+            return status_t::provider_error;
+          }
+        } catch (...) {
+          return status_t::provider_error;
+        }
+      }
+      auto candidate = impl_->resources;
+      auto &updated = candidate.at(id);
+      if (!updated.definition.persistent) {
+        candidate.erase(id);
+      } else {
+        clear_runtime(updated);
+        updated.state = state_t::stopped;
+        updated.owner_client_uuid.reset();
+        updated.error = nullptr;
+        updated.updated_at = impl_->callbacks.now();
+        ++updated.revision;
+      }
+      if (impl_->publish(std::move(candidate)) != status_t::success) {
+        impl_->usable = false;
+        return status_t::unavailable;
       }
     }
-    auto candidate = impl_->resources;
-    bool changed = false;
-    for (auto iterator = candidate.begin(); iterator != candidate.end();) {
-      auto &resource = iterator->second;
-      if (resource.owner_client_uuid != owner_client_uuid) {
-        ++iterator;
-        continue;
-      }
-      changed = true;
-      if (!resource.definition.persistent) {
-        iterator = candidate.erase(iterator);
-        continue;
-      }
-      clear_runtime(resource);
-      resource.state = state_t::stopped;
-      resource.owner_client_uuid.reset();
-      resource.error = nullptr;
-      resource.updated_at = impl_->callbacks.now();
-      ++resource.revision;
-      ++iterator;
-    }
-    if (!changed) {
-      return status_t::success;
-    }
-    const auto status = impl_->publish(std::move(candidate));
-    if (status != status_t::success && !restore_stopped()) {
-      return status_t::unavailable;
-    }
-    return status;
+    return status_t::success;
   }
 
   nlohmann::json to_json(const resource_t &resource) {

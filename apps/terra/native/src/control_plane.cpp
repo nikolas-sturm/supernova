@@ -1,8 +1,8 @@
 #include "control_plane.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -18,10 +18,11 @@
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 
+#include "audio_renderer.h"
 #include "gamestream_client.h"
 #include "input_forwarder.h"
+#include "sse_decoder.h"
 #include "stream_session.h"
-#include "audio_renderer.h"
 #include "video_renderer.h"
 #include "wake_on_lan.h"
 
@@ -51,12 +52,20 @@ std::string randomHex(std::size_t byteCount) {
     return output.str();
 }
 
+std::vector<std::string> stringArray(const Json& value) {
+    std::vector<std::string> result;
+    if (!value.is_array()) return result;
+    for (const auto& item : value) {
+        if (item.is_string()) result.push_back(item.get<std::string>());
+    }
+    return result;
+}
+
 Json hostJson(const HostRecord& host) {
     Json displayModes = Json::array();
     for (const auto& mode : host.displayModes) {
-        displayModes.push_back({{"width", mode.width},
-                                {"height", mode.height},
-                                {"refreshRate", mode.refreshRate}});
+        displayModes.push_back(
+            {{"width", mode.width}, {"height", mode.height}, {"refreshRate", mode.refreshRate}});
     }
     return {
         {"id", host.id},
@@ -78,6 +87,15 @@ Json hostJson(const HostRecord& host) {
         {"wakeMacAddress", host.wakeMacAddress},
         {"lastSeenAt", host.lastSeenAt},
         {"paired", host.paired},
+        {"apiVersion", host.apiVersion},
+        {"apiPort", host.apiPort},
+        {"capabilities", host.capabilities},
+        {"apiClientUuid", host.apiClientUuid},
+        {"apiClientName", host.apiClientName},
+        {"apiScopes", host.apiScopes},
+        {"allowedApps", host.allowedApps},
+        {"features", host.features},
+        {"limits", host.limits},
     };
 }
 
@@ -97,10 +115,9 @@ HostRecord parseHost(const Json& value) {
     if (httpsPort > 0 && httpsPort <= 65535) {
         host.httpsPort = static_cast<std::uint16_t>(httpsPort);
     }
-    host.lastSeenAt = value.value("lastSeenAt", 0);
+    host.lastSeenAt = std::max<std::int64_t>(0, value.value("lastSeenAt", std::int64_t{0}));
     host.currentGameId = value.value("currentGameId", 0);
-    host.serverCodecModeSupport =
-        value.value("serverCodecModeSupport", kBaselineCodecModeSupport);
+    host.serverCodecModeSupport = value.value("serverCodecModeSupport", kBaselineCodecModeSupport);
     host.maxLumaPixelsHevc = value.value("maxLumaPixelsHevc", std::uint64_t{0});
     if (const auto modes = value.find("displayModes"); modes != value.end() && modes->is_array()) {
         for (const auto& mode : *modes) {
@@ -122,6 +139,16 @@ HostRecord parseHost(const Json& value) {
         host.wakeMacAddress = formatMacAddress(*wakeAddress);
     }
     host.paired = value.value("paired", false);
+    host.apiVersion = value.value("apiVersion", 0);
+    const auto apiPort = value.value("apiPort", 0);
+    if (apiPort > 0 && apiPort <= 65535) host.apiPort = static_cast<std::uint16_t>(apiPort);
+    host.capabilities = stringArray(value.value("capabilities", Json::array()));
+    host.apiClientUuid = value.value("apiClientUuid", "");
+    host.apiClientName = value.value("apiClientName", "");
+    host.apiScopes = stringArray(value.value("apiScopes", Json::array()));
+    host.allowedApps = stringArray(value.value("allowedApps", Json::array()));
+    host.features = value.value("features", Json::object());
+    host.limits = value.value("limits", Json::object());
     return host;
 }
 
@@ -143,9 +170,9 @@ std::string imageDataUrl(const std::string& bytes) {
     }
 
     std::string encoded(4 * ((bytes.size() + 2) / 3), '\0');
-    const auto written = EVP_EncodeBlock(
-        reinterpret_cast<unsigned char*>(encoded.data()),
-        reinterpret_cast<const unsigned char*>(bytes.data()), static_cast<int>(bytes.size()));
+    const auto written = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(encoded.data()),
+                                         reinterpret_cast<const unsigned char*>(bytes.data()),
+                                         static_cast<int>(bytes.size()));
     if (written <= 0) {
         throw std::runtime_error("Cannot encode application artwork.");
     }
@@ -154,19 +181,70 @@ std::string imageDataUrl(const std::string& bytes) {
 }
 
 std::string cacheKey(std::string value) {
-    std::replace_if(value.begin(), value.end(),
-                    [](const unsigned char character) {
-                        return !std::isalnum(character) && character != '-' && character != '_';
-                    },
-                    '_');
+    std::replace_if(
+        value.begin(), value.end(),
+        [](const unsigned char character) {
+            return !std::isalnum(character) && character != '-' && character != '_';
+        },
+        '_');
     return value;
+}
+
+bool hasCapability(const HostRecord& host, const std::string_view capability) {
+    return std::ranges::contains(host.capabilities, capability);
+}
+
+std::string nullableString(const Json& value, const std::string_view name) {
+    const auto item = value.find(name);
+    return item != value.end() && item->is_string() ? item->get<std::string>() : std::string{};
+}
+
+GameStreamApp catalogApp(const Json& value) {
+    if (!value.is_object() || !value.contains("uuid") || !value.at("uuid").is_string() ||
+        !value.contains("legacyId") || !value.at("legacyId").is_number_integer() ||
+        !value.contains("name") || !value.at("name").is_string()) {
+        throw std::runtime_error("Sol returned an invalid Catalog V2 application.");
+    }
+    GameStreamApp app{
+        .id = value.at("legacyId").get<int>(),
+        .name = value.at("name").get<std::string>(),
+        .hdrSupported = value.value("hdr", false),
+        .appCollectorGame = value.value("kind", "unknown") == "game",
+        .uuid = value.at("uuid").get<std::string>(),
+        .kind = value.value("kind", "unknown"),
+        .description = value.value("description", ""),
+        .source = value.value("source", ""),
+        .publisher = value.value("publisher", ""),
+        .tags = stringArray(value.value("tags", Json::array())),
+        .inputRequirements = stringArray(value.value("inputRequirements", Json::array())),
+        .installed = value.value("installed", true),
+        .updateAvailable = value.value("updateAvailable", false),
+        .assetId = {},
+        .assetPath = {},
+        .assetRevision = 0,
+        .displayProfileId = nullableString(value, "displayProfileId"),
+        .streamProfileId = nullableString(value, "streamProfileId"),
+        .sandboxProfileId = nullableString(value, "sandboxProfileId"),
+    };
+    const auto assets = value.find("assets");
+    if (assets != value.end() && assets->is_object()) {
+        for (const auto role : {"poster", "icon"}) {
+            const auto asset = assets->find(role);
+            if (asset == assets->end() || !asset->is_object()) continue;
+            app.assetId = asset->value("id", "");
+            app.assetPath = asset->value("url", "");
+            app.assetRevision = asset->value("revision", std::uint64_t{0});
+            if (!app.assetId.empty() && !app.assetPath.empty()) break;
+        }
+    }
+    return app;
 }
 }  // namespace
 
-ControlPlane::ControlPlane(std::filesystem::path dataPath)
-    : dataPath_(std::move(dataPath)),
-      statePath_(dataPath_ / "client-state.json"),
-      gameStream_(std::make_unique<GameStreamClient>(ensureDataPath(dataPath_))) {
+ControlPlane::ControlPlane(std::filesystem::path dataPath) :
+    dataPath_(std::move(dataPath)),
+    statePath_(dataPath_ / "client-state.json"),
+    gameStream_(std::make_unique<GameStreamClient>(ensureDataPath(dataPath_))) {
     load();
     disconnectThread_ = std::thread([this] { cleanupSessions(); });
 }
@@ -180,14 +258,20 @@ ControlPlane::~ControlPlane() {
     if (disconnectThread_.joinable()) disconnectThread_.join();
 
     std::shared_ptr<StreamSession> transport;
+    std::unordered_map<std::string, std::jthread> apiEventThreads;
     {
         std::scoped_lock lock{mutex_};
+        for (auto& [_, thread] : apiEventThreads_)
+            thread.request_stop();
+        apiEventThreads.swap(apiEventThreads_);
         sessionListener_ = {};
         streamOverlayListener_ = {};
         streamStatisticsListener_ = {};
+        apiResourceListener_ = {};
         transport = std::exchange(transport_, {});
         session_.reset();
     }
+    apiEventThreads.clear();
     if (transport) transport->stop();
 }
 
@@ -275,6 +359,15 @@ HostRecord ControlPlane::discoverHost(std::string name, std::string address) {
                           std::chrono::system_clock::now().time_since_epoch())
                           .count(),
         .paired = info.paired,
+        .apiVersion = 0,
+        .apiPort = 0,
+        .capabilities = {},
+        .apiClientUuid = {},
+        .apiClientName = {},
+        .apiScopes = {},
+        .allowedApps = {},
+        .features = Json::object(),
+        .limits = Json::object(),
     };
 
     std::scoped_lock lock{mutex_};
@@ -293,9 +386,8 @@ HostRecord ControlPlane::probeHost(const std::string& id) {
     std::string clientId;
     {
         std::scoped_lock lock{mutex_};
-        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-            return value.id == id;
-        });
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == id; });
         if (host == hosts_.end()) {
             throw std::invalid_argument("Host no longer exists.");
         }
@@ -318,12 +410,35 @@ HostRecord ControlPlane::probeHost(const std::string& id) {
         current.serverCodecModeSupport = info.serverCodecModeSupport;
         current.maxLumaPixelsHevc = info.maxLumaPixelsHevc;
         current.displayModes = info.displayModes;
+        current.apiVersion = info.eclipseApiVersion;
+        current.apiPort = info.eclipseApiPort;
+        current.capabilities = info.eclipseCapabilities;
         if (!current.serverCertificate.empty() && !info.macAddress.empty()) {
             current.wakeMacAddress = info.macAddress;
         }
         current.paired = info.paired;
         current.status = "online";
         current.error.clear();
+        if (current.paired && current.apiVersion == 1) {
+            try {
+                const auto capabilityResponse = gameStream_->apiRequest(
+                    current.address, current.apiPort, current.serverCertificate, "GET",
+                    "/eclipse/v1/capabilities");
+                const auto& document = capabilityResponse.body;
+                current.capabilities = stringArray(document.value("capabilities", Json::array()));
+                current.features = document.value("features", Json::object());
+                current.limits = document.value("limits", Json::object());
+                if (const auto client = document.find("client");
+                    client != document.end() && client->is_object()) {
+                    current.apiClientUuid = client->value("uuid", "");
+                    current.apiClientName = client->value("name", "");
+                    current.apiScopes = stringArray(client->value("scopes", Json::array()));
+                    current.allowedApps = stringArray(client->value("allowedApps", Json::array()));
+                }
+            } catch (const std::exception& exception) {
+                current.error = std::string{"Sol API unavailable: "} + exception.what();
+            }
+        }
         current.lastSeenAt = std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::system_clock::now().time_since_epoch())
                                  .count();
@@ -332,15 +447,19 @@ HostRecord ControlPlane::probeHost(const std::string& id) {
         current.error = exception.what();
     }
 
-    std::scoped_lock lock{mutex_};
-    const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-        return value.id == id;
-    });
-    if (host == hosts_.end()) {
-        return current;
+    {
+        std::scoped_lock lock{mutex_};
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == id; });
+        if (host == hosts_.end()) return current;
+        *host = current;
+        saveLocked();
     }
-    *host = current;
-    saveLocked();
+    if (current.status == "online" && current.paired && current.apiVersion == 1) {
+        startApiEvents(current);
+    } else {
+        stopApiEvents(id);
+    }
     return current;
 }
 
@@ -349,9 +468,8 @@ std::vector<GameStreamApp> ControlPlane::loadApps(const std::string& hostId) {
     std::string clientId;
     {
         std::scoped_lock lock{mutex_};
-        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-            return value.id == hostId;
-        });
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == hostId; });
         if (host == hosts_.end()) {
             throw std::invalid_argument("Host no longer exists.");
         }
@@ -362,11 +480,23 @@ std::vector<GameStreamApp> ControlPlane::loadApps(const std::string& hostId) {
         clientId = clientId_;
     }
 
-    auto result = gameStream_->apps(current.address, current.httpsPort, clientId,
-                                    current.serverCertificate);
-    std::stable_sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
-        return left.name < right.name;
-    });
+    std::vector<GameStreamApp> result;
+    if (current.apiVersion == 1 && hasCapability(current, "catalog-v2")) {
+        const auto response = gameStream_->apiRequest(
+            current.address, current.apiPort, current.serverCertificate, "GET", "/eclipse/v1/apps");
+        const auto apps = response.body.find("apps");
+        if (apps == response.body.end() || !apps->is_array()) {
+            throw std::runtime_error("Sol returned an invalid Catalog V2 collection.");
+        }
+        result.reserve(apps->size());
+        for (const auto& app : *apps)
+            result.push_back(catalogApp(app));
+    } else {
+        result = gameStream_->apps(current.address, current.httpsPort, clientId,
+                                   current.serverCertificate);
+    }
+    std::stable_sort(result.begin(), result.end(),
+                     [](const auto& left, const auto& right) { return left.name < right.name; });
     {
         std::scoped_lock lock{mutex_};
         apps_[hostId] = result;
@@ -376,24 +506,30 @@ std::vector<GameStreamApp> ControlPlane::loadApps(const std::string& hostId) {
 
 std::string ControlPlane::boxArtDataUrl(const std::string& hostId, int appId) {
     HostRecord current;
+    GameStreamApp selected;
     std::string clientId;
     {
         std::scoped_lock lock{mutex_};
-        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-            return value.id == hostId;
-        });
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == hostId; });
         const auto apps = apps_.find(hostId);
-        if (host == hosts_.end() || apps == apps_.end() ||
-            std::none_of(apps->second.begin(), apps->second.end(),
-                         [&](const GameStreamApp& app) { return app.id == appId; })) {
+        if (host == hosts_.end() || apps == apps_.end()) {
+            throw std::invalid_argument("Application no longer exists in this library.");
+        }
+        const auto app = std::ranges::find(apps->second, appId, &GameStreamApp::id);
+        if (app == apps->second.end()) {
             throw std::invalid_argument("Application no longer exists in this library.");
         }
         current = *host;
+        selected = *app;
         clientId = clientId_;
     }
 
     const auto cacheDirectory = dataPath_ / "box-art" / cacheKey(hostId);
-    const auto cachePath = cacheDirectory / (std::to_string(appId) + ".asset");
+    const auto cacheIdentity = selected.uuid.empty() ? std::to_string(appId) : selected.uuid;
+    const auto cachePath = cacheDirectory / (cacheKey(cacheIdentity + "-" + selected.assetId + "-" +
+                                                      std::to_string(selected.assetRevision)) +
+                                             ".asset");
     std::string bytes;
     if (std::filesystem::exists(cachePath)) {
         std::ifstream input{cachePath, std::ios::binary};
@@ -406,8 +542,13 @@ std::string ControlPlane::boxArtDataUrl(const std::string& hostId, int appId) {
         }
     }
 
-    bytes = gameStream_->boxArt(current.address, current.httpsPort, clientId,
-                                current.serverCertificate, appId);
+    if (!selected.assetPath.empty()) {
+        bytes = gameStream_->apiBytes(current.address, current.apiPort, current.serverCertificate,
+                                      selected.assetPath);
+    } else {
+        bytes = gameStream_->boxArt(current.address, current.httpsPort, clientId,
+                                    current.serverCertificate, appId);
+    }
     const auto dataUrl = imageDataUrl(bytes);
     std::filesystem::create_directories(cacheDirectory);
     const auto temporaryPath = cachePath.string() + ".tmp";
@@ -426,8 +567,71 @@ std::string ControlPlane::boxArtDataUrl(const std::string& hostId, int appId) {
     return dataUrl;
 }
 
+nlohmann::json ControlPlane::loadApiResource(const std::string& hostId,
+                                             const std::string& resource) {
+    static const std::map<std::string, std::string, std::less<>> paths{
+        {"capabilities", "/eclipse/v1/capabilities"},
+        {"sessions", "/eclipse/v1/sessions"},
+        {"telemetry", "/eclipse/v1/telemetry"},
+        {"displays", "/eclipse/v1/displays"},
+        {"display-topology", "/eclipse/v1/display-topology"},
+        {"virtual-displays", "/eclipse/v1/virtual-displays"},
+        {"profiles", "/eclipse/v1/profiles"},
+        {"workspaces", "/eclipse/v1/workspaces"},
+        {"sandboxes", "/eclipse/v1/sandboxes"},
+        {"peripherals", "/eclipse/v1/peripherals"},
+        {"peripheral-claims", "/eclipse/v1/peripherals/claims"},
+    };
+    const auto path = paths.find(resource);
+    if (path == paths.end()) throw std::invalid_argument("Unknown Sol API resource collection.");
+
+    HostRecord current;
+    std::function<void(const ApiResourceUpdate&)> listener;
+    {
+        std::scoped_lock lock{mutex_};
+        const auto host = std::ranges::find(hosts_, hostId, &HostRecord::id);
+        if (host == hosts_.end()) throw std::invalid_argument("Host no longer exists.");
+        if (host->status != "online" || !host->paired || host->apiVersion != 1) {
+            throw std::runtime_error("Host API v1 must be paired and online.");
+        }
+        current = *host;
+        listener = apiResourceListener_;
+    }
+    const auto response = gameStream_->apiRequest(current.address, current.apiPort,
+                                                  current.serverCertificate, "GET", path->second);
+    if (listener) listener({hostId, resource, response.body});
+    return response.body;
+}
+
+nlohmann::json ControlPlane::mutateApiResource(const std::string& hostId, const std::string& method,
+                                               const std::string& path, nlohmann::json body,
+                                               const std::optional<std::uint64_t> revision,
+                                               const bool idempotent) {
+    HostRecord current;
+    std::function<void(const ApiResourceUpdate&)> listener;
+    {
+        std::scoped_lock lock{mutex_};
+        const auto host = std::ranges::find(hosts_, hostId, &HostRecord::id);
+        if (host == hosts_.end()) throw std::invalid_argument("Host no longer exists.");
+        if (host->status != "online" || !host->paired || host->apiVersion != 1) {
+            throw std::runtime_error("Host API v1 must be paired and online.");
+        }
+        current = *host;
+        listener = apiResourceListener_;
+    }
+    if (!body.is_object()) throw std::invalid_argument("Sol API mutation body must be an object.");
+    body["schemaVersion"] = 1;
+    std::map<std::string, std::string> headers;
+    if (revision) headers["If-Match"] = '"' + std::to_string(*revision) + '"';
+    if (idempotent) headers["Idempotency-Key"] = ix::uuid4();
+    const auto response = gameStream_->apiRequest(
+        current.address, current.apiPort, current.serverCertificate, method, path, body, headers);
+    if (listener) listener({hostId, "mutation", response.body});
+    return response.body;
+}
+
 SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
-                                        const StreamSettings& settings) {
+                                      const StreamSettings& settings) {
     std::scoped_lock sessionLock{sessionMutex_};
     HostRecord current;
     GameStreamApp selected;
@@ -438,17 +642,18 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
     {
         std::scoped_lock lock{mutex_};
         if (transport_ || session_) {
-            throw std::runtime_error("Terra already has an active stream. Stop it before launching again.");
+            throw std::runtime_error("Terra already has an active stream. Stop it "
+                                     "before launching again.");
         }
-        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-            return value.id == hostId;
-        });
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == hostId; });
         const auto apps = apps_.find(hostId);
         if (host == hosts_.end() || apps == apps_.end()) {
             throw std::invalid_argument("Load this host's application library before launching.");
         }
-        const auto app = std::find_if(apps->second.begin(), apps->second.end(),
-                                      [&](const GameStreamApp& value) { return value.id == appId; });
+        const auto app =
+            std::find_if(apps->second.begin(), apps->second.end(),
+                         [&](const GameStreamApp& value) { return value.id == appId; });
         if (app == apps->second.end()) {
             throw std::invalid_argument("Application no longer exists in this library.");
         }
@@ -456,7 +661,8 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
             throw std::runtime_error("Host must be paired and online to launch applications.");
         }
         if (host->serverCodecModeSupport == 0) {
-            throw std::runtime_error("Host did not report streaming codec support. Refresh it first.");
+            throw std::runtime_error(
+                "Host did not report streaming codec support. Refresh it first.");
         }
         if (host->currentGameId != 0 && host->currentGameId != appId) {
             throw std::runtime_error("Another application is already running on this host.");
@@ -474,6 +680,7 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
             .appName = selected.name,
             .sessionUrl = {},
             .resumed = resume,
+            .logicalSessionId = {},
             .remoteInputKey = {},
             .remoteInputIv = {},
         };
@@ -507,7 +714,8 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                         .appId = appId,
                         .appName = selected.name,
                         .state = "launching",
-                        .message = "Selected surround layout is unavailable; using stereo audio.",
+                        .message = "Selected surround layout is unavailable; using "
+                                   "stereo audio.",
                         .resumed = resume,
                     });
                 } catch (...) {
@@ -526,12 +734,12 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                                      static_cast<std::uint64_t>(effectiveSettings.height);
         if ((videoFormat & VIDEO_FORMAT_MASK_H265) != 0 &&
             requestedPixels > current.maxLumaPixelsHevc) {
-            throw std::runtime_error(
-                "Requested resolution exceeds this host's reported HEVC encoder limit.");
+            throw std::runtime_error("Requested resolution exceeds this host's "
+                                     "reported HEVC encoder limit.");
         }
         launched = gameStream_->launch(current.address, current.httpsPort, clientId,
                                        current.serverCertificate, appId, resume, effectiveSettings,
-                                       &launchCancellationRequested_);
+                                       &launchCancellationRequested_, selected.uuid);
     } catch (...) {
         const auto failure = std::current_exception();
         const bool cancelled = launchCancellationRequested_.load();
@@ -554,6 +762,7 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                 .appName = selected.name,
                 .sessionUrl = {},
                 .resumed = resume,
+                .logicalSessionId = {},
                 .remoteInputKey = {},
                 .remoteInputIv = {},
             };
@@ -566,14 +775,14 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
         .appName = selected.name,
         .sessionUrl = launched.sessionUrl,
         .resumed = launched.resumed,
+        .logicalSessionId = launched.logicalSessionId,
         .remoteInputKey = launched.remoteInputKey,
         .remoteInputIv = launched.remoteInputIv,
     };
     {
         std::scoped_lock lock{mutex_};
-        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-            return value.id == hostId;
-        });
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == hostId; });
         if (host != hosts_.end()) {
             host->currentGameId = appId;
             host->serverState = "SUNSHINE_SERVER_BUSY";
@@ -595,8 +804,8 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
             .settings = effectiveSettings,
             .launch = launched,
         },
-        [this, hostId, appId, appName = selected.name, resumed = launched.resumed, generation](
-            const StreamSessionEvent& event) {
+        [this, hostId, appId, appName = selected.name, resumed = launched.resumed,
+         generation](const StreamSessionEvent& event) {
             std::function<void(const SessionUpdate&)> listener;
             {
                 std::scoped_lock lock{mutex_};
@@ -614,17 +823,14 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                 });
             }
         },
-        [this, generation, hostId, appId, appName = selected.name,
-         resumed = launched.resumed,
+        [this, generation, hostId, appId, appName = selected.name, resumed = launched.resumed,
          quitAppAfter = settings.quitAppAfter](StreamSessionEvent event, bool hostEnded,
-                                                  bool userEnded) {
-            requestSessionDisconnect(generation, hostId, appId, appName, resumed,
-                                     std::move(event), hostEnded,
-                                     userEnded && quitAppAfter);
+                                               bool userEnded) {
+            requestSessionDisconnect(generation, hostId, appId, appName, resumed, std::move(event),
+                                     hostEnded, userEnded && quitAppAfter);
         },
         [this, generation, hostId, appId, appName = selected.name, effectiveSettings,
-         videoFormat](
-            const StreamWindowBounds& bounds) {
+         videoFormat](const StreamWindowBounds& bounds) {
             std::function<void(const StreamOverlayRequest&)> listener;
             {
                 std::scoped_lock lock{mutex_};
@@ -637,6 +843,8 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                     .appId = appId,
                     .appName = appName,
                     .generation = generation,
+                    .revision = bounds.revision,
+                    .visible = bounds.visible,
                     .x = bounds.x,
                     .y = bounds.y,
                     .width = bounds.width,
@@ -697,9 +905,9 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                 session_.reset();
                 sessionStopRequested_ = false;
                 if (!cancelled && !launched.resumed) {
-                    const auto host = std::find_if(
-                        hosts_.begin(), hosts_.end(),
-                        [&](const HostRecord& value) { return value.id == hostId; });
+                    const auto host =
+                        std::find_if(hosts_.begin(), hosts_.end(),
+                                     [&](const HostRecord& value) { return value.id == hostId; });
                     if (host != hosts_.end()) {
                         host->currentGameId = 0;
                         host->serverState = "SUNSHINE_SERVER_IDLE";
@@ -723,9 +931,8 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
     bool ownsSession = false;
     {
         std::scoped_lock lock{mutex_};
-        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-            return value.id == hostId;
-        });
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == hostId; });
         if (host == hosts_.end()) {
             throw std::invalid_argument("Host no longer exists.");
         }
@@ -766,11 +973,11 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
     }
 
     if (quitHost) {
-        gameStream_->cancel(current.address, current.httpsPort, clientId, current.serverCertificate);
+        gameStream_->cancel(current.address, current.httpsPort, clientId,
+                            current.serverCertificate);
         std::scoped_lock lock{mutex_};
-        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-            return value.id == hostId;
-        });
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == hostId; });
         if (host != hosts_.end()) {
             host->currentGameId = 0;
             host->serverState = "SUNSHINE_SERVER_IDLE";
@@ -779,18 +986,30 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
     }
 }
 
-void ControlPlane::resumeStreamOverlay(const std::string& hostId, std::uint64_t generation) {
+void ControlPlane::closeStreamOverlay(const std::string& hostId, std::uint64_t generation,
+                                      std::uint64_t revision) {
     std::shared_ptr<StreamSession> transport;
     {
         std::scoped_lock lock{mutex_};
         if (!session_ || session_->hostId != hostId || sessionGeneration_ != generation) return;
         transport = transport_;
     }
-    if (transport) transport->resumeOverlay();
+    if (transport) transport->closeOverlay(revision);
 }
 
-void ControlPlane::requestSessionDisconnect(std::uint64_t generation,
-                                            std::string hostId, int appId,
+void ControlPlane::acknowledgeStreamOverlayHidden(const std::string& hostId,
+                                                  std::uint64_t generation,
+                                                  std::uint64_t revision) {
+    std::shared_ptr<StreamSession> transport;
+    {
+        std::scoped_lock lock{mutex_};
+        if (!session_ || session_->hostId != hostId || sessionGeneration_ != generation) return;
+        transport = transport_;
+    }
+    if (transport) transport->acknowledgeOverlayHidden(revision);
+}
+
+void ControlPlane::requestSessionDisconnect(std::uint64_t generation, std::string hostId, int appId,
                                             std::string appName, bool resumed,
                                             StreamSessionEvent event, bool hostEnded,
                                             bool quitHost) {
@@ -822,9 +1041,8 @@ void ControlPlane::cleanupSessions() {
         DisconnectRequest request;
         {
             std::unique_lock lock{disconnectMutex_};
-            disconnectCondition_.wait(lock, [this] {
-                return shuttingDown_ || disconnectRequest_.has_value();
-            });
+            disconnectCondition_.wait(
+                lock, [this] { return shuttingDown_ || disconnectRequest_.has_value(); });
             if (shuttingDown_) return;
             request = *std::exchange(disconnectRequest_, std::nullopt);
         }
@@ -855,6 +1073,7 @@ void ControlPlane::finishSessionDisconnect(const DisconnectRequest& request) {
             .appName = request.appName,
             .sessionUrl = {},
             .resumed = request.resumed,
+            .logicalSessionId = {},
             .remoteInputKey = {},
             .remoteInputIv = {},
         });
@@ -880,7 +1099,8 @@ void ControlPlane::finishSessionDisconnect(const DisconnectRequest& request) {
             message = "Render window closed; host application stopped.";
         } catch (const std::exception& exception) {
             state = "error";
-            message = std::string{"Stream disconnected, but the host application could not be stopped: "} +
+            message = std::string{"Stream disconnected, but the host application "
+                                  "could not be stopped: "} +
                       exception.what();
         }
     }
@@ -935,14 +1155,67 @@ void ControlPlane::setStreamStatisticsListener(
     streamStatisticsListener_ = std::move(listener);
 }
 
-HostRecord ControlPlane::pairHost(const std::string& id, const std::string& pin) {
+void ControlPlane::setApiResourceListener(std::function<void(const ApiResourceUpdate&)> listener) {
+    std::scoped_lock lock{mutex_};
+    apiResourceListener_ = std::move(listener);
+}
+
+void ControlPlane::startApiEvents(const HostRecord& host) {
+    std::scoped_lock lock{mutex_};
+    if (apiEventThreads_.contains(host.id)) return;
+    apiEventThreads_.try_emplace(host.id, [this, host](const std::stop_token stopToken) {
+        std::string lastEventId;
+        while (!stopToken.stop_requested()) {
+            std::atomic_bool cancelled = false;
+            std::stop_callback cancel{stopToken, [&] { cancelled.store(true); }};
+            SseDecoder decoder;
+            try {
+                gameStream_->streamEvents(
+                    host.address, host.apiPort, host.serverCertificate, "/eclipse/v1/events",
+                    lastEventId, cancelled, [&](const std::string& chunk) {
+                        decoder.push(chunk, [&](const std::string& id, const Json& event) {
+                            if (!id.empty()) lastEventId = id;
+                            std::function<void(const ApiResourceUpdate&)> listener;
+                            {
+                                std::scoped_lock listenerLock{mutex_};
+                                listener = apiResourceListener_;
+                            }
+                            if (listener) listener({host.id, "event", event});
+                        });
+                    });
+            } catch (const std::exception& exception) {
+                if (!stopToken.stop_requested()) {
+                    std::fprintf(stderr, "[terra-core] Sol event stream failed: %s\n",
+                                 exception.what());
+                }
+            }
+            for (int delay = 0; delay < 20 && !stopToken.stop_requested(); ++delay) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{100});
+            }
+        }
+    });
+}
+
+void ControlPlane::stopApiEvents(const std::string& hostId) {
+    std::jthread thread;
+    {
+        std::scoped_lock lock{mutex_};
+        const auto found = apiEventThreads_.find(hostId);
+        if (found == apiEventThreads_.end()) return;
+        found->second.request_stop();
+        thread = std::move(found->second);
+        apiEventThreads_.erase(found);
+    }
+}
+
+HostRecord ControlPlane::pairHost(const std::string& id, const std::string& pin,
+                                  PairingAccess access) {
     HostRecord current;
     std::string clientId;
     {
         std::scoped_lock lock{mutex_};
-        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-            return value.id == id;
-        });
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == id; });
         if (host == hosts_.end()) {
             throw std::invalid_argument("Host no longer exists.");
         }
@@ -958,7 +1231,7 @@ HostRecord ControlPlane::pairHost(const std::string& id, const std::string& pin)
 
     try {
         current.serverCertificate = gameStream_->pair(current.address, current.httpsPort,
-                                                       current.appVersion, clientId, pin);
+                                                      current.appVersion, clientId, pin, access);
         current.paired = true;
         current.status = "online";
         current.error.clear();
@@ -971,15 +1244,33 @@ HostRecord ControlPlane::pairHost(const std::string& id, const std::string& pin)
             current.serverCodecModeSupport = info.serverCodecModeSupport;
             current.maxLumaPixelsHevc = info.maxLumaPixelsHevc;
             current.displayModes = info.displayModes;
+            current.apiVersion = info.eclipseApiVersion;
+            current.apiPort = info.eclipseApiPort;
+            current.capabilities = info.eclipseCapabilities;
+            if (current.apiVersion == 1) {
+                const auto capabilityResponse = gameStream_->apiRequest(
+                    current.address, current.apiPort, current.serverCertificate, "GET",
+                    "/eclipse/v1/capabilities");
+                const auto& document = capabilityResponse.body;
+                current.capabilities = stringArray(document.value("capabilities", Json::array()));
+                current.features = document.value("features", Json::object());
+                current.limits = document.value("limits", Json::object());
+                if (const auto client = document.find("client");
+                    client != document.end() && client->is_object()) {
+                    current.apiClientUuid = client->value("uuid", "");
+                    current.apiClientName = client->value("name", "");
+                    current.apiScopes = stringArray(client->value("scopes", Json::array()));
+                    current.allowedApps = stringArray(client->value("allowedApps", Json::array()));
+                }
+            }
         } catch (...) {
         }
     } catch (const std::exception& exception) {
         current.status = current.serverName.empty() ? "offline" : "online";
         current.error = exception.what();
         std::scoped_lock lock{mutex_};
-        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-            return value.id == id;
-        });
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == id; });
         if (host != hosts_.end()) {
             *host = current;
             saveLocked();
@@ -987,14 +1278,16 @@ HostRecord ControlPlane::pairHost(const std::string& id, const std::string& pin)
         throw;
     }
 
-    std::scoped_lock lock{mutex_};
-    const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-        return value.id == id;
-    });
-    if (host != hosts_.end()) {
-        *host = current;
-        saveLocked();
+    {
+        std::scoped_lock lock{mutex_};
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == id; });
+        if (host != hosts_.end()) {
+            *host = current;
+            saveLocked();
+        }
     }
+    if (current.paired && current.apiVersion == 1) startApiEvents(current);
     return current;
 }
 
@@ -1002,17 +1295,16 @@ void ControlPlane::wakeHost(const std::string& id) {
     MacAddress address{};
     {
         std::scoped_lock lock{mutex_};
-        const auto host = std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
-            return value.id == id;
-        });
+        const auto host = std::find_if(hosts_.begin(), hosts_.end(),
+                                       [&](const HostRecord& value) { return value.id == id; });
         if (host == hosts_.end()) throw std::invalid_argument("Host no longer exists.");
         if (host->status != "offline") {
             throw std::runtime_error("Wake-on-LAN is available only while host is offline.");
         }
         const auto parsed = parseMacAddress(host->wakeMacAddress);
         if (!parsed) {
-            throw std::runtime_error(
-                "Wake-on-LAN is unavailable until this paired host reports a valid MAC address.");
+            throw std::runtime_error("Wake-on-LAN is unavailable until this paired "
+                                     "host reports a valid MAC address.");
         }
         const auto now = std::chrono::steady_clock::now();
         const auto previous = lastWakeRequests_.find(id);
@@ -1037,6 +1329,7 @@ void ControlPlane::removeHost(const std::string& id) {
         lastWakeRequests_.erase(id);
         saveLocked();
     }
+    stopApiEvents(id);
     std::error_code ignored;
     std::filesystem::remove_all(dataPath_ / "box-art" / cacheKey(id), ignored);
 }
@@ -1055,7 +1348,8 @@ void ControlPlane::load() {
                 }
             }
         } catch (const std::exception& exception) {
-            throw std::runtime_error("Cannot read native client state: " + std::string{exception.what()});
+            throw std::runtime_error("Cannot read native client state: " +
+                                     std::string{exception.what()});
         }
     }
 

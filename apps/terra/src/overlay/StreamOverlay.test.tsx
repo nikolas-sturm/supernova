@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   overlayClosedStorageKey,
+  overlayHiddenStorageKey,
   overlayReadyStorageKey,
   overlayRequestStorageKey,
   overlayStatisticsStorageKey,
@@ -13,6 +14,9 @@ const neutralino = vi.hoisted(() => {
   return {
     data,
     exit: vi.fn(() => Promise.resolve()),
+    hide: vi.fn(() => Promise.resolve()),
+    move: vi.fn((_x: number, _y: number) => Promise.resolve()),
+    setSize: vi.fn((_options: { width: number; height: number }) => Promise.resolve()),
     getData: vi.fn((key: string) =>
       data.has(key)
         ? Promise.resolve(data.get(key) as string)
@@ -33,6 +37,7 @@ vi.mock('@neutralinojs/lib', () => ({
   events: { on: neutralino.on, off: neutralino.off },
   init: neutralino.init,
   storage: { getData: neutralino.getData, setData: neutralino.setData },
+  window: { hide: neutralino.hide, move: neutralino.move, setSize: neutralino.setSize },
 }))
 
 import { StreamOverlay } from './StreamOverlay'
@@ -46,6 +51,7 @@ function request(visible = true): StoredOverlayRequest {
     appId: 7,
     appName: 'Portal',
     generation: '4',
+    revision: '1',
     bounds: { x: -1200, y: 40, width: 1280, height: 720, scaleFactor: 1.25 },
   }
 }
@@ -84,6 +90,8 @@ describe('StreamOverlay', () => {
   beforeEach(() => {
     neutralino.data.clear()
     neutralino.exit.mockClear()
+    neutralino.move.mockClear()
+    neutralino.setSize.mockClear()
     neutralino.getData.mockClear()
     neutralino.setData.mockClear()
     neutralino.on.mockClear()
@@ -144,15 +152,43 @@ describe('StreamOverlay', () => {
     expect(JSON.parse(neutralino.data.get(overlayReadyStorageKey) ?? '')).toEqual({
       schemaVersion: 1,
       requestId: 'overlay-1',
+      revision: '1',
     })
     fireEvent.click(screen.getByRole('button', { name: 'Close overlay' }))
 
-    await waitFor(() => expect(neutralino.exit).toHaveBeenCalledOnce())
+    expect(neutralino.exit).not.toHaveBeenCalled()
     expect(JSON.parse(neutralino.data.get(overlayClosedStorageKey) ?? '')).toEqual({
       schemaVersion: 1,
       requestId: 'overlay-1',
       action: 'resume',
     })
+    neutralino.data.set(
+      overlayRequestStorageKey,
+      JSON.stringify({ ...request(false), revision: '2' }),
+    )
+    await waitFor(() => expect(neutralino.exit).toHaveBeenCalledOnce())
+    expect(JSON.parse(neutralino.data.get(overlayHiddenStorageKey) ?? '')).toMatchObject({
+      requestId: 'overlay-1',
+      revision: '2',
+    })
+  })
+
+  it('applies revisioned stream-window bounds to shared child', async () => {
+    neutralino.data.set(overlayRequestStorageKey, JSON.stringify(request()))
+    render(<StreamOverlay />)
+    await screen.findByText('Portal')
+
+    neutralino.data.set(
+      overlayRequestStorageKey,
+      JSON.stringify({
+        ...request(),
+        revision: '2',
+        bounds: { x: 40, y: 60, width: 960, height: 540, scaleFactor: 1 },
+      }),
+    )
+
+    await waitFor(() => expect(neutralino.move).toHaveBeenCalledWith(40, 60))
+    expect(neutralino.setSize).toHaveBeenCalledWith({ width: 960, height: 540 })
   })
 
   it('switches tabs and exposes unavailable USB forwarding honestly', async () => {
@@ -200,14 +236,14 @@ describe('StreamOverlay', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Disconnect/ }))
 
-    await waitFor(() => expect(neutralino.exit).toHaveBeenCalledOnce())
+    expect(neutralino.exit).not.toHaveBeenCalled()
     expect(JSON.parse(neutralino.data.get(overlayClosedStorageKey) ?? '')).toMatchObject({
       requestId: 'overlay-1',
       action: 'disconnect',
     })
   })
 
-  it('consumes exact shortcut and notifies parent', async () => {
+  it('consumes exact shortcut and notifies parent on O press', async () => {
     neutralino.data.set(overlayRequestStorageKey, JSON.stringify(request()))
     render(<StreamOverlay />)
     await screen.findByText('Portal')
@@ -220,8 +256,15 @@ describe('StreamOverlay', () => {
     })
 
     expect(dispatched).toBe(false)
-    await waitFor(() => expect(neutralino.exit).toHaveBeenCalledOnce())
-    expect(neutralino.data.has(overlayClosedStorageKey)).toBe(true)
+    expect(neutralino.exit).not.toHaveBeenCalled()
+    await waitFor(() => expect(neutralino.data.has(overlayClosedStorageKey)).toBe(true))
+    fireEvent.keyUp(window, {
+      key: 'O',
+      ctrlKey: true,
+      altKey: true,
+      shiftKey: true,
+    })
+    expect(neutralino.exit).not.toHaveBeenCalled()
   })
 
   it('exits without resuming stream when parent hides overlay', async () => {
@@ -243,6 +286,7 @@ describe('StreamOverlay', () => {
     expect(neutralino.exit).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Close overlay' }))
-    await waitFor(() => expect(neutralino.exit).toHaveBeenCalledOnce())
+    await waitFor(() => expect(neutralino.data.has(overlayClosedStorageKey)).toBe(true))
+    expect(screen.queryByText('CLOSE FAILED / RETRY')).not.toBeInTheDocument()
   })
 })

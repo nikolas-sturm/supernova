@@ -76,6 +76,7 @@ namespace {
       [index, shared_ids]() {
         return shared_ids->at(index->fetch_add(1));
       },
+      {},
     };
   }
 
@@ -109,6 +110,27 @@ TEST(TerraOperationsTest, CreatesReplaysAndConflictsByCanonicalBody) {
   EXPECT_FALSE(conflict.operation);
 }
 
+TEST(TerraOperationsTest, BindsItemOperationsToTargetAndRevision) {
+  const auto request = nlohmann::json::parse(R"({"schemaVersion":1,"force":false})");
+  const auto first = terra_operations::item_request_body(request, "11111111-1111-1111-1111-111111111111", 3);
+  const auto second = terra_operations::item_request_body(request, "22222222-2222-2222-2222-222222222222", 3);
+  const auto revised = terra_operations::item_request_body(request, "11111111-1111-1111-1111-111111111111", 4);
+  persistence_t persistence;
+  std::int64_t now = 1000;
+  terra_operations::store_t store {callbacks(persistence, now)};
+
+  EXPECT_EQ(first["targetId"], "11111111-1111-1111-1111-111111111111");
+  EXPECT_EQ(first["revision"], 3);
+  EXPECT_NE(first, second);
+  EXPECT_NE(first, revised);
+  EXPECT_FALSE(request.contains("targetId"));
+  EXPECT_FALSE(request.contains("revision"));
+  EXPECT_EQ(store.submit(CLIENT, "sandbox.stop", "target-key", first, response).status, terra_operations::submission_status_t::created);
+  EXPECT_EQ(store.submit(CLIENT, "sandbox.stop", "target-key", first, response).status, terra_operations::submission_status_t::replayed);
+  EXPECT_EQ(store.submit(CLIENT, "sandbox.stop", "target-key", second, response).status, terra_operations::submission_status_t::conflict);
+  EXPECT_EQ(store.submit(CLIENT, "sandbox.stop", "target-key", revised, response).status, terra_operations::submission_status_t::conflict);
+}
+
 TEST(TerraOperationsTest, ScopesKeysByClientAndAction) {
   persistence_t persistence;
   std::int64_t now = 1000;
@@ -117,6 +139,16 @@ TEST(TerraOperationsTest, ScopesKeysByClientAndAction) {
   EXPECT_EQ(store.submit(CLIENT, "launch", "key", nlohmann::json::object(), response).status, terra_operations::submission_status_t::created);
   EXPECT_EQ(store.submit(CLIENT, "stop", "key", nlohmann::json::object(), response).status, terra_operations::submission_status_t::created);
   EXPECT_EQ(store.submit("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", "launch", "key", nlohmann::json::object(), response).status, terra_operations::submission_status_t::created);
+}
+
+TEST(TerraOperationsTest, ReplaysExactActionsWithoutPrefixSuffixLookalikes) {
+  persistence_t persistence;
+  std::int64_t now = 1000;
+  terra_operations::store_t store {callbacks(persistence, now)};
+  ASSERT_EQ(store.submit(CLIENT, "launchlaunch", "key", nullptr, response).status, terra_operations::submission_status_t::created);
+
+  EXPECT_FALSE(store.replay_exact(CLIENT, "launch", "key", nullptr));
+  EXPECT_TRUE(store.replay_exact(CLIENT, "launchlaunch", "key", nullptr));
 }
 
 TEST(TerraOperationsTest, EnforcesLifecycleAndMonotonicRevision) {
@@ -149,13 +181,74 @@ TEST(TerraOperationsTest, EnforcesLifecycleAndMonotonicRevision) {
 TEST(TerraOperationsTest, RollsBackRejectedPersistence) {
   persistence_t persistence;
   std::int64_t now = 1000;
-  persistence.succeeds = false;
   terra_operations::store_t store {callbacks(persistence, now)};
+  persistence.succeeds = false;
   EXPECT_EQ(store.submit(CLIENT, "launch", "key", nullptr, response).status, terra_operations::submission_status_t::persistence_failed);
+  EXPECT_FALSE(store.available());
   EXPECT_FALSE(store.get(OPERATION));
 }
 
-TEST(TerraOperationsTest, ReloadsValidRecordsAndIgnoresMalformedRecords) {
+TEST(TerraOperationsTest, InitialSaveFailureIsUnavailable) {
+  persistence_t persistence;
+  std::int64_t now = 1000;
+  persistence.succeeds = false;
+  terra_operations::store_t store {callbacks(persistence, now)};
+  EXPECT_FALSE(store.available());
+  persistence.succeeds = true;
+  EXPECT_TRUE(store.reprobe());
+  EXPECT_TRUE(store.available());
+}
+
+TEST(TerraOperationsTest, ReprobePersistsTerminalMutationAfterTransientFailure) {
+  persistence_t persistence;
+  std::int64_t now = 1000;
+  terra_operations::store_t store {callbacks(persistence, now)};
+  ASSERT_EQ(store.submit(CLIENT, "launch", "key", nullptr, response).status, terra_operations::submission_status_t::created);
+  ASSERT_TRUE(store.transition(OPERATION, terra_operations::state_t::running));
+  persistence.succeeds = false;
+  EXPECT_FALSE(store.transition(OPERATION, terra_operations::state_t::succeeded, "resource", nlohmann::json {{"ok", true}}));
+  EXPECT_FALSE(store.available());
+
+  persistence.succeeds = true;
+  ASSERT_TRUE(store.reprobe());
+  const auto operation = store.get(OPERATION);
+  ASSERT_TRUE(operation);
+  EXPECT_EQ(operation->state, terra_operations::state_t::succeeded);
+  EXPECT_EQ(operation->resource_id, "resource");
+  const auto document = nlohmann::json::parse(*persistence.document);
+  EXPECT_EQ(document["operations"][0]["state"], "succeeded");
+}
+
+TEST(TerraOperationsTest, ReprobeFailsOperationAbandonedBeforeExecution) {
+  persistence_t persistence;
+  std::int64_t now = 1000;
+  terra_operations::store_t store {callbacks(persistence, now)};
+  ASSERT_EQ(store.submit(CLIENT, "launch", "key", nullptr, response).status, terra_operations::submission_status_t::created);
+  persistence.succeeds = false;
+  EXPECT_FALSE(store.transition(OPERATION, terra_operations::state_t::running));
+  persistence.succeeds = true;
+  ASSERT_TRUE(store.reprobe());
+  const auto operation = store.get(OPERATION);
+  ASSERT_TRUE(operation);
+  EXPECT_EQ(operation->state, terra_operations::state_t::failed);
+  EXPECT_EQ(operation->error["code"], "persistence_failure");
+}
+
+TEST(TerraOperationsTest, ReplaySkipsOtherActionScopeWithSameKey) {
+  persistence_t persistence;
+  std::int64_t now = 1000;
+  terra_operations::store_t store {callbacks(persistence, now)};
+  const auto first = terra_operations::item_request_body(nlohmann::json {{"name", "one"}}, "11111111-1111-1111-1111-111111111111", 1);
+  const auto other = terra_operations::item_request_body(nlohmann::json {{"name", "two"}}, "22222222-2222-2222-2222-222222222222", 1);
+  const auto conflict = terra_operations::item_request_body(nlohmann::json {{"name", "changed"}}, "11111111-1111-1111-1111-111111111111", 1);
+  ASSERT_EQ(store.submit(CLIENT, "profile.stream.patch", "key", first, response).status, terra_operations::submission_status_t::created);
+  EXPECT_FALSE(store.replay(CLIENT, "profile.", ".patch", "key", other));
+  const auto conflicted = store.replay(CLIENT, "profile.", ".patch", "key", conflict);
+  ASSERT_TRUE(conflicted);
+  EXPECT_EQ(conflicted->status, terra_operations::submission_status_t::conflict);
+}
+
+TEST(TerraOperationsTest, RejectsPartiallyMalformedDocumentsFailClosed) {
   persistence_t persistence;
   std::int64_t now = 1000;
   {
@@ -168,11 +261,8 @@ TEST(TerraOperationsTest, ReloadsValidRecordsAndIgnoresMalformedRecords) {
   persistence.document = document.dump();
 
   terra_operations::store_t reloaded {callbacks(persistence, now)};
-  const auto operation = reloaded.get(OPERATION);
-  ASSERT_TRUE(operation);
-  EXPECT_EQ(operation->client_uuid, CLIENT);
-  EXPECT_EQ(operation->action, "launch");
-  EXPECT_EQ(reloaded.submit(CLIENT, "launch", "key", nullptr, response).status, terra_operations::submission_status_t::replayed);
+  EXPECT_FALSE(reloaded.available());
+  EXPECT_FALSE(reloaded.get(OPERATION));
 }
 
 TEST(TerraOperationsTest, FailsInterruptedOperationsDuringRestartRecovery) {
@@ -220,14 +310,17 @@ TEST(TerraOperationsTest, RejectsUnknownDocumentVersionFailClosed) {
   persistence.document = R"({"version":99,"operations":[],"idempotency":[]})";
   std::int64_t now = 1000;
   terra_operations::store_t store {callbacks(persistence, now)};
+  EXPECT_FALSE(store.available());
+  EXPECT_FALSE(store.reprobe());
   EXPECT_FALSE(store.get(OPERATION));
 }
 
-TEST(TerraOperationsTest, IgnoresSemanticallyMalformedOperation) {
+TEST(TerraOperationsTest, RejectsSemanticallyMalformedOperationFailClosed) {
   persistence_t persistence;
   persistence.document = R"({"version":1,"operations":[{"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","clientUuid":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","action":"launch","state":"pending","resourceId":null,"createdAt":1,"updatedAt":1,"revision":1,"result":{"unexpected":true},"error":null}],"idempotency":[]})";
   std::int64_t now = 1000;
   terra_operations::store_t store {callbacks(persistence, now)};
+  EXPECT_FALSE(store.available());
   EXPECT_FALSE(store.get(OPERATION));
 }
 
