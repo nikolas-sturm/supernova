@@ -158,7 +158,8 @@ export function DisplayManager({ host, settings, onError }: CommonProps) {
   async function createVirtualDisplay(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!host) return
-    const data = new FormData(event.currentTarget)
+    const form = event.currentTarget
+    const data = new FormData(form)
     const name = String(data.get('name') ?? '').trim()
     if (!name) return
     await runMutation(onError, () =>
@@ -181,7 +182,7 @@ export function DisplayManager({ host, settings, onError }: CommonProps) {
         workspaceId: null,
       }),
     )
-    event.currentTarget.reset()
+    form.reset()
   }
 
   return (
@@ -357,7 +358,8 @@ export function WorkspaceManager({
   async function createWorkspace(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!host) return
-    const data = new FormData(event.currentTarget)
+    const form = event.currentTarget
+    const data = new FormData(form)
     const appUuid = String(data.get('appUuid') ?? '')
     const name = String(data.get('name') ?? '').trim()
     if (!appUuid || !name) return
@@ -407,7 +409,7 @@ export function WorkspaceManager({
         cleanupPolicy: 'on-stop',
       }),
     )
-    event.currentTarget.reset()
+    form.reset()
   }
 
   return (
@@ -651,7 +653,8 @@ export function ProfileManager({ host, settings, onError }: CommonProps) {
   async function createProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!host) return
-    const data = new FormData(event.currentTarget)
+    const form = event.currentTarget
+    const data = new FormData(form)
     const name = String(data.get('name') ?? '').trim()
     if (!name) return
     await runMutation(onError, () =>
@@ -677,7 +680,7 @@ export function ProfileManager({ host, settings, onError }: CommonProps) {
         },
       }),
     )
-    event.currentTarget.reset()
+    form.reset()
   }
 
   return (
@@ -791,7 +794,8 @@ export function SandboxManager({ host, apps, settings, onError }: CommonProps) {
   async function createSandbox(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!host) return
-    const data = new FormData(event.currentTarget)
+    const form = event.currentTarget
+    const data = new FormData(form)
     const name = String(data.get('name') ?? '').trim()
     const profileId = String(data.get('profileId') ?? '')
     const appUuid = String(data.get('appUuid') ?? '')
@@ -805,7 +809,7 @@ export function SandboxManager({ host, apps, settings, onError }: CommonProps) {
         name,
       }),
     )
-    event.currentTarget.reset()
+    form.reset()
   }
 
   return (
@@ -999,7 +1003,8 @@ export function HardwareManager({ host, onError }: CommonProps) {
   async function registerPeripheral(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!host) return
-    const data = new FormData(event.currentTarget)
+    const form = event.currentTarget
+    const data = new FormData(form)
     const deviceClass = String(data.get('class')) as 'keyboard' | 'mouse'
     const name = String(data.get('name') ?? '').trim()
     if (!name) return
@@ -1013,7 +1018,7 @@ export function HardwareManager({ host, onError }: CommonProps) {
         capabilities: [`${deviceClass}.hid`],
       }),
     )
-    event.currentTarget.reset()
+    form.reset()
   }
 
   async function claimPeripheral(event: FormEvent<HTMLFormElement>) {

@@ -116,7 +116,7 @@ namespace terra::windows::virtual_display {
       }
     }
 
-    /** @brief Capture exact current active topology into memory and durable journal. */
+    /** @brief Capture exact current active topology and persist it when a journal path is configured. */
     bool capture_rollback(rollback_state_t &rollback) {
       auto api_layer = std::make_shared<display_device::WinApiLayer>();
       display_device::WinDisplayDevice display_api {api_layer};
@@ -154,7 +154,7 @@ namespace terra::windows::virtual_display {
       rollback.primary = primary->m_device_id;
       rollback.modes = std::move(modes);
       rollback.hdr_states = hdr_states;
-      return save_rollback(rollback);
+      return rollback.path.empty() || save_rollback(rollback);
     }
 
     /** @brief Restore retained topology and clear journal only after complete success. */
@@ -337,11 +337,20 @@ namespace terra::windows::virtual_display {
 
       display_device::DeviceDisplayModeMap modes;
       display_device::HdrStateMap hdr_states;
+      const auto current_hdr_states = display_api.getCurrentHdrStates(requested_devices);
+      if (current_hdr_states.size() != requested_devices.size()) {
+        BOOST_LOG(error) << "Terra MttVDD: current HDR state query failed";
+        return false;
+      }
       for (const auto &configuration : configurations) {
         const auto &id = platform_to_device.at(configuration.platform_id);
         const auto &mode = configuration.specification.mode;
         modes[id] = {{static_cast<unsigned int>(mode.width), static_cast<unsigned int>(mode.height)}, {mode.refresh_numerator, mode.refresh_denominator}};
-        hdr_states[id] = configuration.specification.hdr ? display_device::HdrState::Enabled : display_device::HdrState::Disabled;
+        if (configuration.specification.hdr) {
+          hdr_states[id] = display_device::HdrState::Enabled;
+        } else if (current_hdr_states.at(id)) {
+          hdr_states[id] = display_device::HdrState::Disabled;
+        }
       }
       if ((!modes.empty() && !display_api.setDisplayModes(modes)) || (!hdr_states.empty() && !display_api.setHdrStates(hdr_states))) {
         BOOST_LOG(error) << "Terra MttVDD: mode or HDR application failed";
@@ -524,44 +533,8 @@ namespace terra::windows::virtual_display {
       mttvdd::MAX_DISPLAY_COUNT,
       {},
       [rollback]() {
-        auto api_layer = std::make_shared<display_device::WinApiLayer>();
-        display_device::WinDisplayDevice display_api {api_layer};
-        if (!display_api.isApiAccessAvailable()) {
-          return false;
-        }
-        const auto topology = display_api.getCurrentTopology();
-        const auto devices = display_api.enumAvailableDevices();
-        const auto primary = std::ranges::find_if(devices, [](const auto &device) {
-          return device.m_info && device.m_info->m_primary;
-        });
-        if (!display_api.isTopologyValid(topology) || primary == devices.end()) {
-          return false;
-        }
-        std::map<std::string, DEVMODEA, std::less<>> modes;
-        display_device::StringSet active_ids;
-        for (const auto &group : topology) {
-          active_ids.insert(group.begin(), group.end());
-        }
-        for (const auto &device : devices) {
-          if (!active_ids.contains(device.m_device_id) || device.m_display_name.empty()) {
-            continue;
-          }
-          DEVMODEA mode {.dmSize = sizeof(DEVMODEA)};
-          if (!EnumDisplaySettingsExA(device.m_display_name.c_str(), ENUM_CURRENT_SETTINGS, &mode, 0)) {
-            return false;
-          }
-          modes.emplace(device.m_device_id, mode);
-        }
-        const auto hdr_states = display_api.getCurrentHdrStates(active_ids);
-        if (modes.size() != active_ids.size() || hdr_states.size() != active_ids.size()) {
-          return false;
-        }
         std::lock_guard lock {rollback->mutex};
-        rollback->topology = topology;
-        rollback->primary = primary->m_device_id;
-        rollback->modes = std::move(modes);
-        rollback->hdr_states = hdr_states;
-        return true;
+        return capture_rollback(*rollback);
       },
       [rollback]() {
         std::optional<display_device::ActiveTopology> topology;
