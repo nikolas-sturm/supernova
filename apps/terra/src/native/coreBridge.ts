@@ -8,6 +8,7 @@ import { type StreamSettings, settingsSchema } from '../settings'
 import type {
   AppLibrary,
   BridgeStatus,
+  ClientDisplayOutput,
   Host,
   LogicalSession,
   OperationResource,
@@ -37,6 +38,7 @@ const sessionEvent = 'terra.session.changed'
 const streamOverlayEvent = 'terra.stream.overlay.requested'
 const streamStatisticsEvent = 'terra.stream.statistics'
 const solResourceEvent = 'terra.sol.resource.changed'
+const clientDisplaysEvent = 'terra.client-displays.changed'
 
 const statusSchema = z.object({
   schemaVersion: z.literal(1),
@@ -96,6 +98,29 @@ const hostsSchema = z.object({
 const hostErrorSchema = z.object({
   schemaVersion: z.literal(1),
   message: z.string().min(1),
+})
+
+const clientDisplayOutputSchema = z.object({
+  id: z.string().min(1),
+  name: z.string(),
+  primary: z.boolean(),
+  x: z.number().int(),
+  y: z.number().int(),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+  refreshRate: z.number().int().positive(),
+  modes: z.array(
+    z.object({
+      width: z.number().int().positive(),
+      height: z.number().int().positive(),
+      refreshRate: z.number().int().positive(),
+    }),
+  ),
+})
+
+const clientDisplaysSchema = z.object({
+  schemaVersion: z.literal(1),
+  displays: z.array(clientDisplayOutputSchema),
 })
 
 const pairingSchema = z.object({
@@ -422,6 +447,7 @@ interface CoreBridgeHandlers {
   onArtwork: (hostId: string, appId: number, dataUrl: string, error: string) => void
   onSession: (update: SessionUpdate) => void
   onSolResource: (update: SolResourceUpdate) => void
+  onClientDisplays?: (displays: ClientDisplayOutput[]) => void
 }
 
 async function dispatchConnected(event: string, data?: unknown) {
@@ -454,6 +480,7 @@ export function startCoreBridge({
   onArtwork,
   onSession,
   onSolResource,
+  onClientDisplays,
 }: CoreBridgeHandlers) {
   if (!hasNeutralinoRuntime()) {
     onStatus({
@@ -508,6 +535,15 @@ export function startCoreBridge({
   const handleHostError = (event: CustomEvent<unknown>) => {
     const result = hostErrorSchema.safeParse(event.detail)
     onHostError(result.success ? result.data.message : 'Native host request failed.')
+  }
+
+  const handleClientDisplays = (event: CustomEvent<unknown>) => {
+    const result = clientDisplaysSchema.safeParse(event.detail)
+    if (result.success) {
+      onClientDisplays?.(result.data.displays)
+    } else {
+      onHostError('Native core returned an invalid client display topology.')
+    }
   }
 
   const handleExtensionDisconnect = (event: CustomEvent<unknown>) => {
@@ -750,6 +786,7 @@ export function startCoreBridge({
   void events.on(streamOverlayEvent, handleStreamOverlay)
   void events.on(streamStatisticsEvent, handleStreamStatistics)
   void events.on(solResourceEvent, handleSolResource)
+  void events.on(clientDisplaysEvent, handleClientDisplays)
   void events.on('extClientDisconnect', handleExtensionDisconnect)
   void extensions.dispatch(extensionId, 'core.status').catch(() => {
     onStatus({
@@ -771,6 +808,7 @@ export function startCoreBridge({
     void events.off(streamOverlayEvent, handleStreamOverlay)
     void events.off(streamStatisticsEvent, handleStreamStatistics)
     void events.off(solResourceEvent, handleSolResource)
+    void events.off(clientDisplaysEvent, handleClientDisplays)
     void events.off('extClientDisconnect', handleExtensionDisconnect)
   }
 }
@@ -779,6 +817,11 @@ export async function saveCoreHost(name: string, address: string) {
   if (!hasNeutralinoRuntime()) return false
   await dispatchConnected('host.add', { name, address })
   return true
+}
+
+export async function rescanClientDisplays() {
+  if (!hasNeutralinoRuntime()) return
+  await dispatchConnected('client.displays.rescan')
 }
 
 export async function configureCoreDiscovery(enabled: boolean) {

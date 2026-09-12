@@ -277,7 +277,7 @@ namespace terra_workspaces {
   }
 
   std::optional<start_request_t> parse_start_request(const nlohmann::json &value) {
-    static const std::set<std::string, std::less<>> allowed {"appUuid", "profileOverrides"};
+    static const std::set<std::string, std::less<>> allowed {"appUuid", "profileOverrides", "virtualDisplays"};
     if (!value.is_object() || std::ranges::any_of(value.items(), [&](const auto &item) {
           return !allowed.contains(item.key());
         })) {
@@ -287,6 +287,15 @@ namespace terra_workspaces {
       start_request_t result;
       if (value.contains("appUuid")) {
         result.app_uuid = value.at("appUuid").get<std::string>();
+      }
+      if (value.contains("virtualDisplays")) {
+        const auto &displays = value.at("virtualDisplays");
+        if (!displays.is_array() || displays.empty() || displays.size() > 4 || !std::ranges::all_of(displays, [](const auto &display) {
+              return display.is_object();
+            })) {
+          return std::nullopt;
+        }
+        result.virtual_displays = displays.get<std::vector<nlohmann::json>>();
       }
       if (!value.contains("profileOverrides")) {
         return result;
@@ -689,6 +698,9 @@ namespace terra_workspaces {
         return {status_t::invalid, std::nullopt};
       }
     }
+    if (request.virtual_displays && (request.virtual_displays->empty() || request.virtual_displays->size() > 4 || !impl_->callbacks.validate_virtual_display || !std::ranges::all_of(*request.virtual_displays, impl_->callbacks.validate_virtual_display))) {
+      return {status_t::invalid, std::nullopt};
+    }
     const auto original = found->second;
     auto preparing_resource = original;
     preparing_resource.state = state_t::preparing;
@@ -716,7 +728,7 @@ namespace terra_workspaces {
     };
     std::optional<prepared_t> runtime;
     try {
-      runtime = impl_->callbacks.prepare ? impl_->callbacks.prepare({id, *preparing_resource.owner_client_uuid, app, preparing_resource.definition, request.profile_overrides}, persist_preparation) : std::nullopt;
+      runtime = impl_->callbacks.prepare ? impl_->callbacks.prepare({id, *preparing_resource.owner_client_uuid, app, preparing_resource.definition, request.profile_overrides, request.virtual_displays}, persist_preparation) : std::nullopt;
     } catch (...) {
     }
     const auto runtime_valid = runtime && runtime->success && !runtime->session_id && (!runtime->sandbox_id || valid_uuid(*runtime->sandbox_id)) && valid_uuids(runtime->display_ids) && valid_uuids(runtime->peripheral_claim_ids);

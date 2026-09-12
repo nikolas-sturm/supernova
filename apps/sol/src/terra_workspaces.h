@@ -103,6 +103,7 @@ namespace terra_workspaces {
   struct start_request_t {
     std::optional<std::string> app_uuid;  ///< Application override UUID.
     profile_overrides_t profile_overrides;  ///< Ephemeral complete profile overrides.
+    std::optional<std::vector<nlohmann::json>> virtual_displays;  ///< Ephemeral runtime display topology, or no value to use the stored definition.
   };
 
   /**
@@ -165,6 +166,7 @@ namespace terra_workspaces {
     std::string app_uuid;  ///< Resolved application UUID.
     definition_t definition;  ///< Definition snapshot.
     profile_overrides_t profile_overrides;  ///< Validated start overrides.
+    std::optional<std::vector<nlohmann::json>> virtual_displays;  ///< Ephemeral runtime display topology override, or no value to use the definition.
   };
 
   /**

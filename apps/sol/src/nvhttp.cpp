@@ -6903,6 +6903,15 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Workspace start overrides are invalid or unsupported");
       return;
     }
+#ifdef _WIN32
+    if (start->virtual_displays && (!terra_virtual_display_manager || !terra_virtual_display_manager->available() || !std::ranges::all_of(*start->virtual_displays, [](const nlohmann::json &value) {
+          const auto specification = terra_virtual_specification(value);
+          return specification && specification->scale == 1.0 && !specification->workspace_id;
+        }))) {
+      send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Workspace start virtual displays are invalid or unsupported");
+      return;
+    }
+#endif
     const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
     if (!terra_workspace_mutation_preflight(response, *client, request, id, *revision, "workspace.start", operation_body)) {
       return;
@@ -9952,7 +9961,8 @@ namespace nvhttp {
       [](const terra_workspaces::preparation_t &request, const std::function<bool(const terra_workspaces::prepared_t &)> &persist) -> std::optional<terra_workspaces::prepared_t> {
         terra_workspaces::prepared_t runtime {true};
         std::vector<terra_virtual_display::specification_t> display_specifications;
-        for (const auto &value : request.definition.virtual_displays) {
+        const auto &requested_displays = request.virtual_displays ? *request.virtual_displays : request.definition.virtual_displays;
+        for (const auto &value : requested_displays) {
           auto specification = terra_virtual_specification(value);
           if (!specification || !terra_virtual_display_manager) {
             runtime.success = false;

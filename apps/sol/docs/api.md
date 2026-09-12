@@ -84,6 +84,10 @@ Moonlight permissions; explicitly empty fields grant no Terra scopes or input cl
 Terra clients pass `eclipseApiVersion=1`, `eclipseAppUuid`, and optional
 `eclipseWorkspaceId` and `eclipseDisplayId` query parameters to paired `/launch` and `/resume`.
 Workspace launches require one attached, capture-ready virtual display ID per child transport.
+A workspace start request may include an optional `virtualDisplays` array of one to four creation
+objects. When present it replaces the stored definition topology for the lifetime of that prepared
+runtime, so a client can stream a per-session subset of its own outputs without persisting a custom
+host layout.
 `/launch` starts the application and primary child; subsequent displays use `/resume`. Successful
 responses include stable `EclipseSessionId` and unique `EclipseStreamId` fields. One logical session
 supports at most four child streams. Terra virtual-display streams and legacy Moonlight streams are

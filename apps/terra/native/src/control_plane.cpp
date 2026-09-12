@@ -757,14 +757,17 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                 "/eclipse/v1/workspaces/" + workspaceId);
             const auto& workspace = response.body.at("workspace");
             displayIds = workspace.at("displayIds").get<std::vector<std::string>>();
-            const auto& virtualDisplays = workspace.at("virtualDisplays");
-            if (displayIds.empty() || displayIds.size() > 4 || !virtualDisplays.is_array() ||
-                virtualDisplays.size() != displayIds.size() ||
+            if (displayIds.empty() || displayIds.size() > 4 ||
                 (workspace.at("state") != "ready" && workspace.at("state") != "active")) {
                 throw std::runtime_error("Workspace is not ready with one to four displays.");
             }
-            for (const auto& display : virtualDisplays) {
-                const auto& mode = display.at("mode");
+            // Read each attached display's actual mode so an ephemeral start-time
+            // topology override is honored without persisting it on the workspace.
+            for (const auto& displayId : displayIds) {
+                const auto displayResponse = gameStream_->apiRequest(
+                    current.address, current.apiPort, current.serverCertificate, "GET",
+                    "/eclipse/v1/virtual-displays/" + displayId);
+                const auto& mode = displayResponse.body.at("virtualDisplay").at("actualMode");
                 const auto refreshNumerator = mode.at("refreshNumerator").get<int>();
                 const auto refreshDenominator = mode.at("refreshDenominator").get<int>();
                 if (refreshNumerator <= 0 || refreshDenominator <= 0) {
@@ -775,7 +778,7 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                 childSettings.height = mode.at("height").get<int>();
                 childSettings.fps =
                     (refreshNumerator + refreshDenominator / 2) / refreshDenominator;
-                childSettings.enableHdr = display.at("hdr").get<bool>();
+                childSettings.enableHdr = mode.at("hdr").get<bool>();
                 displaySettings.push_back(std::move(childSettings));
             }
             effectiveSettings = displaySettings.front();

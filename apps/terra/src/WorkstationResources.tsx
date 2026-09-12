@@ -1,7 +1,6 @@
 import {
   Cable,
   CircleAlert,
-  HardDrive,
   Monitor,
   Play,
   Plus,
@@ -11,11 +10,18 @@ import {
   Square,
   Trash2,
 } from 'lucide-react'
-import { type FormEvent, type ReactNode, useState } from 'react'
+import type { FormEvent, ReactNode } from 'react'
 import styles from './App.module.css'
-import { loadCoreResource, mutateCoreResource } from './native/coreBridge'
+import {
+  clientDisplayVirtualDisplays,
+  effectiveClientDisplay,
+  enabledClientDisplays,
+} from './clientDisplays'
+import { loadCoreResource, mutateCoreResource, rescanClientDisplays } from './native/coreBridge'
 import type { StreamSettings } from './settings'
 import type {
+  ClientDisplayOutput,
+  ClientDisplayPreference,
   GameApp,
   Host,
   OperationResource,
@@ -30,8 +36,6 @@ interface CommonProps {
   settings: StreamSettings
   onError: (message?: string) => void
 }
-
-const workspaceDisplaySlots = ['primary', 'secondary', 'tertiary', 'quaternary'] as const
 
 function featureReason(host: Host, capability: string) {
   const feature = host.features?.[capability]
@@ -141,219 +145,216 @@ async function runMutation(onError: CommonProps['onError'], mutation: () => Prom
   }
 }
 
-export function DisplayManager({ host, settings, onError }: CommonProps) {
-  const resources = useClientStore((state) => (host ? state.resourcesByHost[host.id] : undefined))
-  const operation = useClientStore((state) => (host ? state.operationsByHost[host.id] : undefined))
-  const displays = resources?.displays?.displays ?? []
-  const virtualDisplays = resources?.['virtual-displays']?.virtualDisplays ?? []
-  const canManage = host?.apiScopes?.includes('display.manage') ?? false
+interface DisplayModeOption {
+  width: number
+  height: number
+  refreshRate: number
+}
 
-  async function patchDisplay(id: string, revision: number, body: Record<string, unknown>) {
-    if (!host) return
-    await runMutation(onError, () =>
-      mutateCoreResource(host.id, 'PATCH', `/eclipse/v1/displays/${id}`, body, revision),
-    )
+function uniqueResolutions(modes: DisplayModeOption[]) {
+  const seen = new Set<string>()
+  const resolutions: Array<{ width: number; height: number }> = []
+  for (const mode of modes) {
+    const key = `${mode.width}x${mode.height}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    resolutions.push({ width: mode.width, height: mode.height })
   }
+  return resolutions
+}
 
-  async function createVirtualDisplay(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    if (!host) return
-    const form = event.currentTarget
-    const data = new FormData(form)
-    const name = String(data.get('name') ?? '').trim()
-    if (!name) return
-    await runMutation(onError, () =>
-      mutateCoreResource(host.id, 'POST', '/eclipse/v1/virtual-displays', {
-        name,
-        mode: {
-          width: settings.width,
-          height: settings.height,
-          refreshNumerator: settings.fps,
-          refreshDenominator: 1,
-          bitDepth: settings.enableHdr ? 10 : 8,
-          hdr: settings.enableHdr,
-        },
-        position: { x: settings.width, y: 0 },
-        scale: 1,
-        rotation: 0,
-        primary: false,
-        hdr: settings.enableHdr,
-        persistent: true,
-        workspaceId: null,
-      }),
+export function DisplayManager({ host, onError }: CommonProps) {
+  const outputs = useClientStore((state) => state.clientDisplays)
+  const preferences = useClientStore((state) => state.clientDisplayPreferences)
+  const setPreference = useClientStore((state) => state.setClientDisplayPreference)
+  const resetPreferences = useClientStore((state) => state.resetClientDisplayPreferences)
+  const streamedDisplays = enabledClientDisplays(outputs, preferences)
+  const streamedCount = streamedDisplays.length
+
+  function updatePreference(output: ClientDisplayOutput, next: Partial<ClientDisplayPreference>) {
+    const current = effectiveClientDisplay(output, preferences[output.id])
+    const candidate = { ...current, ...next }
+    const modes = output.modes.length
+      ? output.modes
+      : [{ width: output.width, height: output.height, refreshRate: output.refreshRate }]
+    if (!modes.some((mode) => mode.width === candidate.width && mode.height === candidate.height)) {
+      candidate.width = output.width
+      candidate.height = output.height
+    }
+    const resolutionModes = modes.filter(
+      (mode) => mode.width === candidate.width && mode.height === candidate.height,
     )
-    form.reset()
+    if (!resolutionModes.some((mode) => mode.refreshRate === candidate.refreshRate)) {
+      candidate.refreshRate = resolutionModes[0]?.refreshRate ?? output.refreshRate
+    }
+    setPreference(output.id, candidate)
   }
 
   return (
-    <ResourceGate host={host} scope="display.read" capability="displays-v1">
-      {host && (
-        <section className={styles.resourcePage}>
-          <ResourceHeading
-            eyebrow="HOST DISPLAY PLANE"
-            title="Connected displays"
-            count={displays.length}
-            hostId={host.id}
-            resources={['displays', 'display-topology', 'virtual-displays']}
-          />
-          <OperationBanner operation={operation} />
-          <div className={styles.displayResourceGrid}>
-            {displays.map((display) => (
-              <article className={styles.displayResourceCard} key={display.id}>
+    <section className={styles.resourcePage}>
+      <div className={styles.sectionHeading}>
+        <div>
+          <p className={styles.eyebrow}>CLIENT DISPLAY OUTPUTS</p>
+          <h2>Streamed display topology</h2>
+        </div>
+        <div className={styles.resourceHeadingActions}>
+          <span>
+            {streamedCount.toString().padStart(2, '0')} OF{' '}
+            {outputs.length.toString().padStart(2, '0')} STREAMED
+          </span>
+          <button
+            type="button"
+            onClick={() => resetPreferences()}
+            disabled={Object.keys(preferences).length === 0}
+          >
+            <RotateCw size={14} /> Reset
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              void rescanClientDisplays().catch((error: unknown) =>
+                onError(
+                  error instanceof Error ? error.message : 'Terra could not rescan displays.',
+                ),
+              )
+            }
+          >
+            <RefreshCw size={14} /> Rescan
+          </button>
+        </div>
+      </div>
+      <p className={styles.resourceFootnote}>
+        Terra mirrors the displays reported by this client. Enable a subset to stream, leave the
+        rest on the local desktop, and pick a resolution, refresh rate, and HDR per streamed
+        display. Up to four outputs stream at once. Adding, removing, or rearranging outputs is not
+        supported because the host topology always follows the client.
+      </p>
+      {outputs.length === 0 ? (
+        <div className={styles.resourceEmpty}>
+          <CircleAlert size={24} />
+          <div>
+            <h2>No client displays detected</h2>
+            <p>Connect a display and rescan to build a streamed topology.</p>
+          </div>
+        </div>
+      ) : (
+        <div className={styles.displayResourceGrid}>
+          {outputs.map((output, index) => {
+            const preference = effectiveClientDisplay(output, preferences[output.id])
+            const modes = output.modes.length
+              ? output.modes
+              : [{ width: output.width, height: output.height, refreshRate: output.refreshRate }]
+            const resolutions = uniqueResolutions(modes)
+            const refreshRates = Array.from(
+              new Set(
+                modes
+                  .filter(
+                    (mode) => mode.width === preference.width && mode.height === preference.height,
+                  )
+                  .map((mode) => mode.refreshRate),
+              ),
+            ).sort((left, right) => left - right)
+            const canToggle = preference.enabled ? streamedCount > 1 : streamedCount < 4
+            return (
+              <article className={styles.displayResourceCard} key={output.id}>
                 <header>
-                  <span>{display.kind.toUpperCase()}</span>
-                  <code>REV {display.revision}</code>
+                  <span>OUTPUT {index + 1}</span>
+                  <code>{output.primary ? 'PRIMARY' : 'SECONDARY'}</code>
                 </header>
                 <Monitor size={26} />
-                <h3>{display.name}</h3>
+                <h3>{output.name || `Display ${index + 1}`}</h3>
                 <p>
-                  {display.currentMode
-                    ? `${display.currentMode.width} × ${display.currentMode.height} / ${(
-                        display.currentMode.refreshNumerator /
-                          display.currentMode.refreshDenominator
-                      ).toFixed(0)} Hz`
-                    : 'Display disabled'}
+                  {output.width} × {output.height} / {output.refreshRate} Hz
                 </p>
-                <small>
-                  {display.primary ? 'PRIMARY' : 'SECONDARY'} ·{' '}
-                  {display.captureEligible ? 'CAPTURE READY' : 'NOT CAPTURABLE'}
-                </small>
-                {canManage && display.kind === 'physical' && (
-                  <footer>
-                    <select
-                      aria-label={`Mode for ${display.name}`}
-                      value={display.currentMode?.id ?? ''}
+                <small>{preference.enabled ? 'STREAMED' : 'LOCAL ONLY'}</small>
+                <footer>
+                  <label className={styles.displayToggle}>
+                    <input
+                      type="checkbox"
+                      checked={preference.enabled}
+                      disabled={!canToggle}
                       onChange={(event) =>
-                        void patchDisplay(display.id, display.revision, {
-                          modeId: event.currentTarget.value,
-                        })
+                        updatePreference(output, { enabled: event.currentTarget.checked })
                       }
-                    >
-                      {display.supportedModes.map((mode) => (
-                        <option value={mode.id} key={mode.id}>
-                          {mode.width}×{mode.height} @{' '}
-                          {(mode.refreshNumerator / mode.refreshDenominator).toFixed(0)} Hz
-                        </option>
-                      ))}
-                    </select>
-                    {!display.primary && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void patchDisplay(display.id, display.revision, { primary: true })
-                        }
+                    />{' '}
+                    Stream this display
+                  </label>
+                  {preference.enabled && (
+                    <>
+                      <select
+                        aria-label={`Resolution for ${output.name || `Display ${index + 1}`}`}
+                        value={`${preference.width}x${preference.height}`}
+                        onChange={(event) => {
+                          const parts = event.currentTarget.value.split('x')
+                          const width = Number(parts[0] ?? 0)
+                          const height = Number(parts[1] ?? 0)
+                          updatePreference(output, { width, height })
+                        }}
                       >
-                        Make primary
-                      </button>
-                    )}
-                    {display.hdr.supported && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void patchDisplay(display.id, display.revision, {
-                            hdr: !display.hdr.enabled,
+                        {resolutions.map((mode) => (
+                          <option
+                            value={`${mode.width}x${mode.height}`}
+                            key={`${mode.width}x${mode.height}`}
+                          >
+                            {mode.width}×{mode.height}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        aria-label={`Refresh rate for ${output.name || `Display ${index + 1}`}`}
+                        value={preference.refreshRate}
+                        onChange={(event) =>
+                          updatePreference(output, {
+                            refreshRate: Number(event.currentTarget.value),
                           })
                         }
                       >
-                        {display.hdr.enabled ? 'Disable HDR' : 'Enable HDR'}
-                      </button>
-                    )}
-                  </footer>
-                )}
-              </article>
-            ))}
-          </div>
-          {canManage && host.capabilities?.includes('virtual-displays-v1') && (
-            <section className={styles.resourceComposer}>
-              <div>
-                <p className={styles.panelLabel}>VIRTUAL OUTPUT</p>
-                <h3>Create from active stream profile</h3>
-                <p>
-                  {settings.width} × {settings.height} / {settings.fps} Hz ·{' '}
-                  {settings.enableHdr ? 'HDR' : 'SDR'}
-                </p>
-              </div>
-              <form onSubmit={createVirtualDisplay}>
-                <label>
-                  Display name
-                  <input name="name" placeholder="Terra virtual display" required />
-                </label>
-                <button type="submit">
-                  <Plus size={14} /> Create display
-                </button>
-              </form>
-            </section>
-          )}
-          {virtualDisplays.length > 0 && (
-            <div className={styles.compactResourceList}>
-              {virtualDisplays.map((display) => (
-                <article key={display.id}>
-                  <HardDrive size={17} />
-                  <div>
-                    <strong>{display.name}</strong>
-                    <small>
-                      {display.state} · {display.actualMode.width}×{display.actualMode.height} · REV{' '}
-                      {display.revision}
-                    </small>
-                  </div>
-                  {(display.workspaceId || display.sessionId) && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        void runMutation(onError, () =>
-                          mutateCoreResource(
-                            host.id,
-                            'POST',
-                            `/eclipse/v1/virtual-displays/${display.id}/detach`,
-                            {},
-                            display.revision,
-                          ),
-                        )
-                      }
-                    >
-                      Detach
-                    </button>
+                        {refreshRates.map((refreshRate) => (
+                          <option value={refreshRate} key={refreshRate}>
+                            {refreshRate} Hz
+                          </option>
+                        ))}
+                      </select>
+                      <label className={styles.displayToggle}>
+                        <input
+                          type="checkbox"
+                          checked={preference.hdr}
+                          onChange={(event) =>
+                            updatePreference(output, { hdr: event.currentTarget.checked })
+                          }
+                        />{' '}
+                        HDR
+                      </label>
+                    </>
                   )}
-                  <button
-                    type="button"
-                    aria-label={`Delete ${display.name}`}
-                    onClick={() => {
-                      if (!window.confirm(`Delete virtual display ${display.name}?`)) return
-                      void runMutation(onError, () =>
-                        mutateCoreResource(
-                          host.id,
-                          'DELETE',
-                          `/eclipse/v1/virtual-displays/${display.id}`,
-                          {},
-                          display.revision,
-                        ),
-                      )
-                    }}
-                  >
-                    <Trash2 size={13} />
-                  </button>
-                </article>
-              ))}
-            </div>
-          )}
-        </section>
+                </footer>
+              </article>
+            )
+          })}
+        </div>
       )}
-    </ResourceGate>
+      {host && !host.capabilities?.includes('multi-display-streaming-v1') && (
+        <p className={styles.resourceFootnote}>
+          This host does not advertise multi-display streaming. Only the primary enabled output is
+          used until the host supports it.
+        </p>
+      )}
+    </section>
   )
 }
 
 export function WorkspaceManager({
   host,
   apps,
-  settings,
   onError,
   onLaunch,
 }: CommonProps & { onLaunch?: (workspaceId: string, appUuid: string) => void }) {
   const resources = useClientStore((state) => (host ? state.resourcesByHost[host.id] : undefined))
   const operation = useClientStore((state) => (host ? state.operationsByHost[host.id] : undefined))
   const workspaces = resources?.workspaces?.workspaces ?? []
-  const [displayCount, setDisplayCount] = useState(1)
-  const [primaryDisplay, setPrimaryDisplay] = useState(0)
+  const clientDisplays = useClientStore((state) => state.clientDisplays)
+  const clientDisplayPreferences = useClientStore((state) => state.clientDisplayPreferences)
+  const virtualDisplays = clientDisplayVirtualDisplays(clientDisplays, clientDisplayPreferences)
 
   async function createWorkspace(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -363,9 +364,6 @@ export function WorkspaceManager({
     const appUuid = String(data.get('appUuid') ?? '')
     const name = String(data.get('name') ?? '').trim()
     if (!appUuid || !name) return
-    const primaryIndex = Number(data.get('primaryDisplay') ?? 0)
-    const primaryX = Number(data.get(`displayX-${primaryIndex}`) ?? 0)
-    const primaryY = Number(data.get(`displayY-${primaryIndex}`) ?? 0)
     await runMutation(onError, () =>
       mutateCoreResource(host.id, 'POST', '/eclipse/v1/workspaces', {
         name,
@@ -377,29 +375,7 @@ export function WorkspaceManager({
         streamProfileId: null,
         launchProfileId: null,
         sandboxProfileId: null,
-        virtualDisplays: Array.from({ length: displayCount }, (_, index) => {
-          const hdr = Boolean(data.get(`displayHdr-${index}`))
-          return {
-            name: String(data.get(`displayName-${index}`) ?? `Display ${index + 1}`).trim(),
-            mode: {
-              width: Number(data.get(`displayWidth-${index}`) ?? settings.width),
-              height: Number(data.get(`displayHeight-${index}`) ?? settings.height),
-              refreshNumerator: Number(data.get(`displayFps-${index}`) ?? settings.fps),
-              refreshDenominator: 1,
-              bitDepth: hdr ? 10 : 8,
-              hdr,
-            },
-            position: {
-              x: Number(data.get(`displayX-${index}`) ?? index * settings.width) - primaryX,
-              y: Number(data.get(`displayY-${index}`) ?? 0) - primaryY,
-            },
-            scale: 1,
-            rotation: 0,
-            primary: index === primaryIndex,
-            hdr,
-            persistent: true,
-          }
-        }),
+        virtualDisplays: [],
         peripheralPolicy: {
           requiredDeviceIds: [],
           requiredClasses: [],
@@ -472,13 +448,14 @@ export function WorkspaceManager({
                       ) : (
                         <button
                           type="button"
+                          disabled={virtualDisplays.length === 0 || virtualDisplays.length > 4}
                           onClick={() =>
                             void runMutation(onError, () =>
                               mutateCoreResource(
                                 host.id,
                                 'POST',
                                 `/eclipse/v1/workspaces/${workspace.id}/start`,
-                                {},
+                                { virtualDisplays },
                                 workspace.revision,
                               ),
                             )
@@ -533,108 +510,11 @@ export function WorkspaceManager({
                   ))}
               </select>
             </label>
-            {workspaceDisplaySlots.slice(0, displayCount).map((slot, index) => (
-              <fieldset key={slot}>
-                <legend>{`Display ${index + 1}`}</legend>
-                <label>
-                  <input
-                    name="primaryDisplay"
-                    type="radio"
-                    value={index}
-                    checked={primaryDisplay === index}
-                    onChange={() => setPrimaryDisplay(index)}
-                  />{' '}
-                  Primary
-                </label>
-                <label>
-                  Name
-                  <input
-                    name={`displayName-${index}`}
-                    defaultValue={`Display ${index + 1}`}
-                    required
-                  />
-                </label>
-                <label>
-                  Width
-                  <input
-                    name={`displayWidth-${index}`}
-                    type="number"
-                    min="640"
-                    max="16384"
-                    defaultValue={settings.width}
-                    required
-                  />
-                </label>
-                <label>
-                  Height
-                  <input
-                    name={`displayHeight-${index}`}
-                    type="number"
-                    min="480"
-                    max="16384"
-                    defaultValue={settings.height}
-                    required
-                  />
-                </label>
-                <label>
-                  FPS
-                  <input
-                    name={`displayFps-${index}`}
-                    type="number"
-                    min="1"
-                    max="480"
-                    defaultValue={settings.fps}
-                    required
-                  />
-                </label>
-                <label>
-                  X
-                  <input
-                    name={`displayX-${index}`}
-                    type="number"
-                    defaultValue={index * settings.width}
-                    readOnly={index === 0}
-                    required
-                  />
-                </label>
-                <label>
-                  Y
-                  <input
-                    name={`displayY-${index}`}
-                    type="number"
-                    defaultValue={0}
-                    readOnly={index === 0}
-                    required
-                  />
-                </label>
-                <label>
-                  <input
-                    name={`displayHdr-${index}`}
-                    type="checkbox"
-                    defaultChecked={settings.enableHdr}
-                  />{' '}
-                  HDR
-                </label>
-              </fieldset>
-            ))}
-            <button
-              type="button"
-              disabled={displayCount >= 4}
-              onClick={() => setDisplayCount((count) => Math.min(4, count + 1))}
-            >
-              <Plus size={14} /> Virtual display
-            </button>
-            {displayCount > 1 && (
-              <button
-                type="button"
-                onClick={() => {
-                  setDisplayCount((count) => count - 1)
-                  setPrimaryDisplay((index) => Math.min(index, displayCount - 2))
-                }}
-              >
-                Remove display
-              </button>
-            )}
+            <p className={styles.resourceFootnote}>
+              Displays are taken from the client topology on the Display &amp; Topology tab.{' '}
+              {virtualDisplays.length} display{virtualDisplays.length === 1 ? '' : 's'} currently
+              streamed.
+            </p>
             <button type="submit" disabled={!apps.some((app) => app.uuid)}>
               <Plus size={14} /> Create workspace
             </button>

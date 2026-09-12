@@ -1,13 +1,14 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { defaultSettings } from './settings'
-import type { Host } from './store/clientStore'
+import type { ClientDisplayOutput, Host } from './store/clientStore'
 import { useClientStore } from './store/clientStore'
 import { DisplayManager } from './WorkstationResources'
 
 const coreBridge = vi.hoisted(() => ({
   loadCoreResource: vi.fn(),
   mutateCoreResource: vi.fn(),
+  rescanClientDisplays: vi.fn(),
 }))
 
 vi.mock('./native/coreBridge', () => coreBridge)
@@ -30,35 +31,65 @@ const host: Host = {
   lastSeenAt: 1,
   paired: true,
   apiVersion: 1,
-  capabilities: ['displays-v1', 'virtual-displays-v1'],
+  capabilities: ['multi-display-streaming-v1'],
   apiScopes: ['display.read', 'display.manage'],
+}
+
+const output: ClientDisplayOutput = {
+  id: 'display-1',
+  name: 'Desk',
+  primary: true,
+  x: 0,
+  y: 0,
+  width: 2560,
+  height: 1440,
+  refreshRate: 60,
+  modes: [
+    { width: 2560, height: 1440, refreshRate: 60 },
+    { width: 2560, height: 1440, refreshRate: 120 },
+    { width: 1920, height: 1080, refreshRate: 60 },
+  ],
 }
 
 describe('DisplayManager', () => {
   beforeEach(() => {
     coreBridge.loadCoreResource.mockReset()
     coreBridge.mutateCoreResource.mockReset()
-    useClientStore.setState({ resourcesByHost: {}, operationsByHost: {} })
+    coreBridge.rescanClientDisplays.mockReset()
+    useClientStore.setState({
+      resourcesByHost: {},
+      operationsByHost: {},
+      clientDisplays: [output],
+      clientDisplayPreferences: {},
+    })
   })
 
-  it('resets the submitted form after an asynchronous mutation', async () => {
-    let completeMutation: (() => void) | undefined
-    coreBridge.mutateCoreResource.mockImplementation(
-      () =>
-        new Promise<void>((resolve) => {
-          completeMutation = resolve
-        }),
-    )
+  it('persists a per-output HDR preference', () => {
     render(<DisplayManager host={host} apps={[]} settings={defaultSettings} onError={vi.fn()} />)
-    const name = screen.getByLabelText('Display name')
-    const form = name.closest('form') as HTMLFormElement
-    const reset = vi.spyOn(form, 'reset')
 
-    fireEvent.change(name, { target: { value: 'Desk' } })
-    fireEvent.submit(form)
-    await waitFor(() => expect(coreBridge.mutateCoreResource).toHaveBeenCalledOnce())
-    completeMutation?.()
+    fireEvent.click(screen.getByLabelText(/HDR/))
 
-    await waitFor(() => expect(reset).toHaveBeenCalledOnce())
+    expect(useClientStore.getState().clientDisplayPreferences[output.id]?.hdr).toBe(true)
+  })
+
+  it('keeps at least one output streamed', () => {
+    render(<DisplayManager host={host} apps={[]} settings={defaultSettings} onError={vi.fn()} />)
+
+    expect(screen.getByLabelText(/Stream this display/)).toBeChecked()
+    expect(screen.getByLabelText(/Stream this display/)).toBeDisabled()
+  })
+
+  it('repairs refresh rate when the resolution changes', () => {
+    render(<DisplayManager host={host} apps={[]} settings={defaultSettings} onError={vi.fn()} />)
+
+    fireEvent.change(screen.getByLabelText(/Resolution for Desk/), {
+      target: { value: '1920x1080' },
+    })
+    fireEvent.change(screen.getByLabelText(/Refresh rate for Desk/), { target: { value: '60' } })
+
+    const preference = useClientStore.getState().clientDisplayPreferences[output.id]
+    expect(preference?.width).toBe(1920)
+    expect(preference?.height).toBe(1080)
+    expect(preference?.refreshRate).toBe(60)
   })
 })

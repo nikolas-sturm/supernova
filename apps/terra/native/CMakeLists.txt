@@ -213,6 +213,7 @@ add_executable(
   terra-core
   src/control_plane.cpp
   src/audio_renderer.cpp
+  src/client_displays.cpp
   src/gamestream_client.cpp
   src/identity.cpp
   src/input_forwarder.cpp

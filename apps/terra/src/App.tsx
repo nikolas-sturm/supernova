@@ -151,6 +151,7 @@ export function App() {
   const setArtwork = useClientStore((state) => state.setArtwork)
   const setSession = useClientStore((state) => state.setSession)
   const setSolResource = useClientStore((state) => state.setSolResource)
+  const setClientDisplays = useClientStore((state) => state.setClientDisplays)
   const [showAddHost, setShowAddHost] = useState(false)
   const [selectedHostId, setSelectedHostId] = useState<string>()
   const [libraryQuery, setLibraryQuery] = useState('')
@@ -192,10 +193,12 @@ export function App() {
         onArtwork: setArtwork,
         onSession: setSession,
         onSolResource: setSolResource,
+        onClientDisplays: setClientDisplays,
       }),
     [
       setArtwork,
       setBridge,
+      setClientDisplays,
       setHostError,
       setHosts,
       setLibrary,
@@ -260,10 +263,6 @@ export function App() {
     const resources: Array<Parameters<typeof loadCoreResource>[1]> = []
     if (activeView === 'workspaces' && host.capabilities?.includes('workspaces-v1')) {
       resources.push('workspaces')
-    }
-    if (activeView === 'display-topology' && host.capabilities?.includes('displays-v1')) {
-      resources.push('displays', 'display-topology')
-      if (host.capabilities.includes('virtual-displays-v1')) resources.push('virtual-displays')
     }
     if (activeView === 'app-sandboxes' && host.capabilities?.includes('sandboxes-v1')) {
       resources.push('sandboxes')

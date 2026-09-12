@@ -202,6 +202,26 @@ export interface DisplayResource {
   revision: number
 }
 
+export interface ClientDisplayOutput {
+  id: string
+  name: string
+  primary: boolean
+  x: number
+  y: number
+  width: number
+  height: number
+  refreshRate: number
+  modes: Array<{ width: number; height: number; refreshRate: number }>
+}
+
+export interface ClientDisplayPreference {
+  enabled: boolean
+  width: number
+  height: number
+  refreshRate: number
+  hdr: boolean
+}
+
 export interface VirtualDisplayResource {
   id: string
   name: string
@@ -372,6 +392,11 @@ interface ClientState {
   operationsByHost: Record<string, OperationResource | undefined>
   appMode: AppMode
   settingsByMode: Record<AppMode, StreamSettings>
+  clientDisplays: ClientDisplayOutput[]
+  clientDisplayPreferences: Record<string, ClientDisplayPreference>
+  setClientDisplays: (displays: ClientDisplayOutput[]) => void
+  setClientDisplayPreference: (id: string, preference: ClientDisplayPreference) => void
+  resetClientDisplayPreferences: () => void
   setBridge: (bridge: BridgeStatus) => void
   setHosts: (hosts: Host[]) => void
   setHostError: (hostError?: string) => void
@@ -410,6 +435,14 @@ export const useClientStore = create<ClientState>()(
         gaming: { ...defaultSettingsByMode.gaming },
         workstation: { ...defaultSettingsByMode.workstation },
       },
+      clientDisplays: [],
+      clientDisplayPreferences: {},
+      setClientDisplays: (clientDisplays) => set({ clientDisplays }),
+      setClientDisplayPreference: (id, preference) =>
+        set((state) => ({
+          clientDisplayPreferences: { ...state.clientDisplayPreferences, [id]: preference },
+        })),
+      resetClientDisplayPreferences: () => set({ clientDisplayPreferences: {} }),
       setBridge: (bridge) => set({ bridge }),
       setHosts: (hosts) => set({ hosts, hostError: undefined }),
       setHostError: (hostError) => set({ hostError }),
@@ -600,6 +633,7 @@ export const useClientStore = create<ClientState>()(
       partialize: (state) => ({
         appMode: state.appMode,
         settingsByMode: state.settingsByMode,
+        clientDisplayPreferences: state.clientDisplayPreferences,
       }),
       migrate: (persisted, version) => {
         if (version !== 0 || !persisted || typeof persisted !== 'object') return persisted
@@ -624,6 +658,7 @@ export const useClientStore = create<ClientState>()(
           ...defaultSettingsByMode.workstation,
           ...stored.settingsByMode?.workstation,
         })
+        const preferences = stored.clientDisplayPreferences
         return {
           ...current,
           appMode: appMode.success ? appMode.data : 'gaming',
@@ -633,6 +668,8 @@ export const useClientStore = create<ClientState>()(
               ? workstation.data
               : { ...defaultSettingsByMode.workstation },
           },
+          clientDisplayPreferences:
+            preferences && typeof preferences === 'object' ? preferences : {},
         }
       },
       skipHydration: true,

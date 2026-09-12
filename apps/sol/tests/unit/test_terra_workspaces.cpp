@@ -52,6 +52,7 @@ namespace {
     int restore_calls = 0;  ///< Failed stop restoration count.
     bool last_terminate = false;  ///< Last stop mode.
     std::string prepared_owner;  ///< Owner supplied to runtime preparation.
+    std::optional<std::vector<nlohmann::json>> prepared_virtual_displays;  ///< Runtime display override supplied to preparation.
     prepared_t cleaned {false};  ///< IDs passed to failed cleanup.
     std::vector<std::string> restored_ids;  ///< Restored workspace IDs.
     std::vector<std::string> stopped_ids;  ///< Stop-attempt workspace IDs.
@@ -92,6 +93,7 @@ namespace {
         [&](const preparation_t &request, const std::function<bool(const prepared_t &)> &persist) -> std::optional<prepared_t> {
           ++prepare_calls;
           prepared_owner = request.owner_client_uuid;
+          prepared_virtual_displays = request.virtual_displays;
           if (report_preparation_progress) {
             prepared_t progress {true, std::nullopt, std::nullopt, {DISPLAY}, {}};
             if (!persist(progress)) {
@@ -159,6 +161,31 @@ TEST(TerraWorkspacesTest, ParsesExactWireRequests) {
   ASSERT_TRUE(start->profile_overrides.display);
   EXPECT_TRUE(start->profile_overrides.display->is_null());
   EXPECT_FALSE(parse_start_request({{"profileOverrides", {{"unknown", nullptr}}}}));
+
+  const auto displays = parse_start_request({{"virtualDisplays", nlohmann::json::array({{{"name", "Client"}}})}});
+  ASSERT_TRUE(displays);
+  ASSERT_TRUE(displays->virtual_displays);
+  ASSERT_EQ(displays->virtual_displays->size(), 1);
+  EXPECT_FALSE(parse_start_request({{"virtualDisplays", nlohmann::json::array()}}));
+  EXPECT_FALSE(parse_start_request({{"virtualDisplays", "invalid"}}));
+  EXPECT_FALSE(parse_start_request({{"virtualDisplays", nlohmann::json::array({"invalid"})}}));
+}
+
+TEST(TerraWorkspacesTest, AppliesEphemeralVirtualDisplayOverride) {
+  fake_t fake;
+  manager_t manager {fake.callbacks()};
+  ASSERT_EQ(manager.create(OWNER, definition()).status, status_t::success);
+
+  const auto start = parse_start_request({{"virtualDisplays", nlohmann::json::array({{{"name", "Client"}, {"mode", {{"width", 1920}}}}})}});
+  ASSERT_TRUE(start);
+  ASSERT_EQ(manager.start(WORKSPACE, 1, *start).status, status_t::success);
+  ASSERT_TRUE(fake.prepared_virtual_displays);
+  ASSERT_EQ(fake.prepared_virtual_displays->size(), 1);
+  EXPECT_EQ(fake.prepared_virtual_displays->at(0)["name"], "Client");
+
+  ASSERT_EQ(manager.create(OWNER, definition()).status, status_t::success);
+  fake.validation_succeeds = false;
+  EXPECT_EQ(manager.start(WORKSPACE_2, 1, *start).status, status_t::invalid);
 }
 
 TEST(TerraWorkspacesTest, PublishesEveryDurableLifecycleTransition) {

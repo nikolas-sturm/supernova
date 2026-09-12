@@ -318,7 +318,7 @@ describe('App', () => {
     expect(screen.getByRole('button', { name: /Desktop OPEN REMOTELY/ })).toBeEnabled()
   })
 
-  it('renders host-backed workstation display management instead of a placeholder', async () => {
+  it('renders client display topology instead of host display management', async () => {
     useClientStore.setState({
       appMode: 'workstation',
       hosts: [
@@ -341,50 +341,32 @@ describe('App', () => {
           paired: true,
           apiVersion: 1,
           apiPort: 47984,
-          capabilities: ['displays-v1', 'virtual-displays-v1'],
-          apiScopes: ['display.read', 'display.manage', 'virtual-display.manage'],
+          capabilities: ['multi-display-streaming-v1'],
+          apiScopes: ['display.read', 'display.manage'],
         },
       ],
-      resourcesByHost: {
-        'host-1': {
-          displays: {
-            revision: 3,
-            displays: [
-              {
-                id: '11111111-1111-4111-8111-111111111111',
-                name: 'Studio Display',
-                kind: 'physical',
-                enabled: true,
-                primary: true,
-                position: { x: 0, y: 0 },
-                currentMode: {
-                  id: '2560x1440@60',
-                  width: 2560,
-                  height: 1440,
-                  refreshNumerator: 60,
-                  refreshDenominator: 1,
-                  bitDepth: 10,
-                  hdr: true,
-                },
-                supportedModes: [],
-                hdr: { supported: true, enabled: true },
-                captureEligible: true,
-                revision: 3,
-              },
-            ],
-          },
-          'virtual-displays': { revision: 1, virtualDisplays: [] },
+      clientDisplays: [
+        {
+          id: 'display-1',
+          name: 'Studio Display',
+          primary: true,
+          x: 0,
+          y: 0,
+          width: 2560,
+          height: 1440,
+          refreshRate: 60,
+          modes: [{ width: 2560, height: 1440, refreshRate: 60 }],
         },
-      },
+      ],
     })
 
     render(<App />)
     fireEvent.click(screen.getByRole('button', { name: 'Display & Topology' }))
 
-    expect(await screen.findByRole('heading', { name: 'Connected displays' })).toBeVisible()
+    expect(await screen.findByRole('heading', { name: 'Streamed display topology' })).toBeVisible()
     expect(screen.getByRole('heading', { name: 'Studio Display' })).toBeVisible()
     expect(screen.getByText('2560 × 1440 / 60 Hz')).toBeVisible()
-    expect(screen.queryByText('Display topology is coming online.')).not.toBeInTheDocument()
+    expect(screen.getByLabelText(/Stream this display/)).toBeChecked()
   })
 
   it('reports native rendering and exposes session stop', async () => {

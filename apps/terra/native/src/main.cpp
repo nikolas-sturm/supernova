@@ -19,6 +19,7 @@
 #include <ixwebsocket/IXWebSocket.h>
 #include <nlohmann/json.hpp>
 
+#include "client_displays.h"
 #include "control_plane.h"
 #include "mdns_discovery.h"
 #include "stream_worker_protocol.h"
@@ -97,6 +98,29 @@ Json makeStatus() {
         {"moonlightCommonRevision", TERRA_MOONLIGHT_COMMON_REVISION},
         {"streamingAvailable", streamingAvailable},
     };
+}
+
+Json clientDisplaysJson() {
+    Json displays = Json::array();
+    for (const auto& output : terra::enumerateClientDisplays()) {
+        Json modes = Json::array();
+        for (const auto& mode : output.modes) {
+            modes.push_back(
+                {{"width", mode.width}, {"height", mode.height}, {"refreshRate", mode.refreshRate}});
+        }
+        displays.push_back({
+            {"id", output.id},
+            {"name", output.name},
+            {"primary", output.primary},
+            {"x", output.x},
+            {"y", output.y},
+            {"width", output.width},
+            {"height", output.height},
+            {"refreshRate", output.refreshRate},
+            {"modes", std::move(modes)},
+        });
+    }
+    return displays;
 }
 
 Json hostJson(const terra::HostRecord& host) {
@@ -337,6 +361,11 @@ int main(int argc, char** argv) {
         const auto publishHostError = [&](const std::string& message) {
             broadcast(socket, context, "terra.host.error",
                       {{"schemaVersion", 1}, {"message", message}});
+        };
+
+        const auto publishClientDisplays = [&] {
+            broadcast(socket, context, "terra.client-displays.changed",
+                      {{"schemaVersion", 1}, {"displays", clientDisplaysJson()}});
         };
 
         const auto probeHost = [&](const std::string& hostId) {
@@ -652,6 +681,7 @@ int main(int argc, char** argv) {
                     std::cout << "[terra-core] connected" << std::endl;
                     broadcast(socket, context, "terra.core.status", makeStatus());
                     publishHosts();
+                    publishClientDisplays();
                     for (const auto& hostId : controlPlane.hostIds()) {
                         probeHost(hostId);
                     }
@@ -665,6 +695,8 @@ int main(int argc, char** argv) {
                     const auto event = payload.value("event", "");
                     if (event == "core.status") {
                         broadcast(socket, context, "terra.core.status", makeStatus());
+                    } else if (event == "client.displays.rescan") {
+                        publishClientDisplays();
                     } else if (event == "hosts.list") {
                         publishHosts();
                     } else if (event == "discovery.configure") {
