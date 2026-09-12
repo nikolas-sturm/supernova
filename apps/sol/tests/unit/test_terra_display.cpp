@@ -4,6 +4,9 @@
  */
 
 #ifdef _WIN32
+  // local includes
+  #include <src/nvhttp.h>
+
   // platform includes
   #include <windows.h>
 
@@ -162,5 +165,17 @@ TEST(TerraDisplayTest, SerializesPhysicalDisplayKind) {
   snapshot.kind = Kind::Internal;
 
   EXPECT_EQ(to_json(snapshot).at("kind"), "physical");
+}
+
+TEST(TerraDisplayTest, PreservesUnknownHdrStateInTopology) {
+  Snapshot snapshot;
+  snapshot.resource_uuid = "aaaaaaaa-aaaa-8aaa-8aaa-aaaaaaaaaaaa";
+  snapshot.enabled = true;
+  snapshot.primary = true;
+
+  const auto topology = nvhttp::test_support::topology_document(nlohmann::json::array({to_json(snapshot)}));
+
+  ASSERT_EQ(topology.at("displays").size(), 1);
+  EXPECT_TRUE(topology.at("displays").front().at("hdr").is_null());
 }
 #endif

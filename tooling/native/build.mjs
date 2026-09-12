@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const root = fileURLToPath(new URL('../../', import.meta.url))
 export const usage =
-  'Usage: node tooling/native/build.mjs <sol|terra> <configure|build|test> <debug|release> [--dev]'
+  'Usage: node tooling/native/build.mjs <sol|terra|vdd> <configure|build|test> <debug|release> [--dev]'
 
 /** Validate the public CLI before inspecting or invoking native tools. */
 export function parseArgs(args) {
@@ -14,7 +14,7 @@ export function parseArgs(args) {
   if (
     (args.length !== 3 &&
       !(args.length === 4 && args[3] === '--dev' && app === 'sol' && config === 'debug')) ||
-    !['sol', 'terra'].includes(app) ||
+    !['sol', 'terra', 'vdd'].includes(app) ||
     !['configure', 'build', 'test'].includes(operation) ||
     !['debug', 'release'].includes(config)
   ) {
@@ -25,9 +25,20 @@ export function parseArgs(args) {
 
 /** Keep upstream source roots and all generated outputs config-specific. */
 export function commandsFor({ app, operation, config, dev = false }, platform = process.platform) {
-  const appRoot = path.join(root, 'apps', app)
-  const source = app === 'terra' ? path.join(appRoot, 'native') : appRoot
-  const build = path.join(appRoot, `cmake-build-${platform}-${dev ? 'dev-' : ''}${config}`)
+  if (app === 'vdd' && platform !== 'win32') {
+    throw new Error('Supernova VDD supports Windows only.')
+  }
+  const appRoot = path.join(root, 'apps', app === 'vdd' ? 'sol' : app)
+  const source =
+    app === 'terra'
+      ? path.join(appRoot, 'native')
+      : app === 'vdd'
+        ? path.join(appRoot, 'third-party', 'vdd')
+        : appRoot
+  const build = path.join(
+    appRoot,
+    `cmake-build-${platform}-${app === 'vdd' ? 'vdd-' : ''}${dev ? 'dev-' : ''}${config}`,
+  )
   const configuration = config === 'debug' ? 'Debug' : 'Release'
   if (operation === 'configure') {
     const command = [
@@ -40,11 +51,13 @@ export function commandsFor({ app, operation, config, dev = false }, platform = 
       'Ninja',
       `-DCMAKE_BUILD_TYPE=${configuration}`,
     ]
-    if (platform === 'win32') {
+    if (platform === 'win32' && app !== 'vdd') {
       command.push('-DCMAKE_C_COMPILER=gcc', '-DCMAKE_CXX_COMPILER=g++')
     }
     command.push(
-      ...(app === 'sol'
+      ...(app === 'vdd'
+        ? [`-DVDD_CONFIGURATION=${configuration}`, '-DVDD_PLATFORM=x64']
+        : app === 'sol'
         ? ['-DSOL_BUILD_WEB_UI=OFF', '-DBUILD_DOCS=OFF', '-DBUILD_TESTS=ON']
         : ['-DBUILD_TESTING=ON']),
     )
@@ -92,7 +105,12 @@ export function main(args) {
       )
     }
     // Tool names must resolve inside UCRT64, never another MinGW/MSVC installation.
-    const tools = ['cmake', 'ninja', 'gcc', 'g++', 'ctest']
+    const tools = [
+      'cmake',
+      'ninja',
+      'ctest',
+      ...(options.app === 'vdd' ? [] : ['gcc', 'g++']),
+    ]
     const checks = tools.map(
       (tool) =>
         `[ -x /ucrt64/bin/${tool}.exe ] || { echo 'Missing UCRT64 tool: ${tool}' >&2; exit 1; }`,

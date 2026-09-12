@@ -15,7 +15,7 @@
  * @brief MikeTheTech Virtual Display Driver control operations.
  */
 namespace mttvdd {
-  constexpr std::uint32_t MAX_DISPLAY_COUNT = 99;  ///< Maximum display count accepted by upstream Virtual Driver Control.
+  constexpr std::uint32_t MAX_DISPLAY_COUNT = 16;  ///< Maximum display count exposed by the vendored driver adapter.
 
   /**
    * @brief Result of probing the installed MttVDD control protocol.

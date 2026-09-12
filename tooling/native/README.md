@@ -4,7 +4,7 @@ Run from any working directory using Node.js; no npm dependencies are needed by
 the wrapper. Supported hosts: Windows MSYS2 UCRT64 and Linux only.
 
 ```text
-node tooling/native/build.mjs <sol|terra> <configure|build|test> <debug|release> [--dev]
+node tooling/native/build.mjs <sol|terra|vdd> <configure|build|test> <debug|release> [--dev]
 node --test tooling/native/build.test.mjs
 ```
 
@@ -17,6 +17,7 @@ directory; Terra tests use CTest and fail if no tests are registered.
 | --- | --- | --- |
 | Sol | `apps/sol` | `apps/sol/cmake-build-<win32\|linux>-<debug\|release>` |
 | Terra | `apps/terra/native` | `apps/terra/cmake-build-<win32\|linux>-<debug\|release>` |
+| VDD | `apps/sol/third-party/vdd` | `apps/sol/cmake-build-win32-vdd-<debug\|release>` |
 
 ## Prerequisites
 
@@ -24,6 +25,11 @@ directory; Terra tests use CTest and fail if no tests are registered.
   Set `SUPERNOVA_MSYS2_SHELL` to an explicit absolute `msys2_shell.cmd` path for
   another installation. The wrapper always selects `-ucrt64` and checks tools
   under `/ucrt64/bin`; it never falls back to MSVC or another MinGW environment.
+- VDD additionally requires Visual Studio 2022 17.13+ C++ Build Tools with Windows
+  Driver Kit Build Tools, x64/x86 Spectre-mitigated libraries, ATL with Spectre
+  mitigations, and a matching Windows SDK/WDK pair. UCRT64 CMake/Ninja orchestrate
+  its existing WDK/MSBuild project; GCC never compiles driver sources. VDD is
+  Windows-only and remains separate from normal Sol builds.
 - Linux: CMake 3.24+, Ninja, CTest, and a C++23 compiler on PATH. `CC` and `CXX`
   can select explicit compiler executables. No MSYS2 or command shell is used.
 - Initialize upstream recursive submodules and provide each app's existing

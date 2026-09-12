@@ -509,6 +509,16 @@ namespace nvhttp {
      */
     nlohmann::json catalog_app_document(const proc::ctx_t &app);
 
+#ifdef _WIN32
+    /**
+     * @brief Build a display topology document through production serialization logic.
+     *
+     * @param displays Unified display resources.
+     * @return Display topology resource.
+     */
+    nlohmann::json topology_document(nlohmann::json displays);
+#endif
+
     /**
      * @brief Project event resynchronization collections through client scopes.
      *

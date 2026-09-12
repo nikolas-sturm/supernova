@@ -25,6 +25,12 @@ endif()
 
 target_link_libraries(sol ${SOL_EXTERNAL_LIBRARIES} ${EXTRA_LIBS})
 target_compile_definitions(sol PUBLIC ${SOL_DEFINITIONS})
+# Git-derived version changes should rebuild only sources that expose the version.
+set_source_files_properties(
+        "${CMAKE_SOURCE_DIR}/src/confighttp.cpp"
+        "${CMAKE_SOURCE_DIR}/src/main.cpp"
+        "${CMAKE_SOURCE_DIR}/src/nvhttp.cpp"
+        PROPERTIES COMPILE_DEFINITIONS "${SOL_VERSION_DEFINITIONS}")
 
 # CLion complains about unknown flags after running cmake, and cannot add symbols to the index for cuda files
 if(CUDA_INHERIT_COMPILE_OPTIONS)

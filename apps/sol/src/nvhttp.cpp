@@ -4558,6 +4558,7 @@ namespace nvhttp {
   nlohmann::json terra_topology_document(nlohmann::json displays, const verified_client_t *client) {
     nlohmann::json entries = nlohmann::json::array();
     for (const auto &display : displays) {
+      const auto &hdr = display.at("hdr");
       entries.push_back({
         {"id", display.at("id")},
         {"enabled", display.at("enabled")},
@@ -4567,7 +4568,7 @@ namespace nvhttp {
         {"scale", display.at("scale")},
         {"rotation", display.value("rotation", 0)},
         {"modeId", display.at("currentMode").is_null() ? nlohmann::json(nullptr) : nlohmann::json(display.at("currentMode").at("id"))},
-        {"hdr", display.at("hdr").is_object() ? nlohmann::json(display.at("hdr").value("enabled", false)) : nlohmann::json(nullptr)},
+        {"hdr", hdr.is_object() && hdr.contains("enabled") && hdr.at("enabled").is_boolean() ? hdr.at("enabled") : nlohmann::json(nullptr)},
       });
     }
     const auto fingerprint = entries.dump();
@@ -4593,12 +4594,17 @@ namespace nvhttp {
     if (!client) {
       return;
     }
-    auto snapshot = terra_unified_displays(&*client);
-    if (!snapshot) {
-      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Windows display inventory is unavailable");
-      return;
+    try {
+      auto snapshot = terra_unified_displays(&*client);
+      if (!snapshot) {
+        send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "Windows display inventory is unavailable");
+        return;
+      }
+      send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"topology", terra_topology_document(std::move(snapshot->second), &*client)}});
+    } catch (const std::exception &exception) {
+      BOOST_LOG(error) << "Failed to build Terra display topology: " << exception.what();
+      send_terra_error(response, SimpleWeb::StatusCode::server_error_internal_server_error, "provider_failure", "Failed to build display topology");
     }
-    send_terra_response(response, SimpleWeb::StatusCode::success_ok, {{"topology", terra_topology_document(std::move(snapshot->second), &*client)}});
   }
 
   /**
@@ -4953,6 +4959,7 @@ namespace nvhttp {
     );
     const auto after = terra_unified_displays(&*client);
     if (!applied || !after) {
+      BOOST_LOG(error) << "Terra display patch failed for [" << display_id << "]: applied=" << applied << " inventory=" << static_cast<bool>(after);
       display_device::revert_configuration();
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "host_failure", "Display state could not be applied; requested state was reverted");
       return;
@@ -4962,6 +4969,7 @@ namespace nvhttp {
     });
     const bool matches = updated != after->second.end() && (!body->contains("enabled") || updated->at("enabled") == body->at("enabled")) && (!body->contains("primary") || updated->at("primary") == body->at("primary")) && (mode.is_null() || (!updated->at("currentMode").is_null() && updated->at("currentMode").at("id") == mode.at("id"))) && (!body->contains("hdr") || body->at("hdr").is_null() || updated->at("hdrEnabled") == body->at("hdr"));
     if (!matches) {
+      BOOST_LOG(error) << "Terra display patch did not verify for [" << display_id << "]: found=" << (updated != after->second.end()) << " wantMode=" << (mode.is_null() ? std::string {"none"} : mode.at("id").get<std::string>()) << " gotMode=" << (updated != after->second.end() && !updated->at("currentMode").is_null() ? updated->at("currentMode").at("id").get<std::string>() : std::string {"none"});
       display_device::revert_configuration();
       send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "host_failure", "Display did not reach requested state; previous configuration was restored");
       return;
@@ -11451,6 +11459,12 @@ namespace nvhttp {
     nlohmann::json catalog_app_document(const proc::ctx_t &app) {
       return terra_app_json(app);
     }
+
+#ifdef _WIN32
+    nlohmann::json topology_document(nlohmann::json displays) {
+      return terra_topology_document(std::move(displays));
+    }
+#endif
 
     std::vector<std::string> event_collections(const terra_api::client_permissions_t &permissions) {
       return terra_event_collections(permissions);

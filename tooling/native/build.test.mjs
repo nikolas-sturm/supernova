@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url'
 import { commandsFor, parseArgs, shellQuote } from './build.mjs'
 
 test('accepts every documented app, operation and configuration', () => {
-  for (const app of ['sol', 'terra']) {
+  for (const app of ['sol', 'terra', 'vdd']) {
     for (const operation of ['configure', 'build', 'test']) {
       for (const config of ['debug', 'release']) {
         assert.deepEqual(parseArgs([app, operation, config]), { app, operation, config })
@@ -65,6 +65,12 @@ test('configure preserves upstream roots and isolates configurations', () => {
     assert.ok(release.includes('-DCMAKE_BUILD_TYPE=Release'))
     if (app === 'sol') assert.ok(debug.includes('-DSOL_BUILD_WEB_UI=OFF'))
   }
+
+  const vdd = commandsFor({ app: 'vdd', operation: 'configure', config: 'release' }, 'win32')[0]
+  assert.ok(vdd[2].endsWith(path.join('apps', 'sol', 'third-party', 'vdd')))
+  assert.ok(vdd[4].endsWith(path.join('apps', 'sol', 'cmake-build-win32-vdd-release')))
+  assert.ok(vdd.includes('-DVDD_CONFIGURATION=Release'))
+  assert.ok(vdd.includes('-DVDD_PLATFORM=x64'))
 })
 
 test('Windows explicitly selects GCC and Terra stages only after build', () => {
@@ -73,6 +79,8 @@ test('Windows explicitly selects GCC and Terra stages only after build', () => {
     'win32',
   )[0]
   assert.ok(configure.includes('-DCMAKE_CXX_COMPILER=g++'))
+  const vdd = commandsFor({ app: 'vdd', operation: 'configure', config: 'debug' }, 'win32')[0]
+  assert.ok(!vdd.some((argument) => argument.startsWith('-DCMAKE_CXX_COMPILER=')))
   const commands = commandsFor({ app: 'terra', operation: 'build', config: 'debug' })
   assert.equal(commands.length, 2)
   assert.equal(commands[0].at(-1), '--parallel')
@@ -85,6 +93,46 @@ test('test uses Sol executable and Terra CTest with no-tests failure', () => {
   assert.ok(commandsFor(options, 'win32')[0][0].endsWith(path.join('tests', 'test_sol.exe')))
   assert.ok(commandsFor(options, 'linux')[0][0].endsWith(path.join('tests', 'test_sol')))
   assert.ok(commandsFor({ ...options, app: 'terra' })[0].includes('--no-tests=error'))
+  assert.ok(commandsFor({ ...options, app: 'vdd' }, 'win32')[0].includes('--no-tests=error'))
+})
+
+test('VDD rejects unsupported hosts', () => {
+  assert.throws(
+    () => commandsFor({ app: 'vdd', operation: 'build', config: 'debug' }, 'linux'),
+    /Windows only/,
+  )
+})
+
+test('VDD uses dynamic monitor lifecycle instead of reinitializing from a pipe handle', () => {
+  const source = readFileSync(
+    new URL(
+      '../../apps/sol/third-party/vdd/Virtual Display Driver (HDR)/MttVDD/Driver.cpp',
+      import.meta.url,
+    ),
+    'utf8',
+  )
+  const project = readFileSync(
+    new URL(
+      '../../apps/sol/third-party/vdd/Virtual Display Driver (HDR)/MttVDD/MttVDD.vcxproj',
+      import.meta.url,
+    ),
+    'utf8',
+  )
+  const build = readFileSync(
+    new URL('../../apps/sol/third-party/vdd/CMakeLists.txt', import.meta.url),
+    'utf8',
+  )
+  assert.doesNotMatch(source, /WdfObjectGet_IndirectDeviceContextWrapper\(hPipe\)/)
+  assert.match(source, /SetMonitorCount\(newDisplayCount\)/)
+  assert.match(source, /IddCxMonitorDeparture\(m_Monitors\.back\(\)\)/)
+  assert.match(source, /PIPE_REJECT_REMOTE_CLIENTS/)
+  assert.match(source, /FILE_FLAG_OVERLAPPED/)
+  assert.match(source, /WaitForPipeIo/)
+  assert.doesNotMatch(source, /CancelSynchronousIo/)
+  assert.match(project, /<LanguageStandard>stdcpp23<\/LanguageStandard>/)
+  assert.match(build, /TO_NATIVE_PATH.*VDD_PACKAGE_DIR_NATIVE/)
+  assert.match(build, /\/p:SkipPackageVerification=true/)
+  assert.match(build, /VDD_INFVERIF_EXECUTABLE.*\/u/s)
 })
 
 test('shell quoting preserves spaces, quotes and metacharacters as data', () => {

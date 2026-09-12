@@ -105,6 +105,19 @@ test('native targets stay uncached with complete configuration chains', () => {
   }
 })
 
+test('Sol Git version definitions rebuild only version-reporting sources', () => {
+  const version = read('apps/sol/cmake/prep/build_version.cmake')
+  const target = read('apps/sol/cmake/targets/common.cmake')
+  const tests = read('apps/sol/tests/CMakeLists.txt')
+  assert.match(version, /set\(SOL_VERSION_DEFINITIONS/)
+  assert.doesNotMatch(version, /SOL_DEFINITIONS PROJECT_VERSION=/)
+  for (const source of ['confighttp.cpp', 'main.cpp', 'nvhttp.cpp']) {
+    assert.match(target, new RegExp(`src/${source.replace('.', '\\.')}`))
+  }
+  assert.match(target, /PROPERTIES COMPILE_DEFINITIONS "\$\{SOL_VERSION_DEFINITIONS\}"/)
+  assert.match(tests, /PROPERTIES COMPILE_DEFINITIONS "\$\{SOL_VERSION_DEFINITIONS\}"/)
+})
+
 test('Sol preserves Sunshine port defaults, offsets, and discovery mapping', () => {
   const upstream = '74273db90c7eb8ce6b6d07d009ffc4066f015611'
   const original = (file) => git('show', `${upstream}:src/${file}`)

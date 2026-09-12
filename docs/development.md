@@ -185,6 +185,9 @@ node tooling/native/build.mjs sol test debug
 node tooling/native/build.mjs terra configure debug
 node tooling/native/build.mjs terra build debug
 node tooling/native/build.mjs terra test debug
+node tooling/native/build.mjs vdd configure debug
+node tooling/native/build.mjs vdd build debug
+node tooling/native/build.mjs vdd test debug
 ```
 
 Use `release` instead of `debug` for the release configuration. Run each step only
@@ -197,6 +200,7 @@ configure/build/test dependencies. They use the same non-daemon workspace mode.
 | --- | --- | --- |
 | Sol | `apps/sol` | `apps/sol/cmake-build-<platform>-<config>` |
 | Terra | `apps/terra/native` | `apps/terra/cmake-build-<platform>-<config>` |
+| VDD | `apps/sol/third-party/vdd` | `apps/sol/cmake-build-win32-vdd-<config>` |
 
 `platform` is `win32` or `linux`; `config` is `debug` or `release`. Never share a
 build tree across apps, configurations, platforms, or toolchains. A separate
@@ -212,6 +216,12 @@ Use MSYS2 UCRT64, not MSVC or another MinGW environment. The wrapper launches
 `SUPERNOVA_MSYS2_SHELL` may specify an absolute path to another MSYS2 installation.
 Required tools include CMake, Ninja, GCC/G++, and CTest, plus each app's native
 dependencies such as OpenSSL.
+
+VDD is a separate Windows-only UMDF artifact. Its wrapper uses UCRT64 CMake and
+Ninja for orchestration, then invokes the vendored project's MSBuild/WDK rules;
+it never compiles driver code with GCC. Building VDD requires Visual Studio 2022 17.13+
+C++ Build Tools and the Windows Driver Kit. It does not install the driver or
+trust a signing certificate.
 
 The local UCRT64 environment has CMake 4.4.2, Ninja, and GCC 16.2. Sol keeps
 its **Boost 1.89.0** requirement despite system Boost 1.92; the existing pinned

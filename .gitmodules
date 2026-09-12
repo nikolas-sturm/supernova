@@ -49,3 +49,6 @@
 [submodule "terra/moonlight-qt"]
 	path = apps/terra/refs/moonlight-qt
 	url = https://github.com/moonlight-stream/moonlight-qt.git
+[submodule "progenitor/vdd"]
+	path = apps/sol/third-party/vdd
+	url = https://github.com/nikolas-sturm/vdd.git

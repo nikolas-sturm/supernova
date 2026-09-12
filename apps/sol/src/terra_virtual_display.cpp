@@ -13,6 +13,7 @@
 #include <utility>
 
 // local includes
+#include "logging.h"
 #include "terra_virtual_display.h"
 #include "utility.h"
 #include "uuid.h"
@@ -234,19 +235,23 @@ namespace terra_virtual_display {
     std::optional<std::pair<std::uint32_t, std::set<std::string>>> provider_state() const {
       try {
         if (!callbacks.provider_healthy || !callbacks.provider_healthy()) {
+          BOOST_LOG(error) << "Terra virtual display provider_state: provider unhealthy";
           return std::nullopt;
         }
         const auto count = callbacks.read_count ? callbacks.read_count() : std::nullopt;
         const auto inventory = callbacks.inventory ? callbacks.inventory() : std::nullopt;
         if (!count || !inventory || inventory->size() != *count) {
+          BOOST_LOG(error) << "Terra virtual display provider_state: count=" << (count ? std::to_string(*count) : std::string {"unavailable"}) << " inventory=" << (inventory ? std::to_string(inventory->size()) : std::string {"unavailable"});
           return std::nullopt;
         }
         std::set<std::string> ids(inventory->begin(), inventory->end());
         if (ids.size() != inventory->size()) {
+          BOOST_LOG(error) << "Terra virtual display provider_state: duplicate inventory ids";
           return std::nullopt;
         }
         return std::pair {*count, std::move(ids)};
       } catch (...) {
+        BOOST_LOG(error) << "Terra virtual display provider_state: threw";
         return std::nullopt;
       }
     }
@@ -268,7 +273,7 @@ namespace terra_virtual_display {
      * @param values Candidate resources updated with actual modes.
      * @return True when provider applied and returned valid results.
      */
-    bool apply(decltype(resources) &values) const {
+    bool apply(decltype(resources) &values, const decltype(resources) *published = nullptr) const {
       std::vector<platform_configuration_t> configurations;
       for (const auto &[id, resource] : values) {
         configurations.push_back({resource.platform_id, specification(resource), resource.actual_mode});
@@ -285,7 +290,14 @@ namespace terra_virtual_display {
         if (configurations[index].platform_id != resource.platform_id || configurations[index].actual_mode.id.empty() || !valid_mode(configurations[index].actual_mode)) {
           return false;
         }
+        if (published) {
+          const auto published_resource = published->find(id);
+          if (published_resource != published->end() && resource.revision == published_resource->second.revision && (resource.position.x != configurations[index].actual_mode.position.x || resource.position.y != configurations[index].actual_mode.position.y)) {
+            ++resource.revision;
+          }
+        }
         resource.actual_mode = configurations[index++].actual_mode;
+        resource.position = resource.actual_mode.position;
       }
       return true;
     }
@@ -444,6 +456,7 @@ namespace terra_virtual_display {
           value.at("platformId").get<std::string>()
         };
         resource.actual_mode = parse_actual_mode(value.at("actualMode"));
+        resource.actual_mode.position = resource.position;
         if (!value.at("ownerClientUuid").is_null()) {
           resource.owner_client_uuid = value.at("ownerClientUuid").get<std::string>();
         }
@@ -482,6 +495,17 @@ namespace terra_virtual_display {
         }
       }
       const auto target = static_cast<std::uint32_t>(impl_->baseline_count + impl_->resources.size());
+      if (impl_->resources.empty() && provider->first == impl_->baseline_count && provider->second == impl_->baseline_ids) {
+        if (!loaded_resources.empty()) {
+          ++impl_->collection_revision;
+          if (!impl_->save(impl_->resources, impl_->collection_revision)) {
+            return;
+          }
+          impl_->notify(loaded_resources, impl_->resources);
+        }
+        impl_->usable = true;
+        return;
+      }
       if (!impl_->capture_configuration()) {
         return;
       }
@@ -544,7 +568,7 @@ namespace terra_virtual_display {
           }
         }
       }
-      if (!impl_->apply(impl_->resources)) {
+      if (!impl_->apply(impl_->resources, &loaded_resources)) {
         return;
       }
       ++impl_->collection_revision;
@@ -594,20 +618,24 @@ namespace terra_virtual_display {
     const auto before = impl_->provider_state();
     const auto expected = static_cast<std::uint32_t>(impl_->baseline_count + impl_->resources.size());
     if (!before || before->first != expected) {
+      BOOST_LOG(error) << "Terra virtual display create: provider count drift, expected " << expected << " observed " << (before ? std::to_string(before->first) : std::string {"unavailable"});
       return {status_t::provider_error, std::nullopt};
     }
     if (expected >= impl_->callbacks.max_count) {
       return {status_t::limit_reached, std::nullopt};
     }
     if (!impl_->capture_configuration()) {
+      BOOST_LOG(error) << "Terra virtual display create: rollback capture failed";
       return {status_t::provider_error, std::nullopt};
     }
     try {
       if (!impl_->callbacks.set_count || !impl_->callbacks.set_count(expected + 1)) {
+        BOOST_LOG(error) << "Terra virtual display create: provider count update to " << (expected + 1) << " failed";
         impl_->rollback_or_disable(expected);
         return {status_t::provider_error, std::nullopt};
       }
     } catch (...) {
+      BOOST_LOG(error) << "Terra virtual display create: provider count update threw";
       impl_->rollback_or_disable(expected);
       return {status_t::provider_error, std::nullopt};
     }
@@ -617,6 +645,7 @@ namespace terra_virtual_display {
       std::set_difference(after->second.begin(), after->second.end(), before->second.begin(), before->second.end(), std::back_inserter(added));
     }
     if (!after || after->first != expected + 1 || added.size() != 1) {
+      BOOST_LOG(error) << "Terra virtual display create: provider inventory mismatch after update, count " << (after ? std::to_string(after->first) : std::string {"unavailable"}) << " added " << added.size();
       impl_->rollback_or_disable(expected);
       return {status_t::provider_error, std::nullopt};
     }
@@ -624,7 +653,7 @@ namespace terra_virtual_display {
     const auto previous = impl_->resources;
     auto candidate = impl_->resources;
     candidate.emplace(resource.id, resource);
-    if (!impl_->apply(candidate)) {
+    if (!impl_->apply(candidate, &previous)) {
       impl_->rollback_or_disable(expected);
       return {status_t::provider_error, std::nullopt};
     }
@@ -701,7 +730,7 @@ namespace terra_virtual_display {
       candidate.emplace(resource.id, resource);
       resources.push_back(std::move(resource));
     }
-    if (!impl_->apply(candidate) || std::ranges::any_of(resources, [&](const auto &resource) {
+    if (!impl_->apply(candidate, &previous) || std::ranges::any_of(resources, [&](const auto &resource) {
           return !mode_matches(resource.requested_mode, candidate.at(resource.id).actual_mode);
         })) {
       impl_->rollback_or_disable(expected);
@@ -791,7 +820,7 @@ namespace terra_virtual_display {
     if (!impl_->capture_configuration()) {
       return {status_t::provider_error, std::nullopt};
     }
-    if (!impl_->apply(candidate)) {
+    if (!impl_->apply(candidate, &previous)) {
       impl_->reapply_or_disable();
       return {status_t::provider_error, std::nullopt};
     }
@@ -859,7 +888,7 @@ namespace terra_virtual_display {
       survivor->second.platform_id = target_platform;
       ++survivor->second.revision;
     }
-    if (!candidate.empty() && !impl_->apply(candidate)) {
+    if (!candidate.empty() && !impl_->apply(candidate, &previous)) {
       impl_->rollback_or_disable(expected);
       return {status_t::provider_error, std::nullopt};
     }
@@ -1050,7 +1079,7 @@ namespace terra_virtual_display {
           ++resource.revision;
         }
       }
-      if (!replacements.empty() || (!candidate.empty() && !impl_->apply(candidate))) {
+      if (!replacements.empty() || (!candidate.empty() && !impl_->apply(candidate, &previous))) {
         impl_->rollback_or_disable(expected);
         return status_t::provider_error;
       }

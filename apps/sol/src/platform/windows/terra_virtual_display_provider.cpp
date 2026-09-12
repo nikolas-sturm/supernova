@@ -121,14 +121,13 @@ namespace terra::windows::virtual_display {
       auto api_layer = std::make_shared<display_device::WinApiLayer>();
       display_device::WinDisplayDevice display_api {api_layer};
       if (!display_api.isApiAccessAvailable()) {
+        BOOST_LOG(error) << "Terra MttVDD: rollback capture failed: display API unavailable";
         return false;
       }
       const auto topology = display_api.getCurrentTopology();
       const auto devices = display_api.enumAvailableDevices();
-      const auto primary = std::ranges::find_if(devices, [](const auto &device) {
-        return device.m_info && device.m_info->m_primary;
-      });
-      if (!display_api.isTopologyValid(topology) || primary == devices.end()) {
+      if (!display_api.isTopologyValid(topology)) {
+        BOOST_LOG(error) << "Terra MttVDD: rollback capture failed: invalid current topology";
         return false;
       }
       display_device::StringSet active_ids;
@@ -142,15 +141,40 @@ namespace terra::windows::virtual_display {
         }
         DEVMODEA mode {.dmSize = sizeof(DEVMODEA)};
         if (!EnumDisplaySettingsExA(device.m_display_name.c_str(), ENUM_CURRENT_SETTINGS, &mode, 0)) {
-          return false;
+          // Windows can retain an active topology entry after its monitor is gone (detached KVM or
+          // capture device). Such a path has no restorable mode, so capture the remaining displays.
+          BOOST_LOG(warning) << "Terra MttVDD: skipping non-present active display during rollback capture: " << device.m_device_id;
+          continue;
         }
         modes.emplace(device.m_device_id, mode);
       }
+      auto restorable_topology = topology;
+      for (auto &group : restorable_topology) {
+        std::erase_if(group, [&](const auto &id) {
+          return !modes.contains(id);
+        });
+      }
+      std::erase_if(restorable_topology, [](const auto &group) {
+        return group.empty();
+      });
+      active_ids.clear();
+      for (const auto &[id, mode] : modes) {
+        (void) mode;
+        active_ids.emplace(id);
+      }
       const auto hdr_states = display_api.getCurrentHdrStates(active_ids);
-      if (modes.size() != active_ids.size() || hdr_states.size() != active_ids.size()) {
+      if (modes.empty() || hdr_states.size() != active_ids.size() || !display_api.isTopologyValid(restorable_topology)) {
+        BOOST_LOG(error) << "Terra MttVDD: rollback capture failed: modes=" << modes.size() << " hdr=" << hdr_states.size() << " active=" << active_ids.size();
         return false;
       }
-      rollback.topology = topology;
+      const auto primary = std::ranges::find_if(devices, [&](const auto &device) {
+        return device.m_info && device.m_info->m_primary && modes.contains(device.m_device_id);
+      });
+      if (primary == devices.end()) {
+        BOOST_LOG(error) << "Terra MttVDD: rollback capture failed: no present primary display";
+        return false;
+      }
+      rollback.topology = std::move(restorable_topology);
       rollback.primary = primary->m_device_id;
       rollback.modes = std::move(modes);
       rollback.hdr_states = hdr_states;
@@ -231,19 +255,30 @@ namespace terra::windows::virtual_display {
     std::optional<std::string> device_id(display_device::WinApiLayer &windows_api, const std::string_view platform_id) {
       const auto config = windows_api.queryDisplayConfig(display_device::QueryType::All);
       if (!config) {
+        BOOST_LOG(error) << "Terra MttVDD: device_id query failed for " << platform_id;
         return std::nullopt;
       }
       std::optional<std::string> result;
+      std::size_t matches = 0;
       for (const auto &path : config->m_paths) {
         const auto monitor_path = windows_api.getMonitorDevicePath(path);
         if (!mttvdd::monitor_id_matches_path(platform_id, monitor_path)) {
           continue;
         }
+        ++matches;
         const auto id = windows_api.getDeviceId(path);
-        if (id.empty() || result) {
+        if (id.empty()) {
+          BOOST_LOG(error) << "Terra MttVDD: device_id empty for " << platform_id << " matches=" << matches;
+          return std::nullopt;
+        }
+        if (result && *result != id) {
+          BOOST_LOG(error) << "Terra MttVDD: device_id ambiguous for " << platform_id << " matches=" << matches;
           return std::nullopt;
         }
         result = id;
+      }
+      if (!result) {
+        BOOST_LOG(verbose) << "Terra MttVDD: device_id no path for " << platform_id;
       }
       return result;
     }
@@ -396,7 +431,7 @@ namespace terra::windows::virtual_display {
         const auto &id = platform_to_device.at(configuration.platform_id);
         const auto snapshot = std::ranges::find(snapshots, id, &display::Snapshot::device_id);
         const auto &requested = configuration.specification.mode;
-        if (snapshot == snapshots.end() || !snapshot->current_mode || snapshot->scale != display::Rational {1, 1} || snapshot->position != display::Position {configuration.specification.position.x, configuration.specification.position.y} || snapshot->primary != configuration.specification.primary || snapshot->hdr_enabled.value_or(false) != configuration.specification.hdr) {
+        if (snapshot == snapshots.end() || !snapshot->current_mode || snapshot->scale != display::Rational {1, 1} || snapshot->primary != configuration.specification.primary || snapshot->hdr_enabled.value_or(false) != configuration.specification.hdr) {
           BOOST_LOG(error) << "Terra MttVDD: applied connector state could not be verified";
           return false;
         }
@@ -406,7 +441,7 @@ namespace terra::windows::virtual_display {
           BOOST_LOG(error) << "Terra MttVDD: applied mode differs from request";
           return false;
         }
-        configuration.actual_mode = {static_cast<int>(actual.size.width), static_cast<int>(actual.size.height), actual.refresh.numerator, actual.refresh.denominator, static_cast<int>(actual.bit_depth), actual.hdr, actual.id};
+        configuration.actual_mode = {static_cast<int>(actual.size.width), static_cast<int>(actual.size.height), actual.refresh.numerator, actual.refresh.denominator, static_cast<int>(actual.bit_depth), actual.hdr, actual.id, {snapshot->position.x, snapshot->position.y}};
       }
       return true;
     }
@@ -527,7 +562,16 @@ namespace terra::windows::virtual_display {
       },
       available,
       mttvdd::configured_display_count,
-      mttvdd::set_display_count_and_wait,
+      [](const std::uint32_t count) {
+        if (!mttvdd::set_display_count_and_wait(count)) {
+          return false;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + DISPLAY_CONFIG_TIMEOUT;
+        while (!available() && std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(DISPLAY_CONFIG_POLL_INTERVAL);
+        }
+        return available();
+      },
       mttvdd::display_inventory,
       apply,
       mttvdd::MAX_DISPLAY_COUNT,

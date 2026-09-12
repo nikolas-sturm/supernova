@@ -34,8 +34,10 @@ namespace {
     bool healthy = true;  ///< Provider health result.
     bool set_succeeds = true;  ///< Count setter result.
     bool apply_succeeds = true;  ///< Configuration apply result.
+    bool capture_succeeds = true;  ///< Host display rollback capture result.
     bool save_succeeds = true;  ///< Persistence result.
     bool ambiguous_growth = false;  ///< Add two IDs while count grows once.
+    bool normalize_existing_position = false;  ///< Adjust an existing display position on later applies.
     std::uint32_t max_count = 99;  ///< Provider connector capacity.
     int apply_calls = 0;  ///< Configuration apply call count.
     int set_calls = 0;  ///< Count setter call count.
@@ -81,7 +83,10 @@ namespace {
       }
       for (auto &configuration : configurations) {
         const auto &mode = configuration.specification.mode;
-        configuration.actual_mode = {mode.width, mode.height, mode.refresh_numerator, mode.refresh_denominator, mode.bit_depth, mode.hdr, configuration.platform_id + ":mode"};
+        configuration.actual_mode = {mode.width, mode.height, mode.refresh_numerator, mode.refresh_denominator, mode.bit_depth, mode.hdr, configuration.platform_id + ":mode", configuration.specification.position};
+        if (normalize_existing_position && apply_calls > 1 && configuration.platform_id == "managed-2") {
+          ++configuration.actual_mode.position.x;
+        }
       }
       return true;
     }
@@ -129,7 +134,7 @@ namespace {
         },
         [&]() {
           ++capture_calls;
-          return true;
+          return capture_succeeds;
         },
         [&]() {
           ++restore_calls;
@@ -167,6 +172,23 @@ TEST(TerraVirtualDisplayTest, PreservesBaselineAndCreatesStableResource) {
   EXPECT_TRUE(listed.changed);
   EXPECT_EQ(listed.resources.size(), 1);
   EXPECT_FALSE(manager.list(listed.revision).changed);
+}
+
+TEST(TerraVirtualDisplayTest, AdvancesSiblingRevisionForProviderAdjustedPosition) {
+  fake_t fake;
+  fake.normalize_existing_position = true;
+  manager_t manager {fake.callbacks()};
+  const auto first = manager.create(OWNER, specification());
+  ASSERT_EQ(first.status, status_t::success);
+  ASSERT_TRUE(first.resource);
+  EXPECT_EQ(first.resource->revision, 1);
+
+  ASSERT_EQ(manager.create(OWNER, specification()).status, status_t::success);
+  const auto adjusted = manager.get(first.resource->id);
+  ASSERT_TRUE(adjusted);
+  EXPECT_EQ(adjusted->position.x, first.resource->position.x + 1);
+  EXPECT_EQ(adjusted->revision, first.resource->revision + 1);
+  EXPECT_EQ(manager.remove(adjusted->id, first.resource->revision).status, status_t::conflict);
 }
 
 TEST(TerraVirtualDisplayTest, CreatesWorkspaceLayoutInOneProviderTransaction) {
@@ -404,6 +426,22 @@ TEST(TerraVirtualDisplayTest, RestartRetainsPersistentAndRemovesEphemeralResourc
   ASSERT_TRUE(persistent);
   EXPECT_EQ(persistent->platform_id, "managed-2");
   EXPECT_EQ(fake.count, 3);
+}
+
+TEST(TerraVirtualDisplayTest, RestartWithNoManagedDisplaysSkipsTopologyRecovery) {
+  fake_t fake;
+  {
+    manager_t manager {fake.callbacks()};
+    ASSERT_TRUE(manager.available());
+  }
+  fake.capture_succeeds = false;
+  fake.apply_succeeds = false;
+
+  manager_t restarted {fake.callbacks()};
+
+  EXPECT_TRUE(restarted.available());
+  EXPECT_EQ(fake.capture_calls, 0);
+  EXPECT_EQ(fake.apply_calls, 0);
 }
 
 TEST(TerraVirtualDisplayTest, RestartRepairsUntrackedProviderConnector) {

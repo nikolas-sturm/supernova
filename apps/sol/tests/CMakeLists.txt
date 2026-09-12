@@ -235,6 +235,10 @@ endif()
 
 target_link_libraries(${PROJECT_NAME} ${TEST_LINK_LIBRARIES})
 target_compile_definitions(${PROJECT_NAME} PUBLIC ${SOL_DEFINITIONS} ${TEST_DEFINITIONS})
+set_source_files_properties(
+        "${CMAKE_SOURCE_DIR}/src/confighttp.cpp"
+        "${CMAKE_SOURCE_DIR}/src/nvhttp.cpp"
+        PROPERTIES COMPILE_DEFINITIONS "${SOL_VERSION_DEFINITIONS}")
 target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SOL_COMPILE_OPTIONS}>;$<$<COMPILE_LANGUAGE:CUDA>:${SOL_COMPILE_OPTIONS_CUDA};-std=c++17>)  # cmake-lint: disable=C0301
 target_link_options(${PROJECT_NAME} PRIVATE ${SOL_LINK_OPTIONS})
 

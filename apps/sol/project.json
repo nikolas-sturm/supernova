@@ -55,6 +55,38 @@
         "debug": {},
         "release": { "command": "node tooling/native/build.mjs sol test release" }
       }
+    },
+    "vdd:configure": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "debug",
+      "options": { "command": "node tooling/native/build.mjs vdd configure debug" },
+      "configurations": {
+        "debug": {},
+        "release": { "command": "node tooling/native/build.mjs vdd configure release" }
+      }
+    },
+    "vdd:build": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["vdd:configure"],
+      "defaultConfiguration": "debug",
+      "options": { "command": "node tooling/native/build.mjs vdd build debug" },
+      "configurations": {
+        "debug": {},
+        "release": { "command": "node tooling/native/build.mjs vdd build release" }
+      }
+    },
+    "vdd:test": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "dependsOn": ["vdd:build"],
+      "defaultConfiguration": "debug",
+      "options": { "command": "node tooling/native/build.mjs vdd test debug" },
+      "configurations": {
+        "debug": {},
+        "release": { "command": "node tooling/native/build.mjs vdd test release" }
+      }
     }
   }
 }

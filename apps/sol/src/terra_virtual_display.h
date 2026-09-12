@@ -32,6 +32,14 @@ namespace terra_virtual_display {
   };
 
   /**
+   * @brief Desktop coordinate.
+   */
+  struct position_t {
+    int x;  ///< Horizontal desktop coordinate.
+    int y;  ///< Vertical desktop coordinate.
+  };
+
+  /**
    * @brief Applied display timing and stable mode identity.
    */
   struct actual_mode_t {
@@ -42,14 +50,7 @@ namespace terra_virtual_display {
     int bit_depth;  ///< Applied bits per color component.
     bool hdr;  ///< Whether HDR output was applied.
     std::string id;  ///< Stable platform mode identifier.
-  };
-
-  /**
-   * @brief Desktop coordinate.
-   */
-  struct position_t {
-    int x;  ///< Horizontal desktop coordinate.
-    int y;  ///< Vertical desktop coordinate.
+    position_t position;  ///< Applied desktop position.
   };
 
   /**
