@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { clientDisplayVirtualDisplays, effectiveClientDisplay } from './clientDisplays'
+import {
+  clientDisplayVirtualDisplays,
+  effectiveClientDisplay,
+  resolvePrimaryClientDisplayId,
+} from './clientDisplays'
 import type { ClientDisplayOutput } from './store/clientStore'
 
 const primary: ClientDisplayOutput = {
@@ -61,6 +65,22 @@ describe('clientDisplays', () => {
       primary: false,
       position: { x: 2560, y: 0 },
     })
+  })
+
+  it('honors a manually selected primary and falls back when it is unavailable', () => {
+    expect(resolvePrimaryClientDisplayId([primary, secondary], {}, 'display-2')).toBe('display-2')
+    expect(resolvePrimaryClientDisplayId([primary, secondary], {}, 'missing')).toBe('display-1')
+    expect(
+      resolvePrimaryClientDisplayId(
+        [primary, secondary],
+        { 'display-2': { enabled: false, width: 1920, height: 1080, refreshRate: 60, hdr: false } },
+        'display-2',
+      ),
+    ).toBe('display-1')
+
+    const displays = clientDisplayVirtualDisplays([primary, secondary], {}, 'display-2')
+    expect(displays[0]).toMatchObject({ name: 'Right', primary: true, position: { x: 0, y: 0 } })
+    expect(displays[1]).toMatchObject({ name: 'Center', position: { x: 1920, y: 0 } })
   })
 
   it('marks HDR modes as ten bit', () => {

@@ -1,5 +1,6 @@
 import { app, events, extensions, window as neutralinoWindow } from '@neutralinojs/lib'
 import { z } from 'zod'
+import type { VirtualDisplaySpecification } from '../clientDisplays'
 import {
   streamOverlayRequestSchema,
   streamStatisticsUpdateSchema,
@@ -897,6 +898,7 @@ export async function launchCoreApp(
   settings: StreamSettings,
   launchProfileId = '',
   workspaceId = '',
+  virtualDisplays: VirtualDisplaySpecification[] = [],
 ) {
   if (!hasNeutralinoRuntime()) return
   await dispatchConnected('app.launch', {
@@ -905,6 +907,7 @@ export async function launchCoreApp(
     settings: settingsSchema.parse(settings),
     launchProfileId: launchProfileId ? z.uuid().parse(launchProfileId) : '',
     workspaceId: workspaceId ? z.uuid().parse(workspaceId) : '',
+    virtualDisplays,
   })
 }
 

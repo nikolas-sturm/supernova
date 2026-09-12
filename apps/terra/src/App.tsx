@@ -32,6 +32,7 @@ import {
 } from 'lucide-react'
 import { type FormEvent, useDeferredValue, useEffect, useState } from 'react'
 import styles from './App.module.css'
+import { clientDisplayVirtualDisplays } from './clientDisplays'
 import {
   applyUiDisplayMode,
   cancelCoreSession,
@@ -410,12 +411,26 @@ export function App() {
             gameOptimizations: configuration.gameOptimizations,
           })
         : undefined
+      const clientState = useClientStore.getState()
+      const virtualDisplays =
+        appMode === 'workstation' && !workspaceId
+          ? clientDisplayVirtualDisplays(
+              clientState.clientDisplays,
+              clientState.clientDisplayPreferences,
+              clientState.clientPrimaryDisplayId,
+            )
+          : []
+      if (appMode === 'workstation' && !workspaceId && virtualDisplays.length === 0) {
+        setHostError('Enable at least one client display before launching a workstation app.')
+        return
+      }
       await launchCoreApp(
         hostId,
         appId,
         profiledSettings?.success ? profiledSettings.data : settings,
         resolvedLaunchProfileId,
         workspaceId,
+        virtualDisplays,
       )
       closeAppDetails()
     } catch (error) {

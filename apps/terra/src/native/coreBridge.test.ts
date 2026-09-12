@@ -318,4 +318,34 @@ describe('coreBridge host protocol', () => {
       expect.objectContaining({ workspaceId: '55555555-5555-4555-8555-555555555555' }),
     )
   })
+
+  it('passes client display topology to native core', async () => {
+    const virtualDisplays = [
+      {
+        name: 'Primary',
+        mode: {
+          width: 2560,
+          height: 1440,
+          refreshNumerator: 200,
+          refreshDenominator: 1,
+          bitDepth: 8,
+          hdr: false,
+        },
+        position: { x: 0, y: 0 },
+        scale: 1,
+        rotation: 0,
+        primary: true,
+        hdr: false,
+        persistent: false,
+      },
+    ]
+
+    await launchCoreApp('host-1', 7, defaultSettings, '', '', virtualDisplays)
+
+    expect(neutralino.dispatch).toHaveBeenCalledWith(
+      'dev.terra.core',
+      'app.launch',
+      expect.objectContaining({ virtualDisplays }),
+    )
+  })
 })

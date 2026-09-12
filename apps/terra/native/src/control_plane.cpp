@@ -43,6 +43,135 @@ std::string trim(std::string value) {
     return value;
 }
 
+Json awaitOperation(GameStreamClient& client, const HostRecord& host, ApiResponse response,
+                    const std::atomic_bool& cancellation) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (true) {
+        if (!response.body.is_object() || !response.body.contains("operation")) {
+            throw std::runtime_error("Sol operation response is invalid.");
+        }
+        const auto& operation = response.body.at("operation");
+        const auto state = operation.value("state", "");
+        if (state == "succeeded") {
+            if (!operation.contains("result") || !operation.at("result").is_object()) {
+                throw std::runtime_error("Sol operation result is invalid.");
+            }
+            return operation.at("result");
+        }
+        if (state == "failed") {
+            const auto error = operation.value("error", Json::object());
+            throw std::runtime_error(error.is_object()
+                                         ? error.value("message", "Sol operation failed.")
+                                         : "Sol operation failed.");
+        }
+        if ((state != "pending" && state != "running") || cancellation.load() ||
+            std::chrono::steady_clock::now() >= deadline) {
+            throw std::runtime_error(cancellation.load() ? "Launch cancelled."
+                                                         : "Sol operation timed out.");
+        }
+        const auto id = operation.value("id", "");
+        if (id.empty()) throw std::runtime_error("Sol operation ID is missing.");
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        response = client.apiRequest(host.address, host.apiPort, host.serverCertificate, "GET",
+                                     "/eclipse/v1/operations/" + id);
+    }
+}
+
+void releaseClientTopologyWorkspace(GameStreamClient& client, const HostRecord& host,
+                                    const std::string& id) noexcept {
+    static const std::atomic_bool neverCancelled{false};
+    try {
+        auto response = client.apiRequest(host.address, host.apiPort, host.serverCertificate, "GET",
+                                          "/eclipse/v1/workspaces/" + id);
+        auto workspace = response.body.at("workspace");
+        if (workspace.value("state", "") != "stopped") {
+            workspace = awaitOperation(
+                            client, host,
+                            client.apiRequest(
+                                host.address, host.apiPort, host.serverCertificate, "POST",
+                                "/eclipse/v1/workspaces/" + id + "/stop",
+                                Json{{"schemaVersion", 1}, {"terminateApplication", true}},
+                                {{"Idempotency-Key", ix::uuid4()},
+                                 {"If-Match", '"' +
+                                                      std::to_string(workspace.at("revision")
+                                                                         .get<std::uint64_t>()) +
+                                                      '"'}}),
+                            neverCancelled)
+                            .at("workspace");
+        }
+        static_cast<void>(awaitOperation(
+            client, host,
+            client.apiRequest(
+                host.address, host.apiPort, host.serverCertificate, "DELETE",
+                "/eclipse/v1/workspaces/" + id, Json{{"schemaVersion", 1}},
+                {{"Idempotency-Key", ix::uuid4()},
+                 {"If-Match", '"' +
+                                      std::to_string(
+                                          workspace.at("revision").get<std::uint64_t>()) +
+                                      '"'}}),
+            neverCancelled));
+    } catch (...) {
+    }
+}
+
+std::string prepareClientTopologyWorkspace(GameStreamClient& client, const HostRecord& host,
+                                           const GameStreamApp& app,
+                                           const Json& virtualDisplays,
+                                           const std::atomic_bool& cancellation) {
+    if (!virtualDisplays.is_array() || virtualDisplays.empty() || virtualDisplays.size() > 4 ||
+        app.uuid.empty()) {
+        throw std::invalid_argument("Client display topology is invalid.");
+    }
+    const Json definition = {
+        {"schemaVersion", 1},
+        {"name", "Terra client topology"},
+        {"description", ""},
+        {"shared", false},
+        {"desktopAppUuid", app.uuid},
+        {"permittedAppUuids", Json::array()},
+        {"displayProfileId", nullptr},
+        {"streamProfileId", nullptr},
+        {"launchProfileId", nullptr},
+        {"sandboxProfileId", nullptr},
+        {"virtualDisplays", virtualDisplays},
+        {"peripheralPolicy",
+         {{"requiredDeviceIds", Json::array()},
+          {"requiredClasses", Json::array()},
+          {"disconnectPolicy", "release"}}},
+        {"persistent", false},
+        {"cleanupPolicy", "on-stop"},
+    };
+    auto result = awaitOperation(
+        client, host,
+        client.apiRequest(host.address, host.apiPort, host.serverCertificate, "POST",
+                          "/eclipse/v1/workspaces", definition,
+                          {{"Idempotency-Key", ix::uuid4()}}),
+        cancellation);
+    const auto& created = result.at("workspace");
+    const auto id = created.at("id").get<std::string>();
+    const auto revision = created.at("revision").get<std::uint64_t>();
+    try {
+        result = awaitOperation(
+            client, host,
+            client.apiRequest(
+                host.address, host.apiPort, host.serverCertificate, "POST",
+                "/eclipse/v1/workspaces/" + id + "/start", Json{{"schemaVersion", 1}},
+                {{"Idempotency-Key", ix::uuid4()},
+                 {"If-Match", '"' + std::to_string(revision) + '"'}}),
+            cancellation);
+    } catch (...) {
+        releaseClientTopologyWorkspace(client, host, id);
+        throw;
+    }
+    const auto& prepared = result.at("workspace");
+    if (prepared.value("state", "") != "ready" || !prepared.at("displayIds").is_array() ||
+        prepared.at("displayIds").size() != virtualDisplays.size()) {
+        releaseClientTopologyWorkspace(client, host, id);
+        throw std::runtime_error("Sol prepared an incomplete client display topology.");
+    }
+    return id;
+}
+
 std::string randomHex(std::size_t byteCount) {
     std::random_device source;
     std::ostringstream output;
@@ -649,11 +778,13 @@ nlohmann::json ControlPlane::mutateApiResource(const std::string& hostId, const 
 SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                                        const StreamSettings& settings,
                                        const std::string& launchProfileId,
-                                       const std::string& workspaceId) {
+                                       const std::string& workspaceId,
+                                       const nlohmann::json& virtualDisplays) {
     std::scoped_lock sessionLock{sessionMutex_};
     HostRecord current;
     GameStreamApp selected;
     std::string clientId;
+    std::string resumableTopologyWorkspaceId;
     bool resume = false;
     std::uint64_t generation = 0;
     std::function<void(const SessionUpdate&)> listener;
@@ -694,6 +825,7 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
         current = *host;
         selected = *app;
         clientId = clientId_;
+        resumableTopologyWorkspaceId = clientTopologyWorkspaceId_;
         resume = host->currentGameId == appId;
         generation = ++sessionGeneration_;
         sessionStopRequested_ = false;
@@ -728,6 +860,8 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
     std::vector<std::string> displayIds;
     std::vector<StreamSettings> displaySettings;
     auto effectiveSettings = settings;
+    auto effectiveWorkspaceId = workspaceId;
+    bool generatedTopologyWorkspace = false;
     const auto selectChildVideoFormat = [&](const StreamSettings& childSettings) {
         auto codecModeSupport = current.serverCodecModeSupport;
         if (current.maxLumaPixelsHevc == 0) {
@@ -747,14 +881,34 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
         return format;
     };
     try {
-        if (!workspaceId.empty()) {
+        if (effectiveWorkspaceId.empty() && !virtualDisplays.empty()) {
+            if (resume) {
+                if (resumableTopologyWorkspaceId.empty()) {
+                    throw std::runtime_error(
+                        "Stop the running application before changing workstation topology.");
+                }
+                effectiveWorkspaceId = resumableTopologyWorkspaceId;
+            }
+            if (current.apiVersion != 1 ||
+                !std::ranges::contains(current.capabilities, "workspaces-v1") ||
+                !std::ranges::contains(current.capabilities, "multi-display-streaming-v1")) {
+                throw std::runtime_error(
+                    "Host does not support client-topology workstation streaming.");
+            }
+            if (!resume) {
+                effectiveWorkspaceId = prepareClientTopologyWorkspace(
+                    *gameStream_, current, selected, virtualDisplays, launchCancellationRequested_);
+                generatedTopologyWorkspace = true;
+            }
+        }
+        if (!effectiveWorkspaceId.empty()) {
             if (current.apiVersion != 1 ||
                 !std::ranges::contains(current.capabilities, "multi-display-streaming-v1")) {
                 throw std::runtime_error("Host does not support multi-display workspace streaming.");
             }
             const auto response = gameStream_->apiRequest(
                 current.address, current.apiPort, current.serverCertificate, "GET",
-                "/eclipse/v1/workspaces/" + workspaceId);
+                "/eclipse/v1/workspaces/" + effectiveWorkspaceId);
             const auto& workspace = response.body.at("workspace");
             displayIds = workspace.at("displayIds").get<std::vector<std::string>>();
             if (displayIds.empty() || displayIds.size() > 4 ||
@@ -806,11 +960,14 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
         launched = gameStream_->launch(current.address, current.httpsPort, clientId,
                                         current.serverCertificate, appId, resume, effectiveSettings,
                                         &launchCancellationRequested_, selected.uuid,
-                                        launchProfileId, workspaceId,
+                                        launchProfileId, effectiveWorkspaceId,
                                         displayIds.empty() ? std::string{} : displayIds.front(), true);
     } catch (...) {
         const auto failure = std::current_exception();
         const bool cancelled = launchCancellationRequested_.load();
+        if (generatedTopologyWorkspace) {
+            releaseClientTopologyWorkspace(*gameStream_, current, effectiveWorkspaceId);
+        }
         {
             std::scoped_lock lock{mutex_};
             if (sessionGeneration_ == generation) {
@@ -857,9 +1014,10 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
             saveLocked();
         }
         session_ = session;
+        if (generatedTopologyWorkspace) clientTopologyWorkspaceId_ = effectiveWorkspaceId;
     }
 
-    if (!workspaceId.empty()) {
+    if (!effectiveWorkspaceId.empty()) {
         std::vector<std::shared_ptr<StreamWorkerProcess>> workers;
         try {
             for (std::size_t index = 0; index < displayIds.size(); ++index) {
@@ -877,7 +1035,7 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                               current.address, current.httpsPort, clientId,
                               current.serverCertificate, appId, true, childSettings,
                               &launchCancellationRequested_, selected.uuid, launchProfileId,
-                              workspaceId, displayIds[index], false);
+                              effectiveWorkspaceId, displayIds[index], false);
                 auto worker = std::make_shared<StreamWorkerProcess>(
                     [this, generation, hostId, appId, appName = selected.name,
                      resumed = childLaunch.resumed,
@@ -937,10 +1095,14 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                                     current.serverCertificate);
             } catch (...) {
             }
+            if (generatedTopologyWorkspace) {
+                releaseClientTopologyWorkspace(*gameStream_, current, effectiveWorkspaceId);
+            }
             {
                 std::scoped_lock lock{mutex_};
                 streamWorkers_.clear();
                 session_.reset();
+                if (generatedTopologyWorkspace) clientTopologyWorkspaceId_.clear();
                 sessionStopRequested_ = false;
                 ++sessionGeneration_;
             }
@@ -1088,6 +1250,7 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
     std::vector<std::shared_ptr<StreamWorkerProcess>> streamWorkers;
     std::uint64_t generation = 0;
     bool ownsSession = false;
+    std::string topologyWorkspaceId;
     {
         std::scoped_lock lock{mutex_};
         const auto host = std::find_if(hosts_.begin(), hosts_.end(),
@@ -1101,6 +1264,7 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
         }
         current = *host;
         clientId = clientId_;
+        topologyWorkspaceId = clientTopologyWorkspaceId_;
         if (ownsSession) {
             generation = sessionGeneration_;
             sessionStopRequested_ = true;
@@ -1138,7 +1302,11 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
     if (quitHost) {
         gameStream_->cancel(current.address, current.httpsPort, clientId,
                             current.serverCertificate);
+        if (!topologyWorkspaceId.empty()) {
+            releaseClientTopologyWorkspace(*gameStream_, current, topologyWorkspaceId);
+        }
         std::scoped_lock lock{mutex_};
+        clientTopologyWorkspaceId_.clear();
         const auto host = std::find_if(hosts_.begin(), hosts_.end(),
                                        [&](const HostRecord& value) { return value.id == hostId; });
         if (host != hosts_.end()) {
@@ -1226,6 +1394,7 @@ void ControlPlane::finishSessionDisconnect(const DisconnectRequest& request) {
     SessionRecord endingSession;
     HostRecord current;
     std::string clientId;
+    std::string topologyWorkspaceId;
     bool hasHost = false;
     {
         std::scoped_lock lock{mutex_};
@@ -1250,6 +1419,7 @@ void ControlPlane::finishSessionDisconnect(const DisconnectRequest& request) {
             hasHost = true;
         }
         clientId = clientId_;
+        topologyWorkspaceId = clientTopologyWorkspaceId_;
     }
     if (transport) transport->stop();
     for (const auto& worker : streamWorkers) worker->stop();
@@ -1270,6 +1440,9 @@ void ControlPlane::finishSessionDisconnect(const DisconnectRequest& request) {
                       exception.what();
         }
     }
+    if (hostEnded && hasHost && !topologyWorkspaceId.empty()) {
+        releaseClientTopologyWorkspace(*gameStream_, current, topologyWorkspaceId);
+    }
 
     std::function<void(const SessionUpdate&)> listener;
     {
@@ -1281,6 +1454,7 @@ void ControlPlane::finishSessionDisconnect(const DisconnectRequest& request) {
         sessionStopRequested_ = false;
         ++sessionGeneration_;
         if (hostEnded) {
+            clientTopologyWorkspaceId_.clear();
             const auto host =
                 std::find_if(hosts_.begin(), hosts_.end(), [&](const HostRecord& value) {
                     return value.id == endingSession.hostId;

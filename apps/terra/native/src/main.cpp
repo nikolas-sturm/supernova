@@ -632,14 +632,16 @@ int main(int argc, char** argv) {
         });
 
         const auto launchApp = [&](const std::string& hostId, int appId,
-                                     const terra::StreamSettings& settings,
-                                     const std::string& launchProfileId,
-                                     const std::string& workspaceId) {
+                                   const terra::StreamSettings& settings,
+                                   const std::string& launchProfileId,
+                                   const std::string& workspaceId, const Json& virtualDisplays) {
             std::scoped_lock lock{workerMutex};
-            workers.emplace_back([&, hostId, appId, settings, launchProfileId, workspaceId] {
+            workers.emplace_back([&, hostId, appId, settings, launchProfileId, workspaceId,
+                                  virtualDisplays] {
                 try {
                     static_cast<void>(controlPlane.launchApp(hostId, appId, settings,
-                                                             launchProfileId, workspaceId));
+                                                             launchProfileId, workspaceId,
+                                                             virtualDisplays));
                     if (!closed) {
                         publishHosts();
                     }
@@ -801,7 +803,8 @@ int main(int argc, char** argv) {
                                        data.at("appId").get<int>(),
                                        parseStreamSettings(data.at("settings")),
                                        data.value("launchProfileId", ""),
-                                       data.value("workspaceId", ""));
+                                       data.value("workspaceId", ""),
+                                       data.value("virtualDisplays", Json::array()));
                         } catch (const std::exception& exception) {
                             publishHostError(exception.what());
                         }

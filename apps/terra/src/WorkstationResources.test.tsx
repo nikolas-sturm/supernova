@@ -61,6 +61,7 @@ describe('DisplayManager', () => {
       operationsByHost: {},
       clientDisplays: [output],
       clientDisplayPreferences: {},
+      clientPrimaryDisplayId: undefined,
     })
   })
 
@@ -77,6 +78,18 @@ describe('DisplayManager', () => {
 
     expect(screen.getByLabelText(/Stream this display/)).toBeChecked()
     expect(screen.getByLabelText(/Stream this display/)).toBeDisabled()
+  })
+
+  it('lets the user choose the streamed primary output', () => {
+    const second: ClientDisplayOutput = { ...output, id: 'display-2', name: 'Side', primary: false }
+    useClientStore.setState({ clientDisplays: [output, second] })
+    render(<DisplayManager host={host} apps={[]} settings={defaultSettings} onError={vi.fn()} />)
+
+    const primaries = screen.getAllByLabelText('Primary')
+    expect(primaries).toHaveLength(2)
+    fireEvent.click(primaries[1] as HTMLElement)
+
+    expect(useClientStore.getState().clientPrimaryDisplayId).toBe('display-2')
   })
 
   it('repairs refresh rate when the resolution changes', () => {

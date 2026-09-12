@@ -44,13 +44,29 @@ export function enabledClientDisplays(
     .filter((entry) => entry.preference.enabled)
 }
 
+export function resolvePrimaryClientDisplayId(
+  outputs: ClientDisplayOutput[],
+  preferences: Record<string, ClientDisplayPreference>,
+  requestedId: string | undefined,
+): string | undefined {
+  const enabled = enabledClientDisplays(outputs, preferences)
+  if (enabled.length === 0) return undefined
+  if (requestedId && enabled.some((entry) => entry.output.id === requestedId)) return requestedId
+  return enabled.find((entry) => entry.output.primary)?.output.id ?? enabled[0]?.output.id
+}
+
 export function clientDisplayVirtualDisplays(
   outputs: ClientDisplayOutput[],
   preferences: Record<string, ClientDisplayPreference>,
+  requestedPrimaryId?: string,
 ): VirtualDisplaySpecification[] {
   const enabled = enabledClientDisplays(outputs, preferences)
   if (enabled.length === 0) return []
-  const primaryIndex = enabled.findIndex((entry) => entry.output.primary)
+  const primaryId = resolvePrimaryClientDisplayId(outputs, preferences, requestedPrimaryId)
+  const primaryIndex = Math.max(
+    0,
+    enabled.findIndex((entry) => entry.output.id === primaryId),
+  )
   const ordered = [...enabled]
   if (primaryIndex > 0) {
     ordered.unshift(...ordered.splice(primaryIndex, 1))

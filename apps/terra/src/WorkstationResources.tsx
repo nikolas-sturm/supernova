@@ -16,6 +16,7 @@ import {
   clientDisplayVirtualDisplays,
   effectiveClientDisplay,
   enabledClientDisplays,
+  resolvePrimaryClientDisplayId,
 } from './clientDisplays'
 import { loadCoreResource, mutateCoreResource, rescanClientDisplays } from './native/coreBridge'
 import type { StreamSettings } from './settings'
@@ -166,10 +167,13 @@ function uniqueResolutions(modes: DisplayModeOption[]) {
 export function DisplayManager({ host, onError }: CommonProps) {
   const outputs = useClientStore((state) => state.clientDisplays)
   const preferences = useClientStore((state) => state.clientDisplayPreferences)
+  const primaryDisplayId = useClientStore((state) => state.clientPrimaryDisplayId)
   const setPreference = useClientStore((state) => state.setClientDisplayPreference)
+  const setPrimaryDisplay = useClientStore((state) => state.setClientPrimaryDisplay)
   const resetPreferences = useClientStore((state) => state.resetClientDisplayPreferences)
   const streamedDisplays = enabledClientDisplays(outputs, preferences)
   const streamedCount = streamedDisplays.length
+  const primaryId = resolvePrimaryClientDisplayId(outputs, preferences, primaryDisplayId)
 
   function updatePreference(output: ClientDisplayOutput, next: Partial<ClientDisplayPreference>) {
     const current = effectiveClientDisplay(output, preferences[output.id])
@@ -225,9 +229,10 @@ export function DisplayManager({ host, onError }: CommonProps) {
       </div>
       <p className={styles.resourceFootnote}>
         Terra mirrors the displays reported by this client. Enable a subset to stream, leave the
-        rest on the local desktop, and pick a resolution, refresh rate, and HDR per streamed
-        display. Up to four outputs stream at once. Adding, removing, or rearranging outputs is not
-        supported because the host topology always follows the client.
+        rest on the local desktop, and pick a resolution, refresh rate, HDR, and the streamed
+        primary per output. Set the primary manually on Linux clients, where the operating system
+        does not reliably report it. Up to four outputs stream at once. Adding, removing, or
+        rearranging outputs is not supported because the host topology always follows the client.
       </p>
       {outputs.length === 0 ? (
         <div className={styles.resourceEmpty}>
@@ -255,11 +260,12 @@ export function DisplayManager({ host, onError }: CommonProps) {
               ),
             ).sort((left, right) => left - right)
             const canToggle = preference.enabled ? streamedCount > 1 : streamedCount < 4
+            const isPrimary = output.id === primaryId
             return (
               <article className={styles.displayResourceCard} key={output.id}>
                 <header>
                   <span>OUTPUT {index + 1}</span>
-                  <code>{output.primary ? 'PRIMARY' : 'SECONDARY'}</code>
+                  <code>{isPrimary ? 'PRIMARY' : 'SECONDARY'}</code>
                 </header>
                 <Monitor size={26} />
                 <h3>{output.name || `Display ${index + 1}`}</h3>
@@ -317,6 +323,15 @@ export function DisplayManager({ host, onError }: CommonProps) {
                       </select>
                       <label className={styles.displayToggle}>
                         <input
+                          type="radio"
+                          name="client-primary-display"
+                          checked={isPrimary}
+                          onChange={() => setPrimaryDisplay(output.id)}
+                        />{' '}
+                        Primary
+                      </label>
+                      <label className={styles.displayToggle}>
+                        <input
                           type="checkbox"
                           checked={preference.hdr}
                           onChange={(event) =>
@@ -354,7 +369,12 @@ export function WorkspaceManager({
   const workspaces = resources?.workspaces?.workspaces ?? []
   const clientDisplays = useClientStore((state) => state.clientDisplays)
   const clientDisplayPreferences = useClientStore((state) => state.clientDisplayPreferences)
-  const virtualDisplays = clientDisplayVirtualDisplays(clientDisplays, clientDisplayPreferences)
+  const clientPrimaryDisplayId = useClientStore((state) => state.clientPrimaryDisplayId)
+  const virtualDisplays = clientDisplayVirtualDisplays(
+    clientDisplays,
+    clientDisplayPreferences,
+    clientPrimaryDisplayId,
+  )
 
   async function createWorkspace(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
