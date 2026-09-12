@@ -4,6 +4,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 // local includes
 #include <src/terra_virtual_display.h>
@@ -44,7 +45,28 @@ TEST(MttVddTest, RecognizesOnlyMttVddMonitorIds) {
 
 TEST(MttVddTest, MatchesInstanceIdAcrossWindowsPathSyntax) {
   EXPECT_TRUE(mttvdd::monitor_id_matches_path(R"(DISPLAY\MTT1337\1&15ECD195&1&UID256)", R"(\\?\DISPLAY#MTT1337#1&15ecd195&1&UID256#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7})"));
+  EXPECT_TRUE(mttvdd::monitor_id_matches_path(R"(DISPLAY\MTT1337\UID256)", R"(\\?\DISPLAY#MTT1337#1&15ecd195&2&UID256#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7})"));
   EXPECT_FALSE(mttvdd::monitor_id_matches_path(R"(DISPLAY\MTT1337\1&15ECD195&1&UID257)", R"(\\?\DISPLAY#MTT1337#1&15ecd195&1&UID256#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7})"));
+}
+
+TEST(MttVddTest, CanonicalizesConnectorIdentityAcrossDriverReinstall) {
+  EXPECT_EQ(mttvdd::canonical_monitor_id(R"(DISPLAY\MTT1337\1&15ECD195&1&UID256)"), "DISPLAY\\MTT1337\\UID256");
+  EXPECT_EQ(mttvdd::canonical_monitor_id(R"(DISPLAY\MTT1337\1&15ECD195&2&UID256)"), "DISPLAY\\MTT1337\\UID256");
+  EXPECT_EQ(mttvdd::canonical_monitor_id(R"(\\?\DISPLAY#MTT1337#1&15ecd195&2&UID256#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7})"), "DISPLAY\\MTT1337\\UID256");
+  EXPECT_FALSE(mttvdd::canonical_monitor_id(R"(DISPLAY\SPD3301\1&15ECD195&2&UID256)"));
+  EXPECT_FALSE(mttvdd::canonical_monitor_id(R"(DISPLAY\MTT1337\instance)"));
+  EXPECT_FALSE(mttvdd::canonical_monitor_id(R"(DISPLAY\MTT1337\1&15ECD195&2&UID256X)"));
+  EXPECT_FALSE(mttvdd::canonical_monitor_id(R"(DISPLAY\MTT1337\1&15ECD195&2&NOTUID256)"));
+}
+
+TEST(MttVddTest, MigratesPersistedConnectorIds) {
+  const auto migrated = terra::windows::virtual_display::canonicalize_persistence_ids(R"({"version":1,"baselineInventory":["DISPLAY\\MTT1337\\1&15ECD195&1&UID256"],"resources":[{"platformId":"DISPLAY\\MTT1337\\1&15ECD195&1&UID257"}]})");
+  ASSERT_TRUE(migrated);
+  const auto parsed = nlohmann::json::parse(*migrated);
+  EXPECT_EQ(parsed.at("baselineInventory").at(0), "DISPLAY\\MTT1337\\UID256");
+  EXPECT_EQ(parsed.at("resources").at(0).at("platformId"), "DISPLAY\\MTT1337\\UID257");
+  EXPECT_FALSE(terra::windows::virtual_display::canonicalize_persistence_ids(R"({"version":1,"baselineInventory":["DISPLAY\\OTHER\\UID256"],"resources":[]})"));
+  EXPECT_FALSE(terra::windows::virtual_display::canonicalize_persistence_ids("not json"));
 }
 
 TEST(MttVddTest, InstalledProviderCountMatchesFilteredInventory) {

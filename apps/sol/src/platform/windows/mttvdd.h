@@ -66,14 +66,22 @@ namespace mttvdd {
   bool is_monitor_id(std::wstring_view id);
 
   /**
+   * @brief Reduce an MttVDD device or interface ID to its restart-stable connector UID.
+   *
+   * @param id PnP device instance ID, canonical connector ID, or monitor interface path.
+   * @return Canonical connector ID, or no value when model and UID cannot be identified.
+   */
+  std::optional<std::string> canonical_monitor_id(std::string_view id);
+
+  /**
    * @brief Match PnP instance ID against Windows monitor interface path.
    *
-   * Windows represents separators differently between these two identifiers.
-   * Matching ignores ASCII punctuation and case while retaining complete instance ID.
+   * Windows represents separators differently between these two identifiers, and
+   * reinstalling the root adapter changes the transient PnP instance component.
    *
-   * @param instance_id Monitor PnP instance ID.
+   * @param instance_id Monitor PnP instance or canonical connector ID.
    * @param interface_path Monitor interface path.
-   * @return `true` when path contains complete normalized instance ID.
+   * @return `true` when both IDs identify the same MttVDD connector UID.
    */
   bool monitor_id_matches_path(std::string_view instance_id, std::string_view interface_path);
 
@@ -82,7 +90,7 @@ namespace mttvdd {
    *
    * Other indirect-display providers are excluded by MttVDD hardware ID.
    *
-   * @return Sorted stable device instance IDs, or no value on enumeration failure.
+   * @return Sorted canonical connector IDs, or no value on enumeration failure.
    */
   std::optional<std::vector<std::string>> display_inventory();
 

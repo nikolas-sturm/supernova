@@ -16,9 +16,17 @@
 
 namespace terra::windows::virtual_display {
   /**
-   * @brief Resolve one MttVDD PnP instance to its libdisplaydevice identifier.
+   * @brief Migrate persisted transient MttVDD PnP IDs to stable connector IDs.
    *
-   * @param platform_id MttVDD monitor PnP instance ID.
+   * @param document Version-one virtual-display persistence document.
+   * @return Migrated document, or no value when its provider IDs are invalid.
+   */
+  [[nodiscard]] std::optional<std::string> canonicalize_persistence_ids(std::string_view document);
+
+  /**
+   * @brief Resolve one MttVDD connector to its libdisplaydevice identifier.
+   *
+   * @param platform_id Canonical MttVDD monitor connector ID.
    * @return Stable libdisplaydevice ID, or no value when correlation is unavailable.
    */
   [[nodiscard]] std::optional<std::string> resolve_device_id(std::string_view platform_id);

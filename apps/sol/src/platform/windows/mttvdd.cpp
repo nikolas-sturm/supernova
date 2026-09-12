@@ -9,6 +9,7 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -190,22 +191,6 @@ namespace mttvdd {
       return result;
     }
 
-    /**
-     * @brief Normalize Windows device identity for cross-API comparison.
-     *
-     * @param value Device identity text.
-     * @return Lowercase ASCII alphanumeric identity.
-     */
-    std::string normalized_id(const std::string_view value) {
-      std::string result;
-      result.reserve(value.size());
-      for (const unsigned char character : value) {
-        if (std::isalnum(character)) {
-          result.push_back(static_cast<char>(std::tolower(character)));
-        }
-      }
-      return result;
-    }
   }  // namespace
 
   std::optional<std::wstring> display_count_command(const std::uint32_t count) {
@@ -255,9 +240,39 @@ namespace mttvdd {
     return uppercase.find(L"\\MTT1337\\") != std::wstring::npos;
   }
 
+  std::optional<std::string> canonical_monitor_id(const std::string_view id) {
+    std::string uppercase {id};
+    std::ranges::transform(uppercase, uppercase.begin(), [](const unsigned char character) {
+      return static_cast<char>(std::toupper(character));
+    });
+    auto model = uppercase.find("\\MTT1337\\");
+    if (model == std::string::npos) {
+      model = uppercase.find("#MTT1337#");
+    }
+    if (model == std::string::npos) {
+      return std::nullopt;
+    }
+    auto uid = uppercase.find("UID", model + 9);
+    while (uid != std::string::npos && uid > 0 && uppercase[uid - 1] != '&' && uppercase[uid - 1] != '\\' && uppercase[uid - 1] != '#') {
+      uid = uppercase.find("UID", uid + 3);
+    }
+    if (uid == std::string::npos) {
+      return std::nullopt;
+    }
+    auto end = uid + 3;
+    while (end < uppercase.size() && std::isdigit(static_cast<unsigned char>(uppercase[end]))) {
+      ++end;
+    }
+    if (end == uid + 3 || (end < uppercase.size() && std::isalnum(static_cast<unsigned char>(uppercase[end])))) {
+      return std::nullopt;
+    }
+    return "DISPLAY\\MTT1337\\" + uppercase.substr(uid, end - uid);
+  }
+
   bool monitor_id_matches_path(const std::string_view instance_id, const std::string_view interface_path) {
-    const auto instance = normalized_id(instance_id);
-    return !instance.empty() && normalized_id(interface_path).find(instance) != std::string::npos;
+    const auto instance = canonical_monitor_id(instance_id);
+    const auto monitor_interface = canonical_monitor_id(interface_path);
+    return instance && monitor_interface && *instance == *monitor_interface;
   }
 
   std::optional<std::vector<std::string>> display_inventory() {
@@ -289,11 +304,12 @@ namespace mttvdd {
       if (!is_monitor_id(instance_id)) {
         continue;
       }
-      auto converted = utf8(instance_id);
-      if (converted.empty()) {
+      const auto converted = utf8(instance_id);
+      const auto canonical = canonical_monitor_id(converted);
+      if (!canonical) {
         return std::nullopt;
       }
-      result.push_back(std::move(converted));
+      result.push_back(*canonical);
     }
     std::ranges::sort(result);
     if (std::ranges::adjacent_find(result) != result.end()) {

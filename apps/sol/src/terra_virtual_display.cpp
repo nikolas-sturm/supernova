@@ -429,6 +429,7 @@ namespace terra_virtual_display {
       impl_->baseline_ids = doc.at("baselineInventory").get<std::set<std::string>>();
       impl_->collection_revision = doc.at("collectionRevision").get<std::uint64_t>();
       if (impl_->baseline_ids.size() != impl_->baseline_count || !std::includes(provider->second.begin(), provider->second.end(), impl_->baseline_ids.begin(), impl_->baseline_ids.end())) {
+        BOOST_LOG(error) << "Terra virtual display startup: persisted baseline does not match provider inventory";
         return;
       }
       for (const auto &value : doc.at("resources")) {

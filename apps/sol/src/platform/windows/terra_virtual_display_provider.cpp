@@ -246,10 +246,10 @@ namespace terra::windows::virtual_display {
     }
 
     /**
-     * @brief Find libdisplaydevice ID for one MttVDD PnP instance.
+     * @brief Find libdisplaydevice ID for one MttVDD connector.
      *
      * @param windows_api Windows display API layer.
-     * @param platform_id MttVDD monitor PnP instance ID.
+     * @param platform_id Canonical MttVDD monitor connector ID.
      * @return Stable libdisplaydevice ID, or no value when correlation is ambiguous.
      */
     std::optional<std::string> device_id(display_device::WinApiLayer &windows_api, const std::string_view platform_id) {
@@ -284,10 +284,10 @@ namespace terra::windows::virtual_display {
     }
 
     /**
-     * @brief Wait for DisplayConfig to expose one newly provisioned PnP monitor.
+     * @brief Wait for DisplayConfig to expose one newly provisioned connector.
      *
      * @param windows_api Windows display API layer.
-     * @param platform_id MttVDD monitor PnP instance ID.
+     * @param platform_id Canonical MttVDD monitor connector ID.
      * @return Stable libdisplaydevice ID, or no value after timeout.
      */
     std::optional<std::string> wait_device_id(display_device::WinApiLayer &windows_api, const std::string_view platform_id) {
@@ -447,6 +447,32 @@ namespace terra::windows::virtual_display {
     }
   }  // namespace
 
+  std::optional<std::string> canonicalize_persistence_ids(const std::string_view document) {
+    try {
+      auto parsed = nlohmann::json::parse(document);
+      if (!parsed.is_object() || parsed.at("version") != 1 || !parsed.at("baselineInventory").is_array() || !parsed.at("resources").is_array()) {
+        return std::nullopt;
+      }
+      for (auto &id : parsed.at("baselineInventory")) {
+        const auto canonical = id.is_string() ? mttvdd::canonical_monitor_id(id.get<std::string>()) : std::nullopt;
+        if (!canonical) {
+          return std::nullopt;
+        }
+        id = *canonical;
+      }
+      for (auto &resource : parsed.at("resources")) {
+        const auto canonical = resource.is_object() && resource.contains("platformId") && resource.at("platformId").is_string() ? mttvdd::canonical_monitor_id(resource.at("platformId").get<std::string>()) : std::nullopt;
+        if (!canonical) {
+          return std::nullopt;
+        }
+        resource["platformId"] = *canonical;
+      }
+      return parsed.dump();
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+
   std::optional<std::string> resolve_device_id(const std::string_view platform_id) {
     display_device::WinApiLayer api_layer;
     return device_id(api_layer, platform_id);
@@ -549,7 +575,8 @@ namespace terra::windows::virtual_display {
         if (!std::filesystem::exists(persistence_path)) {
           return std::nullopt;
         }
-        return file_handler::read_file(persistence_path.string().c_str());
+        const auto document = file_handler::read_file(persistence_path.string().c_str());
+        return canonicalize_persistence_ids(document).value_or(document);
       },
       [persistence_path](const std::string &document) {
         return file_handler::write_file_atomic(persistence_path.string().c_str(), document) == 0;
