@@ -17,7 +17,7 @@ directory; Terra tests use CTest and fail if no tests are registered.
 | --- | --- | --- |
 | Sol | `apps/sol` | `apps/sol/cmake-build-<win32\|linux>-<debug\|release>` |
 | Terra | `apps/terra/native` | `apps/terra/cmake-build-<win32\|linux>-<debug\|release>` |
-| VDD | `apps/sol/third-party/vdd` | `apps/sol/cmake-build-win32-vdd-<debug\|release>` |
+| VDD | `apps/sol/third-party/solvdd` | `apps/sol/cmake-build-win32-vdd-<debug\|release>` |
 
 ## Prerequisites
 

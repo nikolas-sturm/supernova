@@ -200,7 +200,7 @@ configure/build/test dependencies. They use the same non-daemon workspace mode.
 | --- | --- | --- |
 | Sol | `apps/sol` | `apps/sol/cmake-build-<platform>-<config>` |
 | Terra | `apps/terra/native` | `apps/terra/cmake-build-<platform>-<config>` |
-| VDD | `apps/sol/third-party/vdd` | `apps/sol/cmake-build-win32-vdd-<config>` |
+| VDD | `apps/sol/third-party/solvdd` | `apps/sol/cmake-build-win32-vdd-<config>` |
 
 `platform` is `win32` or `linux`; `config` is `debug` or `release`. Never share a
 build tree across apps, configurations, platforms, or toolchains. A separate

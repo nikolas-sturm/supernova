@@ -26,14 +26,14 @@ export function parseArgs(args) {
 /** Keep upstream source roots and all generated outputs config-specific. */
 export function commandsFor({ app, operation, config, dev = false }, platform = process.platform) {
   if (app === 'vdd' && platform !== 'win32') {
-    throw new Error('Supernova VDD supports Windows only.')
+    throw new Error('SolVDD supports Windows only.')
   }
   const appRoot = path.join(root, 'apps', app === 'vdd' ? 'sol' : app)
   const source =
     app === 'terra'
       ? path.join(appRoot, 'native')
       : app === 'vdd'
-        ? path.join(appRoot, 'third-party', 'vdd')
+        ? path.join(appRoot, 'third-party', 'solvdd')
         : appRoot
   const build = path.join(
     appRoot,

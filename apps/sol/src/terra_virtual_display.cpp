@@ -6,11 +6,14 @@
 // standard includes
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <utility>
+#include <vector>
 
 // local includes
 #include "logging.h"
@@ -20,7 +23,8 @@
 
 namespace terra_virtual_display {
   namespace {
-    constexpr int DOCUMENT_VERSION = 1;  ///< Persistent document schema version.
+    constexpr int DOCUMENT_VERSION = 2;  ///< Persistent document schema version.
+    constexpr int LEGACY_DOCUMENT_VERSION = 1;  ///< Pre-slot persistence schema version.
 
     /**
      * @brief Validate lowercase canonical UUID text.
@@ -90,7 +94,7 @@ namespace terra_virtual_display {
      */
     template<class T>
     bool valid_mode(const T &mode) {
-      return mode.width > 0 && mode.height > 0 && mode.width <= 16384 && mode.height <= 16384 && mode.refresh_numerator > 0 && mode.refresh_denominator > 0 && (mode.bit_depth == 8 || mode.bit_depth == 10 || mode.bit_depth == 12);
+      return mode.width > 0 && mode.height > 0 && mode.width <= 16384 && mode.height <= 16384 && mode.refresh_numerator > 0 && mode.refresh_denominator > 0 && (mode.bit_depth == 8 || mode.bit_depth == 10);
     }
 
     /**
@@ -136,10 +140,14 @@ namespace terra_virtual_display {
     }
 
     /**
-     * @brief Compare provider-confirmed mode with requested mode exactly.
+     * @brief Compare provider-confirmed mode with requested mode by normalized rational refresh.
+     *
+     * @param requested Requested mode.
+     * @param actual Provider-confirmed mode.
+     * @return True when resolution, refresh ratio, bit depth, and HDR match exactly.
      */
     bool mode_matches(const mode_t &requested, const actual_mode_t &actual) {
-      return requested.width == actual.width && requested.height == actual.height && requested.refresh_numerator == actual.refresh_numerator && requested.refresh_denominator == actual.refresh_denominator && requested.bit_depth == actual.bit_depth && requested.hdr == actual.hdr;
+      return requested.width == actual.width && requested.height == actual.height && requested.bit_depth == actual.bit_depth && requested.hdr == actual.hdr && static_cast<std::uint64_t>(requested.refresh_numerator) * actual.refresh_denominator == static_cast<std::uint64_t>(actual.refresh_numerator) * requested.refresh_denominator;
     }
 
     /**
@@ -184,14 +192,92 @@ namespace terra_virtual_display {
     specification_t specification(const resource_t &resource) {
       return {resource.name, resource.requested_mode, resource.position, resource.scale, resource.rotation, resource.primary, resource.hdr, resource.persistent, resource.workspace_id};
     }
+
+    /**
+     * @brief Parse one version-two persisted resource.
+     *
+     * @param value Persisted resource object.
+     * @param max_count Maximum provider connector count.
+     * @return Parsed resource, or no value when invalid.
+     */
+    std::optional<resource_t> parse_resource_v2(const nlohmann::json &value, const std::uint32_t max_count) {
+      const auto parsed_state = parse_state(value.at("state").get<std::string>());
+      if (!parsed_state) {
+        return std::nullopt;
+      }
+      resource_t resource {
+        value.at("id").get<std::string>(),
+        value.at("name").get<std::string>(),
+        std::nullopt,
+        parsed_state.value(),
+        parse_mode(value.at("requestedMode")),
+        {},
+        {value.at("position").at("x").get<int>(), value.at("position").at("y").get<int>()},
+        value.at("scale").get<double>(),
+        value.at("rotation").get<int>(),
+        value.at("primary").get<bool>(),
+        value.at("hdr").get<bool>(),
+        value.at("persistent").get<bool>(),
+        std::nullopt,
+        std::nullopt,
+        value.at("error"),
+        value.at("revision").get<std::uint64_t>(),
+        value.at("slot").get<std::uint32_t>(),
+        {}
+      };
+      resource.actual_mode = parse_actual_mode(value.at("actualMode"));
+      resource.actual_mode.position = resource.position;
+      if (!value.at("ownerClientUuid").is_null()) {
+        resource.owner_client_uuid = value.at("ownerClientUuid").get<std::string>();
+      }
+      if (!value.at("workspaceId").is_null()) {
+        resource.workspace_id = value.at("workspaceId").get<std::string>();
+      }
+      if (!value.at("sessionId").is_null()) {
+        resource.session_id = value.at("sessionId").get<std::string>();
+      }
+      const bool invalid_attachment = resource.state == state_t::attached ? resource.session_id.has_value() == resource.workspace_id.has_value() : resource.session_id.has_value();
+      if (!valid_uuid(resource.id) || (resource.owner_client_uuid && !valid_uuid(*resource.owner_client_uuid)) || !valid_specification(specification(resource)) || resource.actual_mode.id.empty() || !valid_mode(resource.actual_mode) || resource.revision == 0 || resource.slot >= max_count || resource.state == state_t::provisioning || resource.state == state_t::deleting || invalid_attachment || (resource.session_id && !valid_uuid(*resource.session_id))) {
+        return std::nullopt;
+      }
+      return resource;
+    }
+
+    /**
+     * @brief Parse one legacy persisted resource and assign a free slot.
+     *
+     * @param value Legacy persisted resource object.
+     * @param slot Slot assigned to the migrated resource.
+     * @param max_count Maximum provider connector count.
+     * @return Parsed resource, or no value when invalid.
+     */
+    std::optional<resource_t> parse_resource_v1(const nlohmann::json &value, const std::uint32_t slot, const std::uint32_t max_count) {
+      auto migrated = value;
+      migrated["slot"] = slot;
+      return parse_resource_v2(migrated, max_count);
+    }
+
+    /**
+     * @brief Build a comparable JSON snapshot of a resource collection.
+     *
+     * @param values Resources to serialize.
+     * @return Sorted JSON array.
+     */
+    nlohmann::json collection_json(const std::map<std::string, resource_t, std::less<>> &values) {
+      nlohmann::json records = nlohmann::json::array();
+      for (const auto &[id, resource] : values) {
+        auto record = to_json(resource);
+        record["slot"] = resource.slot;
+        records.push_back(std::move(record));
+      }
+      return records;
+    }
   }  // namespace
 
   struct manager_t::impl_t {
     callbacks_t callbacks;  ///< Injected services.
     mutable std::mutex mutex;  ///< Serializes state and provider operations.
     bool usable = false;  ///< Whether initialization succeeded.
-    std::uint32_t baseline_count = 0;  ///< Immutable provider count floor.
-    std::set<std::string> baseline_ids;  ///< Immutable baseline connector inventory.
     std::map<std::string, resource_t, std::less<>> resources;  ///< Resources by API UUID.
     std::uint64_t collection_revision = 0;  ///< Monotonic collection revision.
 
@@ -206,10 +292,10 @@ namespace terra_virtual_display {
       nlohmann::json records = nlohmann::json::array();
       for (const auto &[id, resource] : values) {
         auto value = to_json(resource);
-        value["platformId"] = resource.platform_id;
+        value["slot"] = resource.slot;
         records.push_back(std::move(value));
       }
-      return {{"version", DOCUMENT_VERSION}, {"baselineCount", baseline_count}, {"baselineInventory", baseline_ids}, {"collectionRevision", revision}, {"resources", std::move(records)}};
+      return {{"version", DOCUMENT_VERSION}, {"collectionRevision", revision}, {"resources", std::move(records)}};
     }
 
     /**
@@ -228,28 +314,30 @@ namespace terra_virtual_display {
     }
 
     /**
-     * @brief Read and validate provider count and inventory atomically under manager lock.
+     * @brief Read and validate provider inventory under manager lock.
      *
-     * @return Provider count and unique inventory, or no value on failure.
+     * @return Provider connectors, or no value on failure.
      */
-    std::optional<std::pair<std::uint32_t, std::set<std::string>>> provider_state() const {
+    std::optional<std::vector<connector_t>> provider_state() const {
       try {
         if (!callbacks.provider_healthy || !callbacks.provider_healthy()) {
           BOOST_LOG(error) << "Terra virtual display provider_state: provider unhealthy";
           return std::nullopt;
         }
-        const auto count = callbacks.read_count ? callbacks.read_count() : std::nullopt;
         const auto inventory = callbacks.inventory ? callbacks.inventory() : std::nullopt;
-        if (!count || !inventory || inventory->size() != *count) {
-          BOOST_LOG(error) << "Terra virtual display provider_state: count=" << (count ? std::to_string(*count) : std::string {"unavailable"}) << " inventory=" << (inventory ? std::to_string(inventory->size()) : std::string {"unavailable"});
+        if (!inventory || inventory->size() > callbacks.max_count) {
+          BOOST_LOG(error) << "Terra virtual display provider_state: inventory unavailable or oversized";
           return std::nullopt;
         }
-        std::set<std::string> ids(inventory->begin(), inventory->end());
-        if (ids.size() != inventory->size()) {
-          BOOST_LOG(error) << "Terra virtual display provider_state: duplicate inventory ids";
-          return std::nullopt;
+        std::set<std::uint32_t> slots;
+        std::set<std::string> ids;
+        for (const auto &connector : *inventory) {
+          if (connector.slot >= callbacks.max_count || connector.platform_id.empty() || !slots.emplace(connector.slot).second || !ids.emplace(connector.platform_id).second) {
+            BOOST_LOG(error) << "Terra virtual display provider_state: duplicate or invalid connector";
+            return std::nullopt;
+          }
         }
-        return std::pair {*count, std::move(ids)};
+        return inventory;
       } catch (...) {
         BOOST_LOG(error) << "Terra virtual display provider_state: threw";
         return std::nullopt;
@@ -257,26 +345,54 @@ namespace terra_virtual_display {
     }
 
     /**
-     * @brief Check completed provider count and inventory consistency.
+     * @brief Check that provider inventory contains exactly the managed slots.
      *
-     * @param count Expected count.
-     * @return True when provider reports expected consistent state.
+     * @return True when provider state matches the published resources.
      */
-    bool count_matches(const std::uint32_t count) const {
-      const auto state = provider_state();
-      return state && state->first == count;
+    bool provider_slots_match() const {
+      const auto provider = provider_state();
+      if (!provider || provider->size() != resources.size()) {
+        return false;
+      }
+      for (const auto &connector : *provider) {
+        const auto found = std::ranges::find_if(resources, [&](const auto &entry) {
+          return entry.second.slot == connector.slot;
+        });
+        if (found == resources.end()) {
+          return false;
+        }
+      }
+      return true;
     }
 
     /**
-     * @brief Apply complete managed configuration and collect actual modes.
+     * @brief Return the lowest free connector slot.
      *
-     * @param values Candidate resources updated with actual modes.
+     * @return Free slot, or no value when capacity is exhausted.
+     */
+    std::optional<std::uint32_t> free_slot() const {
+      for (std::uint32_t slot = 0; slot < callbacks.max_count; ++slot) {
+        if (std::ranges::none_of(resources, [&](const auto &entry) {
+              return entry.second.slot == slot;
+            })) {
+          return slot;
+        }
+      }
+      return std::nullopt;
+    }
+
+    /**
+     * @brief Apply complete managed topology and collect actual modes.
+     *
+     * @param values Candidate resources updated with connector identifiers and actual modes.
+     * @param published Published resources before the transaction, or null.
      * @return True when provider applied and returned valid results.
      */
     bool apply(decltype(resources) &values, const decltype(resources) *published = nullptr) const {
       std::vector<platform_configuration_t> configurations;
+      configurations.reserve(values.size());
       for (const auto &[id, resource] : values) {
-        configurations.push_back({resource.platform_id, specification(resource), resource.actual_mode});
+        configurations.push_back({resource.slot, resource.platform_id, specification(resource), resource.actual_mode});
       }
       try {
         if (!callbacks.apply_configuration || !callbacks.apply_configuration(configurations) || configurations.size() != values.size()) {
@@ -285,18 +401,40 @@ namespace terra_virtual_display {
       } catch (...) {
         return false;
       }
-      std::size_t index = 0;
+
+      std::map<std::uint32_t, const platform_configuration_t *, std::less<>> by_slot;
+      for (const auto &configuration : configurations) {
+        if (configuration.platform_id.empty() || configuration.actual_mode.id.empty() || !valid_mode(configuration.actual_mode) || !by_slot.emplace(configuration.slot, &configuration).second) {
+          return false;
+        }
+      }
+      const auto provider = provider_state();
+      if (!provider || provider->size() != configurations.size()) {
+        return false;
+      }
+      for (const auto &connector : *provider) {
+        if (!by_slot.contains(connector.slot)) {
+          return false;
+        }
+      }
+
       for (auto &[id, resource] : values) {
-        if (configurations[index].platform_id != resource.platform_id || configurations[index].actual_mode.id.empty() || !valid_mode(configurations[index].actual_mode)) {
+        const auto found = by_slot.find(resource.slot);
+        if (found == by_slot.end()) {
+          return false;
+        }
+        const auto &configuration = *found->second;
+        if (!mode_matches(resource.requested_mode, configuration.actual_mode)) {
           return false;
         }
         if (published) {
           const auto published_resource = published->find(id);
-          if (published_resource != published->end() && resource.revision == published_resource->second.revision && (resource.position.x != configurations[index].actual_mode.position.x || resource.position.y != configurations[index].actual_mode.position.y)) {
+          if (published_resource != published->end() && resource.revision == published_resource->second.revision && (resource.position.x != configuration.actual_mode.position.x || resource.position.y != configuration.actual_mode.position.y || (!resource.platform_id.empty() && resource.platform_id != configuration.platform_id))) {
             ++resource.revision;
           }
         }
-        resource.actual_mode = configurations[index++].actual_mode;
+        resource.platform_id = configuration.platform_id;
+        resource.actual_mode = configuration.actual_mode;
         resource.position = resource.actual_mode.position;
       }
       return true;
@@ -331,21 +469,16 @@ namespace terra_virtual_display {
     }
 
     /**
-     * @brief Restore count and published provider configuration.
+     * @brief Reapply a previous resource collection and restore host configuration.
      *
-     * @param count Count before failed mutation.
+     * @param previous Resources to reapply.
      * @return True when rollback completed.
      */
-    bool rollback(const std::uint32_t count) const {
-      bool count_restored = false;
-      try {
-        count_restored = callbacks.set_count && callbacks.set_count(count) && count_matches(count);
-      } catch (...) {
-      }
+    bool rollback(const decltype(resources) &previous) const {
       bool reapplied = false;
       try {
-        auto old = resources;
-        reapplied = old.empty() || apply(old);
+        auto old = previous;
+        reapplied = callbacks.apply_configuration && apply(old);
       } catch (...) {
       }
       bool restored = false;
@@ -353,16 +486,16 @@ namespace terra_virtual_display {
         restored = !callbacks.restore_configuration || callbacks.restore_configuration();
       } catch (...) {
       }
-      return count_restored && reapplied && restored;
+      return reapplied && restored;
     }
 
     /**
      * @brief Restore provider state or prevent further mutations after divergence.
      *
-     * @param count Connector count before failed mutation.
+     * @param previous Resources before failed mutation.
      */
-    void rollback_or_disable(const std::uint32_t count) {
-      if (!rollback(count)) {
+    void rollback_or_disable(const decltype(resources) &previous) {
+      if (!rollback(previous)) {
         usable = false;
       }
     }
@@ -371,18 +504,7 @@ namespace terra_virtual_display {
      * @brief Reapply published configuration or prevent further mutations.
      */
     void reapply_or_disable() {
-      auto old = resources;
-      bool reapplied = false;
-      try {
-        reapplied = old.empty() || apply(old);
-      } catch (...) {
-      }
-      bool restored = false;
-      try {
-        restored = !callbacks.restore_configuration || callbacks.restore_configuration();
-      } catch (...) {
-      }
-      if (!reapplied || !restored) {
+      if (!rollback(resources)) {
         usable = false;
       }
     }
@@ -404,6 +526,15 @@ namespace terra_virtual_display {
         return false;
       }
     }
+
+    /** @brief Restore captured host display configuration. @return True when restoration completed. */
+    bool restore_configuration() const {
+      try {
+        return !callbacks.restore_configuration || callbacks.restore_configuration();
+      } catch (...) {
+        return false;
+      }
+    }
   };
 
   manager_t::manager_t(callbacks_t callbacks):
@@ -416,69 +547,63 @@ namespace terra_virtual_display {
     try {
       const auto text = impl_->callbacks.load ? impl_->callbacks.load() : std::nullopt;
       if (!text) {
-        impl_->baseline_count = provider->first;
-        impl_->baseline_ids = provider->second;
-        impl_->usable = impl_->save(impl_->resources, 0);
-        return;
-      }
-      const auto doc = nlohmann::json::parse(*text);
-      if (!doc.is_object() || doc.at("version") != DOCUMENT_VERSION) {
-        return;
-      }
-      impl_->baseline_count = doc.at("baselineCount").get<std::uint32_t>();
-      impl_->baseline_ids = doc.at("baselineInventory").get<std::set<std::string>>();
-      impl_->collection_revision = doc.at("collectionRevision").get<std::uint64_t>();
-      if (impl_->baseline_ids.size() != impl_->baseline_count || !std::includes(provider->second.begin(), provider->second.end(), impl_->baseline_ids.begin(), impl_->baseline_ids.end())) {
-        BOOST_LOG(error) << "Terra virtual display startup: persisted baseline does not match provider inventory";
-        return;
-      }
-      for (const auto &value : doc.at("resources")) {
-        const auto parsed_state = parse_state(value.at("state").get<std::string>());
-        if (!parsed_state) {
+        // No persisted resources: clear any stale driver connectors so Sol is authoritative.
+        if (!impl_->capture_configuration()) {
           return;
         }
-        resource_t resource {
-          value.at("id").get<std::string>(),
-          value.at("name").get<std::string>(),
-          std::nullopt,
-          parsed_state.value(),
-          parse_mode(value.at("requestedMode")),
-          {},
-          {value.at("position").at("x").get<int>(), value.at("position").at("y").get<int>()},
-          value.at("scale").get<double>(),
-          value.at("rotation").get<int>(),
-          value.at("primary").get<bool>(),
-          value.at("hdr").get<bool>(),
-          value.at("persistent").get<bool>(),
-          std::nullopt,
-          std::nullopt,
-          value.at("error"),
-          value.at("revision").get<std::uint64_t>(),
-          value.at("platformId").get<std::string>()
-        };
-        resource.actual_mode = parse_actual_mode(value.at("actualMode"));
-        resource.actual_mode.position = resource.position;
-        if (!value.at("ownerClientUuid").is_null()) {
-          resource.owner_client_uuid = value.at("ownerClientUuid").get<std::string>();
-        }
-        if (!value.at("workspaceId").is_null()) {
-          resource.workspace_id = value.at("workspaceId").get<std::string>();
-        }
-        if (!value.at("sessionId").is_null()) {
-          resource.session_id = value.at("sessionId").get<std::string>();
-        }
-        const bool invalid_attachment = resource.state == state_t::attached ? resource.session_id.has_value() == resource.workspace_id.has_value() : resource.session_id.has_value();
-        if (!valid_uuid(resource.id) || (resource.owner_client_uuid && !valid_uuid(*resource.owner_client_uuid)) || !valid_specification(specification(resource)) || resource.actual_mode.id.empty() || !valid_mode(resource.actual_mode) || resource.revision == 0 || impl_->baseline_ids.contains(resource.platform_id) || resource.state == state_t::provisioning || resource.state == state_t::deleting || invalid_attachment || (resource.session_id && !valid_uuid(*resource.session_id)) || !impl_->resources.emplace(resource.id, resource).second) {
+        decltype(impl_->resources) empty;
+        if (!impl_->apply(empty)) {
+          static_cast<void>(impl_->restore_configuration());
           return;
         }
+        impl_->usable = impl_->save(empty, 0);
+        return;
       }
-      const auto loaded_resources = impl_->resources;
-      std::set<std::string> managed;
-      for (const auto &[id, resource] : impl_->resources) {
-        if (!managed.emplace(resource.platform_id).second) {
-          return;
+
+      auto doc = nlohmann::json::parse(*text);
+      if (!doc.is_object()) {
+        return;
+      }
+      const auto version = doc.at("version").get<int>();
+      std::optional<decltype(impl_->resources)> parsed;
+      if (version == DOCUMENT_VERSION && doc.at("resources").is_array()) {
+        decltype(impl_->resources) loaded;
+        std::set<std::uint32_t> slots;
+        for (const auto &value : doc.at("resources")) {
+          const auto resource = parse_resource_v2(value, impl_->callbacks.max_count);
+          if (!resource || !slots.emplace(resource->slot).second || !loaded.emplace(resource->id, *resource).second) {
+            return;
+          }
         }
+        parsed = std::move(loaded);
+      } else if (version == LEGACY_DOCUMENT_VERSION && doc.at("resources").is_array()) {
+        // Migrate persisted resources in identifier order so slot assignment is deterministic.
+        std::map<std::string, nlohmann::json, std::less<>> legacy;
+        for (const auto &value : doc.at("resources")) {
+          if (!value.is_object() || !value.contains("id") || !value.at("id").is_string() || !legacy.emplace(value.at("id").get<std::string>(), value).second) {
+            return;
+          }
+        }
+        decltype(impl_->resources) loaded;
+        std::uint32_t next_slot = 0;
+        for (const auto &[id, value] : legacy) {
+          if (next_slot >= impl_->callbacks.max_count) {
+            return;
+          }
+          const auto resource = parse_resource_v1(value, next_slot, impl_->callbacks.max_count);
+          if (!resource) {
+            return;
+          }
+          loaded.emplace(resource->id, *resource);
+          ++next_slot;
+        }
+        parsed = std::move(loaded);
+      } else {
+        return;
       }
+      impl_->collection_revision = doc.value("collectionRevision", std::uint64_t {0});
+      impl_->resources = std::move(*parsed);
+
       // Ephemeral records are restart-owned cleanup, never published again.
       for (auto iterator = impl_->resources.begin(); iterator != impl_->resources.end();) {
         if (!iterator->second.persistent) {
@@ -495,90 +620,31 @@ namespace terra_virtual_display {
           ++resource.revision;
         }
       }
-      const auto target = static_cast<std::uint32_t>(impl_->baseline_count + impl_->resources.size());
-      if (impl_->resources.empty() && provider->first == impl_->baseline_count && provider->second == impl_->baseline_ids) {
-        if (!loaded_resources.empty()) {
-          ++impl_->collection_revision;
-          if (!impl_->save(impl_->resources, impl_->collection_revision)) {
-            return;
-          }
-          impl_->notify(loaded_resources, impl_->resources);
-        }
-        impl_->usable = true;
-        return;
-      }
-      if (!impl_->capture_configuration()) {
-        return;
-      }
+
+      const auto before = impl_->resources;
       bool reconciled = false;
       auto restore = util::fail_guard([&]() {
         if (reconciled) {
           return;
         }
-        try {
-          static_cast<void>(impl_->callbacks.set_count && impl_->callbacks.set_count(provider->first));
-        } catch (...) {
-        }
-        try {
-          auto previous_resources = loaded_resources;
-          if (!previous_resources.empty()) {
-            static_cast<void>(impl_->apply(previous_resources));
-          }
-        } catch (...) {
-        }
-        try {
-          static_cast<void>(!impl_->callbacks.restore_configuration || impl_->callbacks.restore_configuration());
-        } catch (...) {
-        }
+        static_cast<void>(impl_->restore_configuration());
       });
-      const bool inventory_matches = provider->first == target && std::ranges::all_of(impl_->resources, [&](const auto &entry) {
-                                       return provider->second.contains(entry.second.platform_id);
-                                     }) &&
-                                     std::ranges::all_of(provider->second, [&](const auto &platform_id) {
-                                       return impl_->baseline_ids.contains(platform_id) || std::ranges::any_of(impl_->resources, [&](const auto &entry) {
-                                                return entry.second.platform_id == platform_id;
-                                              });
-                                     });
-      if (!inventory_matches) {
-        if (!impl_->callbacks.set_count || !impl_->callbacks.set_count(impl_->baseline_count) || !impl_->callbacks.set_count(target)) {
-          return;
-        }
-        const auto reconciled = impl_->provider_state();
-        if (!reconciled || reconciled->first != target) {
-          return;
-        }
-        std::set<std::string> assigned;
-        for (const auto &[id, resource] : impl_->resources) {
-          if (reconciled->second.contains(resource.platform_id)) {
-            assigned.emplace(resource.platform_id);
-          }
-        }
-        std::vector<std::string> replacements;
-        std::set_difference(reconciled->second.begin(), reconciled->second.end(), impl_->baseline_ids.begin(), impl_->baseline_ids.end(), std::back_inserter(replacements));
-        std::erase_if(replacements, [&](const auto &platform_id) {
-          return assigned.contains(platform_id);
-        });
-        for (auto &[id, resource] : impl_->resources) {
-          if (!reconciled->second.contains(resource.platform_id)) {
-            if (replacements.empty()) {
-              return;
-            }
-            resource.platform_id = replacements.back();
-            replacements.pop_back();
-            ++resource.revision;
-          }
-        }
-      }
-      if (!impl_->apply(impl_->resources, &loaded_resources)) {
+      if (!impl_->capture_configuration() || !impl_->apply(impl_->resources, &before)) {
+        impl_->resources.clear();
         return;
       }
+
+      const bool changed = version != DOCUMENT_VERSION || collection_json(before) != collection_json(impl_->resources);
       ++impl_->collection_revision;
       if (!impl_->save(impl_->resources, impl_->collection_revision)) {
+        impl_->resources.clear();
         return;
       }
       reconciled = true;
       impl_->usable = true;
-      impl_->notify(loaded_resources, impl_->resources);
+      if (changed) {
+        impl_->notify(before, impl_->resources);
+      }
     } catch (...) {
       impl_->resources.clear();
     }
@@ -593,7 +659,7 @@ namespace terra_virtual_display {
 
   std::uint32_t manager_t::max_active() const {
     std::scoped_lock lock {impl_->mutex};
-    return impl_->callbacks.max_count > impl_->baseline_count ? impl_->callbacks.max_count - impl_->baseline_count : 0;
+    return impl_->callbacks.max_count > impl_->resources.size() ? static_cast<std::uint32_t>(impl_->callbacks.max_count - impl_->resources.size()) : 0;
   }
 
   result_t manager_t::create(const std::string &owner, const specification_t &spec) {
@@ -616,51 +682,30 @@ namespace terra_virtual_display {
     if (!valid_uuid(resource_id) || impl_->resources.contains(resource_id)) {
       return {status_t::invalid, std::nullopt};
     }
-    const auto before = impl_->provider_state();
-    const auto expected = static_cast<std::uint32_t>(impl_->baseline_count + impl_->resources.size());
-    if (!before || before->first != expected) {
-      BOOST_LOG(error) << "Terra virtual display create: provider count drift, expected " << expected << " observed " << (before ? std::to_string(before->first) : std::string {"unavailable"});
+    if (!impl_->provider_slots_match()) {
+      BOOST_LOG(error) << "Terra virtual display create: provider topology drift";
       return {status_t::provider_error, std::nullopt};
     }
-    if (expected >= impl_->callbacks.max_count) {
+    const auto slot = impl_->free_slot();
+    if (!slot) {
       return {status_t::limit_reached, std::nullopt};
     }
+    const auto previous = impl_->resources;
+    auto candidate = impl_->resources;
+    resource_t resource {resource_id, spec.name, owner, state_t::ready, spec.mode, {}, spec.position, spec.scale, spec.rotation, spec.primary, spec.hdr, spec.persistent, spec.workspace_id, std::nullopt, nullptr, 1, *slot, {}};
+    candidate.emplace(resource.id, resource);
     if (!impl_->capture_configuration()) {
       BOOST_LOG(error) << "Terra virtual display create: rollback capture failed";
       return {status_t::provider_error, std::nullopt};
     }
-    try {
-      if (!impl_->callbacks.set_count || !impl_->callbacks.set_count(expected + 1)) {
-        BOOST_LOG(error) << "Terra virtual display create: provider count update to " << (expected + 1) << " failed";
-        impl_->rollback_or_disable(expected);
-        return {status_t::provider_error, std::nullopt};
-      }
-    } catch (...) {
-      BOOST_LOG(error) << "Terra virtual display create: provider count update threw";
-      impl_->rollback_or_disable(expected);
-      return {status_t::provider_error, std::nullopt};
-    }
-    const auto after = impl_->provider_state();
-    std::vector<std::string> added;
-    if (after) {
-      std::set_difference(after->second.begin(), after->second.end(), before->second.begin(), before->second.end(), std::back_inserter(added));
-    }
-    if (!after || after->first != expected + 1 || added.size() != 1) {
-      BOOST_LOG(error) << "Terra virtual display create: provider inventory mismatch after update, count " << (after ? std::to_string(after->first) : std::string {"unavailable"}) << " added " << added.size();
-      impl_->rollback_or_disable(expected);
-      return {status_t::provider_error, std::nullopt};
-    }
-    resource_t resource {resource_id, spec.name, owner, state_t::ready, spec.mode, {}, spec.position, spec.scale, spec.rotation, spec.primary, spec.hdr, spec.persistent, spec.workspace_id, std::nullopt, nullptr, 1, added.front()};
-    const auto previous = impl_->resources;
-    auto candidate = impl_->resources;
-    candidate.emplace(resource.id, resource);
     if (!impl_->apply(candidate, &previous)) {
-      impl_->rollback_or_disable(expected);
+      BOOST_LOG(error) << "Terra virtual display create: topology apply failed";
+      impl_->rollback_or_disable(previous);
       return {status_t::provider_error, std::nullopt};
     }
     const auto revision = impl_->collection_revision + 1;
     if (!impl_->save(candidate, revision)) {
-      impl_->rollback_or_disable(expected);
+      impl_->rollback_or_disable(previous);
       return {status_t::persistence_error, std::nullopt};
     }
     impl_->resources = std::move(candidate);
@@ -692,34 +737,28 @@ namespace terra_virtual_display {
     } catch (...) {
       return {status_t::invalid, {}};
     }
-    const auto before = impl_->provider_state();
-    const auto expected = static_cast<std::uint32_t>(impl_->baseline_count + impl_->resources.size());
-    if (!before || before->first != expected) {
+    if (!impl_->provider_slots_match()) {
       return {status_t::provider_error, {}};
     }
-    if (specifications.size() > impl_->callbacks.max_count - std::min(expected, impl_->callbacks.max_count)) {
-      return {status_t::limit_reached, {}};
+    std::set<std::uint32_t> used_slots;
+    for (const auto &[id, resource] : impl_->resources) {
+      used_slots.emplace(resource.slot);
     }
-    if (!impl_->capture_configuration()) {
-      return {status_t::provider_error, {}};
-    }
-    try {
-      if (!impl_->callbacks.set_count || !impl_->callbacks.set_count(expected + static_cast<std::uint32_t>(specifications.size()))) {
-        impl_->rollback_or_disable(expected);
-        return {status_t::provider_error, {}};
+    std::vector<std::uint32_t> slots;
+    slots.reserve(specifications.size());
+    for (std::size_t index = 0; index < specifications.size(); ++index) {
+      std::optional<std::uint32_t> slot;
+      for (std::uint32_t candidate = 0; candidate < impl_->callbacks.max_count; ++candidate) {
+        if (!used_slots.contains(candidate)) {
+          slot = candidate;
+          break;
+        }
       }
-    } catch (...) {
-      impl_->rollback_or_disable(expected);
-      return {status_t::provider_error, {}};
-    }
-    const auto after = impl_->provider_state();
-    std::vector<std::string> added;
-    if (after) {
-      std::set_difference(after->second.begin(), after->second.end(), before->second.begin(), before->second.end(), std::back_inserter(added));
-    }
-    if (!after || after->first != expected + specifications.size() || added.size() != specifications.size()) {
-      impl_->rollback_or_disable(expected);
-      return {status_t::provider_error, {}};
+      if (!slot) {
+        return {status_t::limit_reached, {}};
+      }
+      used_slots.emplace(*slot);
+      slots.push_back(*slot);
     }
     const auto previous = impl_->resources;
     auto candidate = impl_->resources;
@@ -727,19 +766,20 @@ namespace terra_virtual_display {
     resources.reserve(specifications.size());
     for (std::size_t index = 0; index < specifications.size(); ++index) {
       const auto &spec = specifications[index];
-      resource_t resource {resource_ids[index], spec.name, owner, spec.workspace_id ? state_t::attached : state_t::ready, spec.mode, {}, spec.position, spec.scale, spec.rotation, spec.primary, spec.hdr, spec.persistent, spec.workspace_id, std::nullopt, nullptr, 1, added[index]};
+      resource_t resource {resource_ids[index], spec.name, owner, spec.workspace_id ? state_t::attached : state_t::ready, spec.mode, {}, spec.position, spec.scale, spec.rotation, spec.primary, spec.hdr, spec.persistent, spec.workspace_id, std::nullopt, nullptr, 1, slots[index], {}};
       candidate.emplace(resource.id, resource);
       resources.push_back(std::move(resource));
     }
-    if (!impl_->apply(candidate, &previous) || std::ranges::any_of(resources, [&](const auto &resource) {
-          return !mode_matches(resource.requested_mode, candidate.at(resource.id).actual_mode);
-        })) {
-      impl_->rollback_or_disable(expected);
+    if (!impl_->capture_configuration()) {
+      return {status_t::provider_error, {}};
+    }
+    if (!impl_->apply(candidate, &previous)) {
+      impl_->rollback_or_disable(previous);
       return {status_t::provider_error, {}};
     }
     const auto revision = impl_->collection_revision + 1;
     if (!impl_->save(candidate, revision)) {
-      impl_->rollback_or_disable(expected);
+      impl_->rollback_or_disable(previous);
       return {status_t::persistence_error, {}};
     }
     impl_->resources = std::move(candidate);
@@ -780,8 +820,7 @@ namespace terra_virtual_display {
     if (found->second.revision != expected_revision || found->second.state == state_t::attached) {
       return {status_t::conflict, std::nullopt};
     }
-    const auto provider = impl_->provider_state();
-    if (!provider || provider->first != impl_->baseline_count + impl_->resources.size()) {
+    if (!impl_->provider_slots_match()) {
       return {status_t::provider_error, std::nullopt};
     }
     const auto previous = impl_->resources;
@@ -848,54 +887,22 @@ namespace terra_virtual_display {
     if (found->second.revision != expected_revision || found->second.state == state_t::attached) {
       return {status_t::conflict, std::nullopt};
     }
-    const auto before = impl_->provider_state();
-    const auto expected = static_cast<std::uint32_t>(impl_->baseline_count + impl_->resources.size());
-    if (!before || before->first != expected) {
-      return {status_t::provider_error, std::nullopt};
-    }
-    if (!impl_->capture_configuration()) {
-      return {status_t::provider_error, std::nullopt};
-    }
-    try {
-      if (!impl_->callbacks.set_count || !impl_->callbacks.set_count(expected - 1)) {
-        impl_->rollback_or_disable(expected);
-        return {status_t::provider_error, std::nullopt};
-      }
-    } catch (...) {
-      impl_->rollback_or_disable(expected);
-      return {status_t::provider_error, std::nullopt};
-    }
-    const auto after = impl_->provider_state();
-    std::vector<std::string> removed;
-    if (after) {
-      std::set_difference(before->second.begin(), before->second.end(), after->second.begin(), after->second.end(), std::back_inserter(removed));
-    }
-    if (!after || after->first != expected - 1 || removed.size() != 1 || impl_->baseline_ids.contains(removed.front())) {
-      impl_->rollback_or_disable(expected);
+    if (!impl_->provider_slots_match()) {
       return {status_t::provider_error, std::nullopt};
     }
     const auto previous = impl_->resources;
     auto candidate = impl_->resources;
-    const auto target_platform = candidate.at(id).platform_id;
     candidate.erase(id);
-    if (removed.front() != target_platform) {
-      auto survivor = std::find_if(candidate.begin(), candidate.end(), [&](const auto &item) {
-        return item.second.platform_id == removed.front();
-      });
-      if (survivor == candidate.end() || !after->second.contains(target_platform)) {
-        impl_->rollback_or_disable(expected);
-        return {status_t::provider_error, std::nullopt};
-      }
-      survivor->second.platform_id = target_platform;
-      ++survivor->second.revision;
+    if (!impl_->capture_configuration()) {
+      return {status_t::provider_error, std::nullopt};
     }
-    if (!candidate.empty() && !impl_->apply(candidate, &previous)) {
-      impl_->rollback_or_disable(expected);
+    if (!impl_->apply(candidate, &previous)) {
+      impl_->rollback_or_disable(previous);
       return {status_t::provider_error, std::nullopt};
     }
     const auto revision = impl_->collection_revision + 1;
     if (!impl_->save(candidate, revision)) {
-      impl_->rollback_or_disable(expected);
+      impl_->rollback_or_disable(previous);
       return {status_t::persistence_error, std::nullopt};
     }
     const auto deleted = found->second;
@@ -1007,12 +1014,12 @@ namespace terra_virtual_display {
     const auto previous = impl_->resources;
     auto candidate = impl_->resources;
     bool changed = false;
-    std::vector<std::string> ephemeral_ids;
+    bool removed_connector = false;
     for (auto &[id, resource] : candidate) {
       if (resource.owner_client_uuid && *resource.owner_client_uuid == owner) {
         changed = true;
         if (!resource.persistent) {
-          ephemeral_ids.push_back(id);
+          removed_connector = true;
           continue;
         }
         resource.state = state_t::ready;
@@ -1025,70 +1032,23 @@ namespace terra_virtual_display {
     if (!changed) {
       return status_t::success;
     }
-    if (!impl_->capture_configuration()) {
-      return status_t::provider_error;
-    }
-    const auto expected = static_cast<std::uint32_t>(impl_->baseline_count + impl_->resources.size());
-    if (!ephemeral_ids.empty()) {
-      const auto before = impl_->provider_state();
-      if (!before || before->first != expected) {
+    std::erase_if(candidate, [&](const auto &entry) {
+      const auto &resource = entry.second;
+      return resource.owner_client_uuid && *resource.owner_client_uuid == owner && !resource.persistent;
+    });
+    if (removed_connector) {
+      if (!impl_->provider_slots_match() || !impl_->capture_configuration()) {
         return status_t::provider_error;
       }
-      const auto target = expected - static_cast<std::uint32_t>(ephemeral_ids.size());
-      try {
-        if (!impl_->callbacks.set_count || !impl_->callbacks.set_count(target)) {
-          impl_->rollback_or_disable(expected);
-          return status_t::provider_error;
-        }
-      } catch (...) {
-        impl_->rollback_or_disable(expected);
-        return status_t::provider_error;
-      }
-      const auto after = impl_->provider_state();
-      std::vector<std::string> removed;
-      if (after) {
-        std::set_difference(before->second.begin(), before->second.end(), after->second.begin(), after->second.end(), std::back_inserter(removed));
-      }
-      if (!after || after->first != target || removed.size() != ephemeral_ids.size() || std::ranges::any_of(removed, [&](const auto &platform_id) {
-            return impl_->baseline_ids.contains(platform_id);
-          })) {
-        impl_->rollback_or_disable(expected);
-        return status_t::provider_error;
-      }
-      for (const auto &id : ephemeral_ids) {
-        candidate.erase(id);
-      }
-      std::set<std::string> assigned;
-      for (const auto &[id, resource] : candidate) {
-        if (after->second.contains(resource.platform_id)) {
-          assigned.emplace(resource.platform_id);
-        }
-      }
-      std::vector<std::string> replacements;
-      std::set_difference(after->second.begin(), after->second.end(), impl_->baseline_ids.begin(), impl_->baseline_ids.end(), std::back_inserter(replacements));
-      std::erase_if(replacements, [&](const auto &platform_id) {
-        return assigned.contains(platform_id);
-      });
-      for (auto &[id, resource] : candidate) {
-        if (!after->second.contains(resource.platform_id)) {
-          if (replacements.empty()) {
-            impl_->rollback_or_disable(expected);
-            return status_t::provider_error;
-          }
-          resource.platform_id = replacements.back();
-          replacements.pop_back();
-          ++resource.revision;
-        }
-      }
-      if (!replacements.empty() || (!candidate.empty() && !impl_->apply(candidate, &previous))) {
-        impl_->rollback_or_disable(expected);
+      if (!impl_->apply(candidate, &previous)) {
+        impl_->rollback_or_disable(previous);
         return status_t::provider_error;
       }
     }
     const auto revision = impl_->collection_revision + 1;
     if (!impl_->save(candidate, revision)) {
-      if (!ephemeral_ids.empty()) {
-        impl_->rollback_or_disable(expected);
+      if (removed_connector) {
+        impl_->rollback_or_disable(previous);
       }
       return status_t::persistence_error;
     }

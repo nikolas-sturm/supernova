@@ -1,6 +1,6 @@
 /**
  * @file src/platform/windows/terra_virtual_display_provider.cpp
- * @brief Windows provider callbacks for Terra MttVDD lifecycle management.
+ * @brief Windows provider callbacks for Terra SolVDD lifecycle management.
  */
 
 // header include
@@ -27,7 +27,7 @@
 #include <nlohmann/json.hpp>
 
 // local includes
-#include "mttvdd.h"
+#include "sol_vdd.h"
 #include "src/file_handler.h"
 #include "src/logging.h"
 #include "src/utility.h"
@@ -121,13 +121,13 @@ namespace terra::windows::virtual_display {
       auto api_layer = std::make_shared<display_device::WinApiLayer>();
       display_device::WinDisplayDevice display_api {api_layer};
       if (!display_api.isApiAccessAvailable()) {
-        BOOST_LOG(error) << "Terra MttVDD: rollback capture failed: display API unavailable";
+        BOOST_LOG(error) << "Terra SolVDD: rollback capture failed: display API unavailable";
         return false;
       }
       const auto topology = display_api.getCurrentTopology();
       const auto devices = display_api.enumAvailableDevices();
       if (!display_api.isTopologyValid(topology)) {
-        BOOST_LOG(error) << "Terra MttVDD: rollback capture failed: invalid current topology";
+        BOOST_LOG(error) << "Terra SolVDD: rollback capture failed: invalid current topology";
         return false;
       }
       display_device::StringSet active_ids;
@@ -143,7 +143,7 @@ namespace terra::windows::virtual_display {
         if (!EnumDisplaySettingsExA(device.m_display_name.c_str(), ENUM_CURRENT_SETTINGS, &mode, 0)) {
           // Windows can retain an active topology entry after its monitor is gone (detached KVM or
           // capture device). Such a path has no restorable mode, so capture the remaining displays.
-          BOOST_LOG(warning) << "Terra MttVDD: skipping non-present active display during rollback capture: " << device.m_device_id;
+          BOOST_LOG(warning) << "Terra SolVDD: skipping non-present active display during rollback capture: " << device.m_device_id;
           continue;
         }
         modes.emplace(device.m_device_id, mode);
@@ -164,14 +164,14 @@ namespace terra::windows::virtual_display {
       }
       const auto hdr_states = display_api.getCurrentHdrStates(active_ids);
       if (modes.empty() || hdr_states.size() != active_ids.size() || !display_api.isTopologyValid(restorable_topology)) {
-        BOOST_LOG(error) << "Terra MttVDD: rollback capture failed: modes=" << modes.size() << " hdr=" << hdr_states.size() << " active=" << active_ids.size();
+        BOOST_LOG(error) << "Terra SolVDD: rollback capture failed: modes=" << modes.size() << " hdr=" << hdr_states.size() << " active=" << active_ids.size();
         return false;
       }
       const auto primary = std::ranges::find_if(devices, [&](const auto &device) {
         return device.m_info && device.m_info->m_primary && modes.contains(device.m_device_id);
       });
       if (primary == devices.end()) {
-        BOOST_LOG(error) << "Terra MttVDD: rollback capture failed: no present primary display";
+        BOOST_LOG(error) << "Terra SolVDD: rollback capture failed: no present primary display";
         return false;
       }
       rollback.topology = std::move(restorable_topology);
@@ -246,39 +246,39 @@ namespace terra::windows::virtual_display {
     }
 
     /**
-     * @brief Find libdisplaydevice ID for one MttVDD connector.
+     * @brief Find libdisplaydevice ID for one SolVDD connector.
      *
      * @param windows_api Windows display API layer.
-     * @param platform_id Canonical MttVDD monitor connector ID.
+     * @param platform_id Canonical SolVDD monitor connector ID.
      * @return Stable libdisplaydevice ID, or no value when correlation is ambiguous.
      */
     std::optional<std::string> device_id(display_device::WinApiLayer &windows_api, const std::string_view platform_id) {
       const auto config = windows_api.queryDisplayConfig(display_device::QueryType::All);
       if (!config) {
-        BOOST_LOG(error) << "Terra MttVDD: device_id query failed for " << platform_id;
+        BOOST_LOG(error) << "Terra SolVDD: device_id query failed for " << platform_id;
         return std::nullopt;
       }
       std::optional<std::string> result;
       std::size_t matches = 0;
       for (const auto &path : config->m_paths) {
         const auto monitor_path = windows_api.getMonitorDevicePath(path);
-        if (!mttvdd::monitor_id_matches_path(platform_id, monitor_path)) {
+        if (!sol_vdd::monitor_id_matches_path(platform_id, monitor_path)) {
           continue;
         }
         ++matches;
         const auto id = windows_api.getDeviceId(path);
         if (id.empty()) {
-          BOOST_LOG(error) << "Terra MttVDD: device_id empty for " << platform_id << " matches=" << matches;
+          BOOST_LOG(error) << "Terra SolVDD: device_id empty for " << platform_id << " matches=" << matches;
           return std::nullopt;
         }
         if (result && *result != id) {
-          BOOST_LOG(error) << "Terra MttVDD: device_id ambiguous for " << platform_id << " matches=" << matches;
+          BOOST_LOG(error) << "Terra SolVDD: device_id ambiguous for " << platform_id << " matches=" << matches;
           return std::nullopt;
         }
         result = id;
       }
       if (!result) {
-        BOOST_LOG(verbose) << "Terra MttVDD: device_id no path for " << platform_id;
+        BOOST_LOG(verbose) << "Terra SolVDD: device_id no path for " << platform_id;
       }
       return result;
     }
@@ -287,7 +287,7 @@ namespace terra::windows::virtual_display {
      * @brief Wait for DisplayConfig to expose one newly provisioned connector.
      *
      * @param windows_api Windows display API layer.
-     * @param platform_id Canonical MttVDD monitor connector ID.
+     * @param platform_id Canonical SolVDD monitor connector ID.
      * @return Stable libdisplaydevice ID, or no value after timeout.
      */
     std::optional<std::string> wait_device_id(display_device::WinApiLayer &windows_api, const std::string_view platform_id) {
@@ -323,37 +323,81 @@ namespace terra::windows::virtual_display {
     /**
      * @brief Apply and verify complete managed virtual-display configuration.
      *
-     * @param configurations Managed connector configurations.
+     * Replaces the complete driver topology, correlates each stable connector slot to
+     * its Windows device, then activates and verifies exact mode, refresh, bit depth,
+     * HDR, position, rotation, and primary state.
+     *
+     * @param configurations Managed connector configurations updated in place.
      * @return `true` only after every requested property can be confirmed.
      */
     bool apply(std::vector<configuration_t> &configurations) {
       auto api_layer = std::make_shared<display_device::WinApiLayer>();
       display_device::WinDisplayDevice display_api {api_layer};
       if (!display_api.isApiAccessAvailable()) {
-        BOOST_LOG(error) << "Terra MttVDD: display configuration API unavailable";
+        BOOST_LOG(error) << "Terra SolVDD: display configuration API unavailable";
+        return false;
+      }
+
+      std::vector<sol_vdd::connector_t> driver_topology;
+      driver_topology.reserve(configurations.size());
+      std::set<std::uint32_t, std::less<>> requested_slots;
+      std::size_t primary_count = 0;
+      for (const auto &configuration : configurations) {
+        const auto &spec = configuration.specification;
+        const auto refresh = display::make_rational(spec.mode.refresh_numerator, spec.mode.refresh_denominator);
+        if (spec.scale != 1.0 || (spec.primary && (spec.position.x != 0 || spec.position.y != 0)) || !refresh || (spec.mode.bit_depth != 8 && spec.mode.bit_depth != 10) || !requested_slots.emplace(configuration.slot).second) {
+          BOOST_LOG(error) << "Terra SolVDD: unsupported scale, mode, or slot";
+          return false;
+        }
+        primary_count += spec.primary;
+        driver_topology.push_back({
+          configuration.slot,
+          static_cast<std::uint32_t>(spec.mode.width),
+          static_cast<std::uint32_t>(spec.mode.height),
+          refresh->numerator,
+          refresh->denominator,
+          static_cast<std::uint32_t>(spec.mode.bit_depth),
+          spec.hdr,
+        });
+      }
+      if (primary_count > 1) {
+        BOOST_LOG(error) << "Terra SolVDD: multiple primary displays requested";
+        return false;
+      }
+      if (!sol_vdd::apply_topology_and_wait(driver_topology)) {
+        BOOST_LOG(error) << "Terra SolVDD: driver topology application failed";
+        return false;
+      }
+
+      const auto inventory = sol_vdd::display_inventory();
+      if (!inventory || inventory->size() != driver_topology.size()) {
+        BOOST_LOG(error) << "Terra SolVDD: connector inventory did not converge";
+        return false;
+      }
+      std::map<std::uint32_t, std::string, std::less<>> platform_by_slot;
+      for (const auto &connector : *inventory) {
+        platform_by_slot.emplace(connector.slot, connector.id);
+      }
+      if (platform_by_slot.size() != driver_topology.size()) {
+        BOOST_LOG(error) << "Terra SolVDD: connector inventory is ambiguous";
         return false;
       }
 
       std::map<std::string, std::string, std::less<>> platform_to_device;
       std::set<std::string, std::less<>> requested_devices;
-      std::size_t primary_count = 0;
-      for (const auto &configuration : configurations) {
-        const auto &spec = configuration.specification;
-        if (spec.scale != 1.0 || (spec.primary && (spec.position.x != 0 || spec.position.y != 0))) {
-          BOOST_LOG(error) << "Terra MttVDD: unsupported scale or primary position";
+      for (auto &configuration : configurations) {
+        const auto platform = platform_by_slot.find(configuration.slot);
+        if (platform == platform_by_slot.end()) {
+          BOOST_LOG(error) << "Terra SolVDD: connector slot has no inventory entry";
           return false;
         }
-        primary_count += spec.primary;
+        configuration.platform_id = platform->second;
         const auto id = wait_device_id(*api_layer, configuration.platform_id);
         if (!id || !requested_devices.emplace(*id).second) {
-          BOOST_LOG(error) << "Terra MttVDD: connector correlation failed for " << configuration.platform_id;
+          BOOST_LOG(error) << "Terra SolVDD: connector correlation failed for " << configuration.platform_id;
           return false;
         }
         platform_to_device.emplace(configuration.platform_id, *id);
-      }
-      if (primary_count > 1) {
-        BOOST_LOG(error) << "Terra MttVDD: multiple primary displays requested";
-        return false;
       }
 
       auto topology = display_api.getCurrentTopology();
@@ -366,7 +410,7 @@ namespace terra::windows::virtual_display {
         }
       }
       if (!display_api.isTopologyValid(topology) || !display_api.setTopology(topology)) {
-        BOOST_LOG(error) << "Terra MttVDD: topology activation failed";
+        BOOST_LOG(error) << "Terra SolVDD: topology activation failed";
         return false;
       }
 
@@ -374,7 +418,7 @@ namespace terra::windows::virtual_display {
       display_device::HdrStateMap hdr_states;
       const auto current_hdr_states = display_api.getCurrentHdrStates(requested_devices);
       if (current_hdr_states.size() != requested_devices.size()) {
-        BOOST_LOG(error) << "Terra MttVDD: current HDR state query failed";
+        BOOST_LOG(error) << "Terra SolVDD: current HDR state query failed";
         return false;
       }
       for (const auto &configuration : configurations) {
@@ -388,14 +432,14 @@ namespace terra::windows::virtual_display {
         }
       }
       if ((!modes.empty() && !display_api.setDisplayModes(modes)) || (!hdr_states.empty() && !display_api.setHdrStates(hdr_states))) {
-        BOOST_LOG(error) << "Terra MttVDD: mode or HDR application failed";
+        BOOST_LOG(error) << "Terra SolVDD: mode or HDR application failed";
         return false;
       }
       const auto primary = std::ranges::find_if(configurations, [](const auto &configuration) {
         return configuration.specification.primary;
       });
       if (primary != configurations.end() && !display_api.setAsPrimary(platform_to_device.at(primary->platform_id))) {
-        BOOST_LOG(error) << "Terra MttVDD: primary display application failed";
+        BOOST_LOG(error) << "Terra SolVDD: primary display application failed";
         return false;
       }
 
@@ -404,12 +448,12 @@ namespace terra::windows::virtual_display {
         const auto &id = platform_to_device.at(configuration.platform_id);
         const auto device = std::ranges::find(devices, id, &display_device::EnumeratedDevice::m_device_id);
         if (device == devices.end() || device->m_display_name.empty()) {
-          BOOST_LOG(error) << "Terra MttVDD: activated connector is absent from display enumeration";
+          BOOST_LOG(error) << "Terra SolVDD: activated connector is absent from display enumeration";
           return false;
         }
         DEVMODEA mode {.dmSize = sizeof(DEVMODEA)};
         if (!EnumDisplaySettingsExA(device->m_display_name.c_str(), ENUM_CURRENT_SETTINGS, &mode, 0)) {
-          BOOST_LOG(error) << "Terra MttVDD: current DEVMODE query failed";
+          BOOST_LOG(error) << "Terra SolVDD: current DEVMODE query failed";
           return false;
         }
         mode.dmPosition.x = configuration.specification.position.x;
@@ -417,12 +461,12 @@ namespace terra::windows::virtual_display {
         mode.dmDisplayOrientation = orientation(configuration.specification.rotation);
         mode.dmFields = DM_POSITION | DM_DISPLAYORIENTATION;
         if (ChangeDisplaySettingsExA(device->m_display_name.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr) != DISP_CHANGE_SUCCESSFUL) {
-          BOOST_LOG(error) << "Terra MttVDD: position or rotation staging failed";
+          BOOST_LOG(error) << "Terra SolVDD: position or rotation staging failed";
           return false;
         }
       }
       if (!configurations.empty() && ChangeDisplaySettingsExA(nullptr, nullptr, nullptr, 0, nullptr) != DISP_CHANGE_SUCCESSFUL) {
-        BOOST_LOG(error) << "Terra MttVDD: staged position or rotation commit failed";
+        BOOST_LOG(error) << "Terra SolVDD: staged position or rotation commit failed";
         return false;
       }
 
@@ -432,13 +476,13 @@ namespace terra::windows::virtual_display {
         const auto snapshot = std::ranges::find(snapshots, id, &display::Snapshot::device_id);
         const auto &requested = configuration.specification.mode;
         if (snapshot == snapshots.end() || !snapshot->current_mode || snapshot->scale != display::Rational {1, 1} || snapshot->primary != configuration.specification.primary || snapshot->hdr_enabled.value_or(false) != configuration.specification.hdr) {
-          BOOST_LOG(error) << "Terra MttVDD: applied connector state could not be verified";
+          BOOST_LOG(error) << "Terra SolVDD: applied connector state could not be verified";
           return false;
         }
         const auto &actual = *snapshot->current_mode;
         const auto requested_refresh = display::make_rational(requested.refresh_numerator, requested.refresh_denominator);
-        if (!requested_refresh || actual.size != display::Size {static_cast<std::uint32_t>(requested.width), static_cast<std::uint32_t>(requested.height)} || actual.refresh != *requested_refresh || actual.bit_depth < static_cast<std::uint32_t>(requested.bit_depth) || actual.hdr != requested.hdr) {
-          BOOST_LOG(error) << "Terra MttVDD: applied mode differs from request";
+        if (!requested_refresh || actual.size != display::Size {static_cast<std::uint32_t>(requested.width), static_cast<std::uint32_t>(requested.height)} || actual.refresh != *requested_refresh || actual.bit_depth != static_cast<std::uint32_t>(requested.bit_depth) || actual.hdr != requested.hdr) {
+          BOOST_LOG(error) << "Terra SolVDD: applied mode differs from request";
           return false;
         }
         configuration.actual_mode = {static_cast<int>(actual.size.width), static_cast<int>(actual.size.height), actual.refresh.numerator, actual.refresh.denominator, static_cast<int>(actual.bit_depth), actual.hdr, actual.id, {snapshot->position.x, snapshot->position.y}};
@@ -447,49 +491,23 @@ namespace terra::windows::virtual_display {
     }
   }  // namespace
 
-  std::optional<std::string> canonicalize_persistence_ids(const std::string_view document) {
-    try {
-      auto parsed = nlohmann::json::parse(document);
-      if (!parsed.is_object() || parsed.at("version") != 1 || !parsed.at("baselineInventory").is_array() || !parsed.at("resources").is_array()) {
-        return std::nullopt;
-      }
-      for (auto &id : parsed.at("baselineInventory")) {
-        const auto canonical = id.is_string() ? mttvdd::canonical_monitor_id(id.get<std::string>()) : std::nullopt;
-        if (!canonical) {
-          return std::nullopt;
-        }
-        id = *canonical;
-      }
-      for (auto &resource : parsed.at("resources")) {
-        const auto canonical = resource.is_object() && resource.contains("platformId") && resource.at("platformId").is_string() ? mttvdd::canonical_monitor_id(resource.at("platformId").get<std::string>()) : std::nullopt;
-        if (!canonical) {
-          return std::nullopt;
-        }
-        resource["platformId"] = *canonical;
-      }
-      return parsed.dump();
-    } catch (...) {
-      return std::nullopt;
-    }
-  }
-
   std::optional<std::string> resolve_device_id(const std::string_view platform_id) {
     display_device::WinApiLayer api_layer;
     return device_id(api_layer, platform_id);
   }
 
   bool available() {
-    if (!mttvdd::probe().available) {
+    if (!sol_vdd::probe().available) {
       return false;
     }
-    const auto inventory = mttvdd::display_inventory();
+    const auto inventory = sol_vdd::display_inventory();
     if (!inventory) {
       return false;
     }
     auto api_layer = std::make_shared<display_device::WinApiLayer>();
     display_device::WinDisplayDevice display_api {api_layer};
-    return display_api.isApiAccessAvailable() && std::ranges::all_of(*inventory, [&](const auto &platform_id) {
-             return device_id(*api_layer, platform_id).has_value();
+    return display_api.isApiAccessAvailable() && std::ranges::all_of(*inventory, [&](const auto &connector) {
+             return device_id(*api_layer, connector.id).has_value();
            });
   }
 
@@ -521,6 +539,7 @@ namespace terra::windows::virtual_display {
       }
       topology.push_back({*id});
       configurations.push_back({
+        display.slot,
         display.platform_id,
         {
           display.name,
@@ -568,15 +587,14 @@ namespace terra::windows::virtual_display {
     exclusive_rollback = exclusive;
     if (std::filesystem::exists(exclusive->path) && !restore_exclusive()) {
       exclusive->recovery_failed = true;
-      BOOST_LOG(error) << "Terra MttVDD: stale exclusive display topology could not be restored";
+      BOOST_LOG(error) << "Terra SolVDD: stale exclusive display topology could not be restored";
     }
     return {
       [persistence_path]() -> std::optional<std::string> {
         if (!std::filesystem::exists(persistence_path)) {
           return std::nullopt;
         }
-        const auto document = file_handler::read_file(persistence_path.string().c_str());
-        return canonicalize_persistence_ids(document).value_or(document);
+        return file_handler::read_file(persistence_path.string().c_str());
       },
       [persistence_path](const std::string &document) {
         return file_handler::write_file_atomic(persistence_path.string().c_str(), document) == 0;
@@ -588,20 +606,20 @@ namespace terra::windows::virtual_display {
         return uuid_util::uuid_t::generate().string();
       },
       available,
-      mttvdd::configured_display_count,
-      [](const std::uint32_t count) {
-        if (!mttvdd::set_display_count_and_wait(count)) {
-          return false;
+      []() -> std::optional<std::vector<terra_virtual_display::connector_t>> {
+        const auto inventory = sol_vdd::display_inventory();
+        if (!inventory) {
+          return std::nullopt;
         }
-        const auto deadline = std::chrono::steady_clock::now() + DISPLAY_CONFIG_TIMEOUT;
-        while (!available() && std::chrono::steady_clock::now() < deadline) {
-          std::this_thread::sleep_for(DISPLAY_CONFIG_POLL_INTERVAL);
+        std::vector<terra_virtual_display::connector_t> result;
+        result.reserve(inventory->size());
+        for (const auto &connector : *inventory) {
+          result.push_back({connector.slot, connector.id});
         }
-        return available();
+        return result;
       },
-      mttvdd::display_inventory,
       apply,
-      mttvdd::MAX_DISPLAY_COUNT,
+      sol_vdd::MAX_DISPLAY_COUNT,
       {},
       [rollback]() {
         std::lock_guard lock {rollback->mutex};

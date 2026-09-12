@@ -2494,7 +2494,7 @@ namespace stream {
 
 #ifdef _WIN32
         if (!terra::windows::virtual_display::restore_exclusive()) {
-          BOOST_LOG(error) << "Terra MttVDD: failed to restore physical display topology after final stream";
+          BOOST_LOG(error) << "Terra SolVDD: failed to restore physical display topology after final stream";
         }
 #endif
 

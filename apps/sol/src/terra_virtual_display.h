@@ -65,6 +65,14 @@ namespace terra_virtual_display {
   };
 
   /**
+   * @brief Provider connector currently present at a stable slot.
+   */
+  struct connector_t {
+    std::uint32_t slot;  ///< Stable provider connector slot.
+    std::string platform_id;  ///< Stable provider connector identifier.
+  };
+
+  /**
    * @brief Published virtual display resource.
    */
   struct resource_t {
@@ -84,6 +92,7 @@ namespace terra_virtual_display {
     std::optional<std::string> session_id;  ///< Canonical attached session UUID.
     nlohmann::json error;  ///< Error object, or JSON null.
     std::uint64_t revision;  ///< Resource revision.
+    std::uint32_t slot;  ///< Stable provider connector slot owned by the resource.
     std::string platform_id;  ///< Internal stable provider connector identifier.
   };
 
@@ -129,7 +138,8 @@ namespace terra_virtual_display {
    * @brief Provider configuration input and output.
    */
   struct platform_configuration_t {
-    std::string platform_id;  ///< Stable connector identifier.
+    std::uint32_t slot;  ///< Stable provider connector slot.
+    std::string platform_id;  ///< Stable connector identifier, empty when the slot is new.
     specification_t specification;  ///< Desired connector configuration.
     actual_mode_t actual_mode;  ///< Applied mode returned by provider.
   };
@@ -143,10 +153,8 @@ namespace terra_virtual_display {
     std::function<std::int64_t()> now;  ///< Return current Unix time in milliseconds.
     std::function<std::string()> uuid;  ///< Return a new canonical UUID.
     std::function<bool()> provider_healthy;  ///< Report whether provider is usable.
-    std::function<std::optional<std::uint32_t>()> read_count;  ///< Read global MttVDD connector count.
-    std::function<bool(std::uint32_t)> set_count;  ///< Set global MttVDD connector count and await completion.
-    std::function<std::optional<std::vector<std::string>>()> inventory;  ///< Read stable provider connector identifiers.
-    std::function<bool(std::vector<platform_configuration_t> &)> apply_configuration;  ///< Apply configurations and populate actual modes.
+    std::function<std::optional<std::vector<connector_t>>()> inventory;  ///< Read present provider connectors by stable slot.
+    std::function<bool(std::vector<platform_configuration_t> &)> apply_configuration;  ///< Apply complete sparse topology and populate connector identifiers and actual modes.
     std::uint32_t max_count {};  ///< Maximum global connector count supported by provider.
     std::function<void(const std::optional<resource_t> &, const std::optional<resource_t> &)> changed;  ///< Observe committed create, update, reconciliation, and removal changes.
     std::function<bool()> capture_configuration;  ///< Capture exact host topology before mutation.
@@ -217,13 +225,13 @@ namespace terra_virtual_display {
      */
     bool available() const;
     /**
-     * @brief Return remaining provider capacity above immutable baseline.
+     * @brief Return remaining provider capacity above managed connectors.
      *
      * @return Maximum additional managed virtual displays.
      */
     std::uint32_t max_active() const;
     /**
-     * @brief Create one managed connector above immutable baseline.
+     * @brief Create one managed connector in a free stable slot.
      *
      * @param owner_client_uuid Canonical owner UUID.
      * @param specification Desired display fields.

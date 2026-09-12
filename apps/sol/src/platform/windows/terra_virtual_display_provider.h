@@ -1,6 +1,6 @@
 /**
  * @file src/platform/windows/terra_virtual_display_provider.h
- * @brief Windows provider callbacks for Terra MttVDD lifecycle management.
+ * @brief Windows provider callbacks for Terra SolVDD lifecycle management.
  */
 #pragma once
 
@@ -16,23 +16,15 @@
 
 namespace terra::windows::virtual_display {
   /**
-   * @brief Migrate persisted transient MttVDD PnP IDs to stable connector IDs.
+   * @brief Resolve one SolVDD connector to its libdisplaydevice identifier.
    *
-   * @param document Version-one virtual-display persistence document.
-   * @return Migrated document, or no value when its provider IDs are invalid.
-   */
-  [[nodiscard]] std::optional<std::string> canonicalize_persistence_ids(std::string_view document);
-
-  /**
-   * @brief Resolve one MttVDD connector to its libdisplaydevice identifier.
-   *
-   * @param platform_id Canonical MttVDD monitor connector ID.
+   * @param platform_id Canonical SolVDD monitor connector ID.
    * @return Stable libdisplaydevice ID, or no value when correlation is unavailable.
    */
   [[nodiscard]] std::optional<std::string> resolve_device_id(std::string_view platform_id);
 
   /**
-   * @brief Probe complete read-only MttVDD and display-correlation path.
+   * @brief Probe complete read-only SolVDD and display-correlation path.
    *
    * @return `true` when provider, inventory, and every connector mapping are usable.
    */
@@ -54,7 +46,7 @@ namespace terra::windows::virtual_display {
   [[nodiscard]] bool restore_exclusive();
 
   /**
-   * @brief Build production MttVDD and libdisplaydevice callbacks.
+   * @brief Build production SolVDD and libdisplaydevice callbacks.
    *
    * @param persistence_path Atomic lifecycle persistence document path.
    * @return Callbacks suitable for `terra_virtual_display::manager_t`.

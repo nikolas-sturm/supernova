@@ -67,7 +67,7 @@ test('configure preserves upstream roots and isolates configurations', () => {
   }
 
   const vdd = commandsFor({ app: 'vdd', operation: 'configure', config: 'release' }, 'win32')[0]
-  assert.ok(vdd[2].endsWith(path.join('apps', 'sol', 'third-party', 'vdd')))
+  assert.ok(vdd[2].endsWith(path.join('apps', 'sol', 'third-party', 'solvdd')))
   assert.ok(vdd[4].endsWith(path.join('apps', 'sol', 'cmake-build-win32-vdd-release')))
   assert.ok(vdd.includes('-DVDD_CONFIGURATION=Release'))
   assert.ok(vdd.includes('-DVDD_PLATFORM=x64'))
@@ -103,33 +103,55 @@ test('VDD rejects unsupported hosts', () => {
   )
 })
 
-test('VDD uses dynamic monitor lifecycle instead of reinitializing from a pipe handle', () => {
+test('VDD uses versioned sparse topology control instead of a settings file', () => {
   const source = readFileSync(
     new URL(
-      '../../apps/sol/third-party/vdd/Virtual Display Driver (HDR)/MttVDD/Driver.cpp',
+      '../../apps/sol/third-party/solvdd/Virtual Display Driver (HDR)/SolVDD/Driver.cpp',
+      import.meta.url,
+    ),
+    'utf8',
+  )
+  const header = readFileSync(
+    new URL(
+      '../../apps/sol/third-party/solvdd/Virtual Display Driver (HDR)/SolVDD/Driver.h',
       import.meta.url,
     ),
     'utf8',
   )
   const project = readFileSync(
     new URL(
-      '../../apps/sol/third-party/vdd/Virtual Display Driver (HDR)/MttVDD/MttVDD.vcxproj',
+      '../../apps/sol/third-party/solvdd/Virtual Display Driver (HDR)/SolVDD/SolVDD.vcxproj',
       import.meta.url,
     ),
     'utf8',
   )
   const build = readFileSync(
-    new URL('../../apps/sol/third-party/vdd/CMakeLists.txt', import.meta.url),
+    new URL('../../apps/sol/third-party/solvdd/CMakeLists.txt', import.meta.url),
     'utf8',
   )
-  assert.doesNotMatch(source, /WdfObjectGet_IndirectDeviceContextWrapper\(hPipe\)/)
-  assert.match(source, /SetMonitorCount\(newDisplayCount\)/)
-  assert.match(source, /IddCxMonitorDeparture\(m_Monitors\.back\(\)\)/)
+  const verification = readFileSync(
+    new URL('../../apps/sol/third-party/solvdd/cmake/VerifyPackage.cmake', import.meta.url),
+    'utf8',
+  )
+  const protocol = readFileSync(
+    new URL('../../apps/sol/third-party/solvdd/Common/Include/SolVddProtocol.h', import.meta.url),
+    'utf8',
+  )
+  for (const text of [source, project, protocol]) assert.doesNotMatch(text, /vdd_settings/)
+  assert.doesNotMatch(source, /loadSettings|SETDISPLAYCOUNT|GETSETTINGS|monitorModes/)
+  assert.match(source, /ApplyTopology/)
+  assert.match(source, /QueryTopology/)
   assert.match(source, /PIPE_REJECT_REMOTE_CLIENTS/)
   assert.match(source, /FILE_FLAG_OVERLAPPED/)
   assert.match(source, /WaitForPipeIo/)
   assert.doesNotMatch(source, /CancelSynchronousIo/)
+  assert.match(header, /sol_vdd::MAX_CONNECTORS/)
+  assert.match(protocol, /PROTOCOL_VERSION/)
+  assert.match(protocol, /EDID_SERIAL_BASE/)
   assert.match(project, /<LanguageStandard>stdcpp23<\/LanguageStandard>/)
+  assert.match(project, /DIDDCX_VERSION_MINOR=10/)
+  assert.doesNotMatch(project, /PostBuildEvent/)
+  assert.match(verification, /must not contain vdd_settings\.xml/)
   assert.match(build, /TO_NATIVE_PATH.*VDD_PACKAGE_DIR_NATIVE/)
   assert.match(build, /\/p:SkipPackageVerification=true/)
   assert.match(build, /VDD_INFVERIF_EXECUTABLE.*\/u/s)

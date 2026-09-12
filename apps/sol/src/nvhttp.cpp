@@ -385,7 +385,7 @@ namespace nvhttp {
   std::mutex terra_target_transaction_mutex;  ///< Serializes target binding with target-end cleanup.
   std::unique_ptr<terra_workspaces::manager_t> terra_workspace_manager;  ///< Persistent workspaces-v1 lifecycle manager.
 #ifdef _WIN32
-  std::unique_ptr<terra_virtual_display::manager_t> terra_virtual_display_manager;  ///< MttVDD virtual-display lifecycle manager.
+  std::unique_ptr<terra_virtual_display::manager_t> terra_virtual_display_manager;  ///< SolVDD virtual-display lifecycle manager.
   std::unique_ptr<terra_sandboxes::manager_t> terra_sandbox_manager;  ///< Persistent sandboxes-v1 lifecycle manager.
   bool revoke_terra_profiles(const std::string &owner, const std::optional<terra_api::client_permissions_t> &permissions = std::nullopt);
   bool revoke_terra_sandboxes(const std::string &owner, const std::optional<terra_api::client_permissions_t> &permissions = std::nullopt);
@@ -2229,7 +2229,7 @@ namespace nvhttp {
         restore_exclusive_topology = true;
         launch_session->timeout_cleanup = []() {
           if (!terra::windows::virtual_display::restore_exclusive()) {
-            BOOST_LOG(error) << "Terra MttVDD: failed to restore physical topology after RTSP launch timeout";
+            BOOST_LOG(error) << "Terra SolVDD: failed to restore physical topology after RTSP launch timeout";
           }
         };
       }
@@ -3158,7 +3158,7 @@ namespace nvhttp {
       features["virtual-displays-v1"] = {{"available", true}};
     } else {
       features["virtual-displays-v1"]["reasonCode"] = "provider_unavailable";
-      features["virtual-displays-v1"]["reason"] = operations_available ? "MttVDD virtual display manager is unavailable" : "Operation persistence manager is unavailable";
+      features["virtual-displays-v1"]["reason"] = operations_available ? "SolVDD virtual display manager is unavailable" : "Operation persistence manager is unavailable";
     }
 #endif
 
@@ -5461,7 +5461,7 @@ namespace nvhttp {
       case status_t::limit_reached:
         return {{"code", "resource_limit"}, {"message", "Virtual display provider capacity is exhausted"}};
       case status_t::provider_error:
-        return {{"code", "provider_failure"}, {"message", "MttVDD or Windows display operation failed"}};
+        return {{"code", "provider_failure"}, {"message", "SolVDD or Windows display operation failed"}};
       case status_t::persistence_error:
         return {{"code", "persistence_failure"}, {"message", "Virtual display state could not be persisted"}};
       case status_t::unavailable:
@@ -5477,7 +5477,7 @@ namespace nvhttp {
     if (terra_virtual_display_manager && terra_virtual_display_manager->available()) {
       return true;
     }
-    send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "MttVDD virtual display provider is unavailable");
+    send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "SolVDD virtual display provider is unavailable");
     return false;
   }
 
@@ -5652,7 +5652,7 @@ namespace nvhttp {
       return;
     }
     if (!terra_virtual_display_manager || !terra_virtual_display_manager->available()) {
-      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "MttVDD virtual display provider is unavailable");
+      send_terra_error(response, SimpleWeb::StatusCode::server_error_service_unavailable, "provider_unavailable", "SolVDD virtual display provider is unavailable");
       return;
     }
     std::optional<std::uint64_t> since;
@@ -5712,7 +5712,7 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Create one managed MttVDD display asynchronously.
+   * @brief Create one managed SolVDD display asynchronously.
    */
   void terra_create_virtual_display(resp_https_t response, req_https_t request) {
     const auto client = authorize_terra_request(response, request, "virtual-display.manage");
@@ -11085,7 +11085,7 @@ namespace nvhttp {
     terra_operation_pool.join();
 #ifdef _WIN32
     if (!terra::windows::virtual_display::restore_exclusive()) {
-      BOOST_LOG(error) << "Terra MttVDD: failed to restore physical display topology during shutdown";
+      BOOST_LOG(error) << "Terra SolVDD: failed to restore physical display topology during shutdown";
     }
 #endif
     {

@@ -202,8 +202,11 @@ changes. The response returns the actual applied
 
 ### Virtual displays
 
-Windows hosts advertise `virtual-displays-v1` only while the MttVDD manager is healthy and report
-maximum managed-display capacity above the provider baseline under `limits.virtualDisplays.maxActive`. `GET /eclipse/v1/virtual-displays`
+Windows hosts advertise `virtual-displays-v1` only while the SolVDD manager is healthy and report
+maximum managed-display capacity under `limits.virtualDisplays.maxActive`. The host owns the complete
+sparse SolVDD connector topology: each resource keeps a stable connector slot, resolution, rational
+refresh rate, bit depth (8 or 10), and HDR state are applied per connector, and deleting a resource
+never changes the Windows device identity of surviving displays. `GET /eclipse/v1/virtual-displays`
 and `GET /eclipse/v1/virtual-displays/{id}` require `display.read` and apply owner visibility.
 Create, patch, delete, attach, detach, and adopt routes require `Idempotency-Key`; item mutations also
 require strong numeric `If-Match`. Mutations return HTTP `202` operations. Committed transitions emit
