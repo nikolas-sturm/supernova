@@ -352,8 +352,8 @@ int main(int argc, char** argv) {
         expect(events.back().state == "receiving", "Poor network status was not published.");
         savedCallbacks.connectionStatusUpdate(CONN_STATUS_OKAY);
         expect(events.back().state == "rendering" &&
-                   events.back().message == "Network quality recovered.",
-               "Network recovery did not clear warning state.");
+                   events.back().message == "Video delivery recovered.",
+               "Video delivery recovery did not clear warning state.");
         savedCallbacks.connectionTerminated(ML_ERROR_GRACEFUL_TERMINATION);
         savedCallbacks.connectionTerminated(-1);
         expect(disconnects == 1, "Termination callback was delivered more than once.");
@@ -387,6 +387,8 @@ int main(int argc, char** argv) {
             testConfig(),
             [&](const terra::StreamSessionEvent& event) {
                 if (event.state == "receiving") {
+                    expect(event.message.find("host load") != std::string::npos,
+                           "Frame-loss warning incorrectly blames only network quality.");
                     activeSession->stop();
                     stoppedFromListener = true;
                 }

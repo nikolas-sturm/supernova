@@ -65,6 +65,7 @@ std::optional<std::string> prepareClipboardText(std::string_view text) {
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
@@ -183,6 +184,12 @@ struct InputForwarder::Impl {
     bool enabled = false;
     bool mouseCaptured = false;
     bool workspaceDragCaptured = false;
+    ULONGLONG workspaceDragStarted = 0;
+    ULONGLONG workspaceDragLastMove = 0;
+    ULONGLONG workspaceDragMaxGap = 0;
+    unsigned workspaceDragMoves = 0;
+    bool workspaceDragCrossed = false;
+
     bool cursorHidden = false;
     int streamWidth = 1;
     int streamHeight = 1;
@@ -236,6 +243,16 @@ struct InputForwarder::Impl {
         }
         if (mouseCaptured) title += L" (Ctrl+Alt+Shift+Z to release)";
         SetWindowTextW(window, title.c_str());
+    }
+
+    void reportWorkspaceDrag(const char* reason) {
+        if (workspaceDragStarted == 0) return;
+        std::fprintf(stderr,
+            "[terra-mouse pid=%lu] end=%s duration_ms=%llu moves=%u crossed=%d max_move_gap_ms=%llu foreground=%d capture=%d\n",
+            GetCurrentProcessId(), reason, GetTickCount64() - workspaceDragStarted,
+            workspaceDragMoves, workspaceDragCrossed, workspaceDragMaxGap,
+            GetForegroundWindow() == window, GetCapture() == window);
+        workspaceDragStarted = 0;
     }
 
     void noteInputResult(int result) {
@@ -377,6 +394,7 @@ struct InputForwarder::Impl {
     }
 
     void releaseRemoteState() {
+        reportWorkspaceDrag("cancel-or-queue-failure");
         for (int attempt = 0; attempt < 20 && (!keysDown.empty() || !mouseButtonsDown.empty());
              ++attempt) {
             for (auto key = keysDown.begin(); key != keysDown.end();) {
@@ -792,6 +810,19 @@ struct InputForwarder::Impl {
             const auto position = workspaceMousePosition(settings.workspaceMouse,
                 origin.x + GET_X_LPARAM(value), origin.y + GET_Y_LPARAM(value));
             if (!position) return false;
+            if (workspaceDragCaptured) {
+                const auto now = GetTickCount64();
+                workspaceDragMaxGap = std::max(workspaceDragMaxGap, now - workspaceDragLastMove);
+                workspaceDragLastMove = now;
+                ++workspaceDragMoves;
+                if (!workspaceDragCrossed && (GET_X_LPARAM(value) < 0 || GET_X_LPARAM(value) >= local.width ||
+                                              GET_Y_LPARAM(value) < 0 || GET_Y_LPARAM(value) >= local.height)) {
+                    workspaceDragCrossed = true;
+                    std::fprintf(stderr, "[terra-mouse pid=%lu] crossed foreground=%d capture=%d elapsed_ms=%llu\n",
+                        GetCurrentProcessId(), GetForegroundWindow() == window, GetCapture() == window,
+                        now - workspaceDragStarted);
+                }
+            }
             const int result = LiSendMousePositionEvent(position->x, position->y,
                                                         position->width, position->height);
             noteInputResult(result);
@@ -819,6 +850,12 @@ struct InputForwarder::Impl {
             SetCapture(window);
             if (GetCapture() != window) return;
             workspaceDragCaptured = true;
+            workspaceDragStarted = workspaceDragLastMove = GetTickCount64();
+            workspaceDragMaxGap = 0;
+            workspaceDragMoves = 0;
+            workspaceDragCrossed = false;
+            std::fprintf(stderr, "[terra-mouse pid=%lu] start foreground=%d capture=%d\n",
+                GetCurrentProcessId(), GetForegroundWindow() == window, GetCapture() == window);
         }
         const bool sent = sendMouseButton(button, pressed);
         if (!pressed && workspaceDragCaptured && (!positioned || !sent)) {
@@ -826,8 +863,10 @@ struct InputForwarder::Impl {
             // capture held merely because the transport queue rejected button-up.
             releaseRemoteState();
         }
-        if (mouseButtonsDown.empty() && std::exchange(workspaceDragCaptured, false) &&
-            GetCapture() == window) ReleaseCapture();
+        if (mouseButtonsDown.empty()) {
+            reportWorkspaceDrag("buttons-released");
+            if (std::exchange(workspaceDragCaptured, false) && GetCapture() == window) ReleaseCapture();
+        }
     }
 
     void emulateDirectPointer(UINT32 pointerId, std::uint8_t eventType, float x, float y) {

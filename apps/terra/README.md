@@ -57,6 +57,14 @@ disconnects release held buttons. Reconnect after changing monitor layout or res
 maps are not reused. Linux uses SDL capture on X11 and the compositor's implicit drag grab on
 Wayland; compositor-specific cross-output behavior still needs live validation.
 
+For intermittent crossing problems, the native terminal emits bounded `terra-mouse` drag
+summaries (foreground/capture ownership, crossing, delivered movement count and longest event
+gap) and `terra-stream` frame timing samples. Frame samples appear every five seconds, or once
+per second when frame loss/queue drops occur. They distinguish missing pointer delivery from
+host processing, receive/reassembly, decode and presentation stalls; frame-loss warnings alone
+do not prove a network bottleneck. Sol logs each workspace coordinate rejection reason only
+once per transport. These diagnostics do not log individual mouse packets or input keys.
+
 ## Prerequisites
 
 - Node.js 20.19+, 22.12+, or newer

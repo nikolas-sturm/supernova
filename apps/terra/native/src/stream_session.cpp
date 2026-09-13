@@ -509,9 +509,9 @@ void StreamSession::connectionStatusUpdate(int status) {
     if (!session || !session->config_.settings.connectionWarnings) return;
     if (status == CONN_STATUS_POOR) {
         publishAndRelease(std::move(session), "receiving",
-                          "Encoded stream received; network quality is poor.");
+                          "Video frames are being lost; check host load and network delivery.");
     } else if (status == CONN_STATUS_OKAY) {
-        publishAndRelease(std::move(session), "rendering", "Network quality recovered.");
+        publishAndRelease(std::move(session), "rendering", "Video delivery recovered.");
     }
 }
 

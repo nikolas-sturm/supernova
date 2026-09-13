@@ -3,10 +3,13 @@
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+
+#include "stream_statistics.h"
 
 namespace terra {
 namespace {
@@ -198,6 +201,8 @@ int runStreamWorker() {
   if (!frame)
     return 2;
   auto config = parseStreamWorkerConfig(*frame);
+  const int displayIndex = config.settings.displayIndex;
+  const bool workspaceMouse = !config.settings.input.workspaceMouse.empty();
   std::mutex outputMutex;
   const auto send = [&](nlohmann::json value) {
     std::scoped_lock lock{outputMutex};
@@ -216,6 +221,21 @@ int runStreamWorker() {
               {"message", event.message},
               {"hostEnded", hostEnded},
               {"userEnded", userEnded}});
+      }, {},
+      [displayIndex, workspaceMouse](const StreamStatisticsSample &sample) {
+        if (!workspaceMouse) return;
+        const auto &s = sample.statistics;
+        if (sample.sequence % 5 != 0 && s.frameLossPercent == 0 && s.queueDrops == 0) return;
+        // Once per sample at most, never per frame or mouse packet. stderr is separate
+        // from the framed worker protocol on stdout.
+        std::fprintf(stderr,
+            "[terra-stream display=%d t_ms=%llu] received_fps=%.1f presented_fps=%.1f mbps=%.2f loss_pct=%.2f rtt_ms=%u host_avg_ms=%.2f host_max_ms=%.2f reassembly_ms=%.2f decode_ms=%.2f present_ms=%.2f queue_ms=%.2f queue_drops=%llu\n",
+            displayIndex, static_cast<unsigned long long>(sample.elapsedMs), s.receivedFps,
+            s.presentedFps, s.bitrateMbps, s.frameLossPercent, s.rttMs,
+            s.hasHostLatency ? s.averageHostLatencyMs : -1.0,
+            s.hasHostLatency ? s.maximumHostLatencyMs : -1.0, s.averageReassemblyMs,
+            s.averageDecodeMs, s.averagePresentMs, s.averageQueueDelayMs,
+            static_cast<unsigned long long>(s.queueDrops));
       }};
   try {
     session.start();

@@ -313,6 +313,7 @@ namespace input {
     terra_api::input_permissions_t permissions;  ///< Input classes permitted by paired-client policy.
     mouse_mode_e mouse_mode;  ///< Mouse-coordinate mode accepted from this stream.
     std::vector<mouse_viewport_t> mouse_viewports;  ///< Authorized workspace displays, replaced on the input task thread.
+    std::uint8_t workspace_mouse_rejections {};  ///< Rejection reasons already logged for this transport.
     std::mutex permissions_mutex;  ///< Protects policy replacement and packet authorization on resumed streams.
 
     std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
@@ -850,17 +851,31 @@ namespace input {
     auto &touch_port = input->touch_port;
 
     if (!input->mouse_viewports.empty()) {
+      // One message per reason per transport, not per rejected mouse packet.
+      const auto reject = [&](std::uint8_t reason, const char *detail) {
+        if ((input->workspace_mouse_rejections & reason) != 0) {
+          return;
+        }
+        input->workspace_mouse_rejections |= reason;
+        const auto &source = input->mouse_viewports.front();
+        BOOST_LOG(warning) << "Workspace mouse rejected: " << detail
+                           << "; source=" << source.x << ',' << source.y << ' '
+                           << source.width << 'x' << source.height;
+      };
       if (input->mouse_viewports.front().generation != workspace_mouse_generation()) {
+        reject(1, "topology changed; reconnect required");
         return;
       }
       const auto relative = workspace_mouse_position(input->mouse_viewports, x, y, width, height);
       if (!relative) {
+        reject(2, "point falls outside authorized displays");
         return;
       }
       const auto &source = input->mouse_viewports.front();
       // Fail closed after a capture mode change; the client must rebuild its topology map.
       if (std::abs((touch_port.width - 2 * touch_port.client_offsetX) * touch_port.scalar_inv - source.width) > 1 ||
           std::abs((touch_port.height - 2 * touch_port.client_offsetY) * touch_port.scalar_inv - source.height) > 1) {
+        reject(4, "capture dimensions no longer match the mouse map");
         return;
       }
       tpcoords = std::pair {touch_port.offset_x + relative->first / touch_port.scalar_tpcoords,
@@ -2482,6 +2497,7 @@ namespace input {
         rebind_input(input, mail);
         input->mouse_viewports = std::move(mouse_viewports);
         input->touch_port = {};
+        input->workspace_mouse_rejections = 0;
       });
     }
 
