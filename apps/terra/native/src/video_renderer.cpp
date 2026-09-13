@@ -1918,7 +1918,35 @@ struct VideoRenderer::Impl {
         if (!placeboActive && !directPresentationEnabled.load() && !createSdlRenderer()) {
             throw std::runtime_error(sdlError("Cannot create SDL renderer"));
         }
-        inputForwarder.start(window, settings.input, width, height, frameRate,
+        // Pointer motion and window sizes live in the compositor's logical
+        // coordinate space; correlate the SDL display map onto xdg-output
+        // logical rectangles before input consumes it. Fail closed to
+        // per-display input when correlation is not unique.
+        InputSettings forwarderInput = settings.input;
+        if (!workspacePlacementReady && !settings.input.workspaceMouse.empty()) {
+            try {
+                logicalWorkspace = waylandLogicalWorkspace(window, settings.input.workspaceMouse);
+            } catch (const std::exception& exception) {
+                logicalWorkspace.reset();
+                std::fprintf(stderr, "[terra-window] logical workspace mapping failed: %s\n",
+                             exception.what());
+            }
+            if (logicalWorkspace) {
+                forwarderInput.workspaceMouse = *logicalWorkspace;
+                std::fprintf(stderr, "[terra-window] logical workspace map resolved entries=%zu\n",
+                             logicalWorkspace->size());
+            } else {
+                std::fprintf(stderr,
+                             "[terra-window] workspace input unresolvable; using per-display input\n");
+                settings.input.workspaceMouse.clear();
+                forwarderInput.workspaceMouse.clear();
+                workspacePlacementReady = true;
+                workspacePlacementDeadline.reset();
+                notify("connected",
+                       "Workspace mouse routing unavailable on this compositor; using per-display input.");
+            }
+        }
+        inputForwarder.start(window, forwarderInput, width, height, frameRate,
                              [this] { togglePerformanceOverlay(); },
                              [this] { return toggleFullscreen(); },
                               [this](std::uint64_t revision, bool visible) {
@@ -2398,16 +2426,24 @@ struct VideoRenderer::Impl {
             int height = 0;
             SDL_GetWindowSize(window, &width, &height);
             const int actualIndex = SDL_GetWindowDisplayIndex(window);
-            const bool matches = SDL_GetDisplayBounds(actualIndex, &output) == 0 &&
+            const bool boundsKnown = SDL_GetDisplayBounds(actualIndex, &output) == 0;
+            // Validate in logical space: the compositor reports window sizes
+            // in xdg-output coordinates, not the SDL display-mode space used
+            // for the assigned rectangle.
+            const MouseRectangle& source = logicalWorkspace
+                                               ? logicalWorkspace->front().local
+                                               : settings.input.workspaceMouse.front().local;
+            const bool matches = boundsKnown &&
                 (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0 &&
-                workspaceWindowMatches(settings.input.workspaceMouse.front().local,
-                    {output.x, output.y, output.w, output.h}, width, height);
+                actualIndex == currentDisplayIndex && width == source.width &&
+                height == source.height;
             const bool timedOut = std::chrono::steady_clock::now() >= *workspacePlacementDeadline;
             if (matches || timedOut) {
                 const auto& assigned = settings.input.workspaceMouse.front().local;
                 std::fprintf(stderr,
-                    "[terra-window] workspace_placement=%s assigned=%d,%d:%dx%d actual_output=%d,%d:%dx%d window=%dx%d sdl_display=%d\n",
+                    "[terra-window] workspace_placement=%s assigned=%d,%d:%dx%d logical=%d,%d:%dx%d actual_output=%d,%d:%dx%d window=%dx%d sdl_display=%d\n",
                     matches ? "ready" : "failed", assigned.x, assigned.y, assigned.width, assigned.height,
+                    source.x, source.y, source.width, source.height,
                     output.x, output.y, output.w, output.h, width, height, actualIndex);
             }
             if (matches) {
@@ -3187,6 +3223,7 @@ struct VideoRenderer::Impl {
     bool framePresented = false;
     bool workspacePlacementReady = true;
     std::optional<std::chrono::steady_clock::time_point> workspacePlacementDeadline;
+    std::optional<std::vector<WorkspaceMouseDisplay>> logicalWorkspace;
     bool overlayDisabled = false;
     bool overlayVisible = false;
     std::atomic_bool recoveryRequested{false};

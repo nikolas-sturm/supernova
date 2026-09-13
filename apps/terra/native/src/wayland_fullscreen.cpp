@@ -14,6 +14,7 @@
 #include <exception>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #if SDL_VERSION_ATLEAST(2, 0, 18) && defined(SDL_VIDEO_DRIVER_WAYLAND)
@@ -124,9 +125,55 @@ struct Discovery {
         for (const auto& output : state.outputs)
             if (output->name == name) state.changed = true;
     }
+
+    [[nodiscard]] const Output* resolve(const MouseRectangle& assigned) const {
+        // Fractional scaling makes SDL display rectangles differ from xdg-output
+        // logical rectangles in size, while their origins share the compositor's
+        // logical coordinate space. Prefer an exact match, then a unique origin.
+        const Output* exact = nullptr;
+        const Output* byOrigin = nullptr;
+        int originCount = 0;
+        for (const auto& output : outputs) {
+            if (!output->position || !output->size || output->rectangle.width <= 0 ||
+                output->rectangle.height <= 0)
+                throw std::runtime_error("Incomplete Wayland output logical rectangle");
+            if (output->rectangle == assigned) exact = output.get();
+            if (output->rectangle.x == assigned.x && output->rectangle.y == assigned.y) {
+                ++originCount;
+                byOrigin = output.get();
+            }
+        }
+        if (exact) return exact;
+        if (originCount == 1) return byOrigin;
+        if (originCount > 1) throw std::runtime_error("Ambiguous Wayland output rectangle origin");
+        return nullptr;
+    }
 };
 
 const wl_registry_listener registryListener = {Discovery::global, Discovery::removed};
+
+// All proxies inherit SDL's default queue. SDL retains its listeners and
+// handles its own configure/enter/leave events during these roundtrips.
+std::unique_ptr<Discovery> discoverLogicalOutputs(wl_display* display) {
+    auto state = std::make_unique<Discovery>();
+    state->registry = wl_display_get_registry(display);
+    if (!state->registry) throw std::runtime_error("Cannot create Wayland registry");
+    if (wl_registry_add_listener(state->registry, &registryListener, state.get()) < 0)
+        throw std::runtime_error("Cannot listen to Wayland registry");
+    state->roundtrip(display);
+    state->enumerated = true;
+    if (!state->manager) throw std::runtime_error("Compositor lacks xdg-output logical rectangles");
+    for (const auto& output : state->outputs) {
+        output->logical = zxdg_output_manager_v1_get_xdg_output(state->manager, output->handle);
+        if (!output->logical) throw std::runtime_error("Cannot create xdg-output");
+        if (zxdg_output_v1_add_listener(output->logical, &logicalListener, output.get()) < 0)
+            throw std::runtime_error("Cannot listen to xdg-output");
+    }
+    // This sync bounds initial logical events for both xdg-output v1/v2 (done)
+    // and v3 (wl_output.done); no extra roundtrip is needed per output.
+    state->roundtrip(display);
+    return state;
+}
 
 } // namespace
 
@@ -144,38 +191,45 @@ void requestWaylandFullscreenOutput(SDL_Window* window, const MouseRectangle& as
     if (!native.display || !native.surface || !native.xdg_toplevel)
         throw std::runtime_error("SDL did not expose a mapped Wayland xdg_toplevel");
 
-    // All proxies inherit SDL's default queue. SDL retains its listeners and
-    // handles its own configure/enter/leave events during these roundtrips.
-    Discovery state;
-    state.registry = wl_display_get_registry(native.display);
-    if (!state.registry) throw std::runtime_error("Cannot create Wayland registry");
-    if (wl_registry_add_listener(state.registry, &registryListener, &state) < 0)
-        throw std::runtime_error("Cannot listen to Wayland registry");
-    state.roundtrip(native.display);
-    state.enumerated = true;
-    if (!state.manager) throw std::runtime_error("Compositor lacks xdg-output logical rectangles");
-    for (const auto& output : state.outputs) {
-        output->logical = zxdg_output_manager_v1_get_xdg_output(state.manager, output->handle);
-        if (!output->logical) throw std::runtime_error("Cannot create xdg-output");
-        if (zxdg_output_v1_add_listener(output->logical, &logicalListener, output.get()) < 0)
-            throw std::runtime_error("Cannot listen to xdg-output");
+    auto state = discoverLogicalOutputs(native.display);
+    const Output* target = state->resolve(assigned);
+    if (!target) {
+        std::string detail = "Assigned rectangle matches no Wayland output";
+        for (const auto& output : state->outputs) {
+            detail += " [logical=" + std::to_string(output->rectangle.x) + ',' +
+                      std::to_string(output->rectangle.y) + ':' +
+                      std::to_string(output->rectangle.width) + 'x' +
+                      std::to_string(output->rectangle.height) + ']';
+        }
+        throw std::runtime_error(detail);
     }
-    // This sync bounds initial logical events for both xdg-output v1/v2 (done)
-    // and v3 (wl_output.done); no extra roundtrip is needed per output.
-    state.roundtrip(native.display);
-    wl_output* target = nullptr;
-    for (const auto& output : state.outputs) {
-        if (!output->position || !output->size || output->rectangle.width <= 0 ||
-            output->rectangle.height <= 0)
-            throw std::runtime_error("Incomplete Wayland output logical rectangle");
-        if (output->rectangle != assigned) continue;
-        if (target) throw std::runtime_error("Ambiguous Wayland output logical rectangle");
-        target = output->handle;
-    }
-    if (!target) throw std::runtime_error("Assigned rectangle matches no Wayland output");
     // Deliberately bypass SDL positioning and its cached fullscreen target.
     xdg_toplevel_set_fullscreen(native.xdg_toplevel, target);
-    state.roundtrip(native.display); // Flush the request; not a placement acknowledgement.
+    if (wl_display_roundtrip(native.display) < 0)
+        throw std::runtime_error("Wayland fullscreen request flush failed");
+}
+
+std::optional<std::vector<WorkspaceMouseDisplay>> waylandLogicalWorkspace(
+    SDL_Window* window, const std::vector<WorkspaceMouseDisplay>& map) {
+    if (!window || map.size() < 2 || map.size() > 4) return std::nullopt;
+    SDL_SysWMinfo info{};
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(window, &info) || info.subsystem != SDL_SYSWM_WAYLAND ||
+        !info.info.wl.display) {
+        return std::nullopt;
+    }
+    auto state = discoverLogicalOutputs(info.info.wl.display);
+    std::vector<WorkspaceMouseDisplay> result;
+    result.reserve(map.size());
+    for (const auto& entry : map) {
+        // Pointer motion and window sizes live in the compositor's logical
+        // coordinate space; replace each SDL display rectangle with the
+        // matching xdg-output logical rectangle before input uses the map.
+        const Output* resolved = state->resolve(entry.local);
+        if (!resolved) return std::nullopt;
+        result.push_back({resolved->rectangle, entry.remote});
+    }
+    return result;
 }
 
 } // namespace terra
@@ -184,6 +238,10 @@ namespace terra {
 void requestWaylandFullscreenOutput(SDL_Window*, const MouseRectangle&) {
     throw std::runtime_error("Explicit Wayland workspace placement requires SDL 2.0.18 or newer with Wayland support.");
 }
+std::optional<std::vector<WorkspaceMouseDisplay>> waylandLogicalWorkspace(
+    SDL_Window*, const std::vector<WorkspaceMouseDisplay>&) {
+    return std::nullopt;
 }
+} // namespace terra
 #endif
 #endif

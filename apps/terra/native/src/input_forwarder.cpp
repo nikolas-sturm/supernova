@@ -2902,9 +2902,18 @@ struct InputForwarder::Impl {
         int width = 0;
         int height = 0;
         SDL_GetWindowSize(window, &width, &height);
-        SDL_Rect display{};
-        if (SDL_GetDisplayBounds(SDL_GetWindowDisplayIndex(window), &display) != 0 ||
-            !workspaceWindowMatches(local, {display.x, display.y, display.w, display.h}, width, height)) return false;
+        // The native pointer reports compositor logical coordinates whose
+        // window sizes need no display-bounds correlation; SDL motion still
+        // arrives in display-mode space and keeps the strict rect check.
+        if (waylandPointer.active()) {
+            if (width != local.width || height != local.height) return false;
+        } else {
+            SDL_Rect display{};
+            if (SDL_GetDisplayBounds(SDL_GetWindowDisplayIndex(window), &display) != 0 ||
+                !workspaceWindowMatches(local, {display.x, display.y, display.w, display.h},
+                                        width, height))
+                return false;
+        }
         const auto position = workspaceMousePosition(settings.workspaceMouse, local.x + x, local.y + y);
         if (!position) return false;
         const int result = LiSendMousePositionEvent(position->x, position->y,

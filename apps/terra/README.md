@@ -64,9 +64,14 @@ behavior still needs live validation.
 
 On Wayland, Terra enters fullscreen after the window has been shown and requests the assigned
 `wl_output` explicitly after its first presented buffer. Output selection uses xdg-output logical
-bounds, without rewriting SDL's cached window coordinates. This targeting requires SDL 2.0.18+
-and the compositor's xdg-output interface. Input stays disabled while initial placement settles;
-startup output notifications are not treated as mid-session topology changes. Each worker resolves
+bounds and correlates SDL display rectangles to logical rectangles by origin first and exact
+rectangle second, so fractional scaling does not defeat output targeting. The workspace mouse map
+itself is rebuilt in logical space: native `wl_pointer` motion and window sizes are compositor
+logical coordinates. If any stream's rectangle cannot be correlated uniquely, Terra fails closed
+to ordinary per-display input for that session rather than risking misrouted drags. Targeting
+requires SDL 2.0.18+ and the compositor's xdg-output interface. Input stays disabled while initial
+placement settles; placement is validated against the logical window size on the assigned output.
+Startup output notifications are not treated as mid-session topology changes. Each worker resolves
 its target from the assigned output bounds rather than trusting another process's SDL index order.
 If the compositor does not place the window on that output, Terra reports a placement error instead
 of accepting input with the wrong map. Compositor window rules can affect placement. Moving an
