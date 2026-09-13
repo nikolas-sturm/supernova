@@ -266,30 +266,32 @@ export function SettingsView({ section = 'profile' }: { section?: 'profile' | 'g
       <div className={styles.settingsColumns}>
         <div>
           <SettingGroup title="Stream" eyebrow="BASIC SETTINGS">
-            <div className={styles.settingPair}>
-              <SelectSetting
-                label="Resolution"
-                value={resolutionValue}
-                options={[
-                  ...resolutionOptions.map((option) => ({
-                    label: option.label,
-                    value: `${option.width}x${option.height}`,
-                  })),
-                  { label: 'Custom', value: 'custom' },
-                ]}
-                onChange={selectResolution}
-              />
-              <SelectSetting
-                label="Frame rate"
-                value={fpsValue}
-                options={[
-                  ...fpsOptions.map((fps) => ({ label: `${fps} FPS`, value: fps })),
-                  { label: 'Custom', value: 'custom' },
-                ]}
-                onChange={selectFps}
-              />
-            </div>
-            {customResolution && (
+            {appMode === 'gaming' && (
+              <div className={styles.settingPair}>
+                <SelectSetting
+                  label="Resolution"
+                  value={resolutionValue}
+                  options={[
+                    ...resolutionOptions.map((option) => ({
+                      label: option.label,
+                      value: `${option.width}x${option.height}`,
+                    })),
+                    { label: 'Custom', value: 'custom' },
+                  ]}
+                  onChange={selectResolution}
+                />
+                <SelectSetting
+                  label="Frame rate"
+                  value={fpsValue}
+                  options={[
+                    ...fpsOptions.map((fps) => ({ label: `${fps} FPS`, value: fps })),
+                    { label: 'Custom', value: 'custom' },
+                  ]}
+                  onChange={selectFps}
+                />
+              </div>
+            )}
+            {appMode === 'gaming' && customResolution && (
               <div className={styles.settingPair}>
                 <NumberSetting
                   label="Custom width"
@@ -307,7 +309,7 @@ export function SettingsView({ section = 'profile' }: { section?: 'profile' | 'g
                 />
               </div>
             )}
-            {customFps && (
+            {appMode === 'gaming' && customFps && (
               <NumberSetting
                 label="Custom frame rate"
                 value={settings.fps}
@@ -345,18 +347,26 @@ export function SettingsView({ section = 'profile' }: { section?: 'profile' | 'g
                 update({ displayMode: displayMode as typeof settings.displayMode })
               }
             />
-            <SelectSetting
-              label="Target display"
-              value={settings.displayIndex}
-              options={[
-                { label: 'Primary display', value: 0 },
-                { label: 'Display 2', value: 1 },
-                { label: 'Display 3', value: 2 },
-                { label: 'Display 4', value: 3 },
-              ]}
-              note="Unavailable displays fall back to primary."
-              onChange={(displayIndex) => update({ displayIndex: Number(displayIndex) })}
-            />
+            {appMode === 'gaming' && (
+              <SelectSetting
+                label="Target display"
+                value={settings.displayIndex}
+                options={[
+                  { label: 'Primary display', value: 0 },
+                  { label: 'Display 2', value: 1 },
+                  { label: 'Display 3', value: 2 },
+                  { label: 'Display 4', value: 3 },
+                ]}
+                note="Unavailable displays fall back to primary."
+                onChange={(displayIndex) => update({ displayIndex: Number(displayIndex) })}
+              />
+            )}
+            {appMode === 'workstation' && (
+              <p className={styles.topologyNote}>
+                Workstation streams mirror the enabled outputs, resolution, and refresh rates from
+                the Display &amp; Topology tab.
+              </p>
+            )}
             <div className={styles.toggleStack}>
               <Toggle
                 label="V-Sync"

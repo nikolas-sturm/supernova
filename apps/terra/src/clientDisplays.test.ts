@@ -67,6 +67,15 @@ describe('clientDisplays', () => {
     })
   })
 
+  it('records the mirrored client origin of every streamed output', () => {
+    const displays = clientDisplayVirtualDisplays([secondary, primary], {
+      'display-2': { enabled: false, width: 1920, height: 1080, refreshRate: 60, hdr: false },
+    })
+
+    expect(displays).toHaveLength(1)
+    expect(displays[0]).toMatchObject({ clientOrigin: { x: 0, y: 0 } })
+  })
+
   it('honors a manually selected primary and falls back when it is unavailable', () => {
     expect(resolvePrimaryClientDisplayId([primary, secondary], {}, 'display-2')).toBe('display-2')
     expect(resolvePrimaryClientDisplayId([primary, secondary], {}, 'missing')).toBe('display-1')

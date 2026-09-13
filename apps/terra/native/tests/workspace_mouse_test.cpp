@@ -65,6 +65,32 @@ int main() {
            "Out-of-range selection did not fall back to leftmost position order.");
     expect(terra::workspaceOutputOrder({}, 0).empty(), "Empty enumeration produced an output order.");
 
+    // Topology mirrors pair streams to their mirrored outputs by origin; the
+    // disabled embedded panel at 0,270 is never claimed.
+    const std::vector<terra::MouseRectangle> topologyMirrors{{1440, 0, 2560, 1440},
+                                                              {4000, 0, 2560, 1440}};
+    expect((terra::workspacePairByOrigin(topologyMirrors, mixedScale) ==
+            std::vector<std::size_t>{0, 2}),
+           "Mirrored outputs were not paired with their local origins.");
+    expect((terra::workspacePairByOrigin(topologyMirrors, topologyMirrors) ==
+            std::vector<std::size_t>{0, 1}),
+           "Identical layouts were not paired.");
+    const std::vector<terra::MouseRectangle> unmatchedMirror{{2560, 0, 0, 0}};
+    expect(!terra::workspacePairByOrigin(unmatchedMirror, mixedScale),
+           "A mirror without a local origin was accepted.");
+    expect(!terra::workspacePairByOrigin(
+               topologyMirrors, std::vector<terra::MouseRectangle>{{1440, 0, 2560, 1440}}),
+           "More mirrors than local outputs were accepted.");
+    const std::vector<terra::MouseRectangle> duplicatedOrigin{{0, 0, 1920, 1080},
+                                                              {0, 0, 1280, 1024}};
+    const std::vector<terra::MouseRectangle> ambiguousMirror{{0, 0, 0, 0}};
+    expect(!terra::workspacePairByOrigin(ambiguousMirror, duplicatedOrigin),
+           "An ambiguous local origin was accepted.");
+    expect(!terra::workspacePairByOrigin({}, mixedScale),
+           "Empty mirror list produced a pairing.");
+    expect(!terra::workspacePairByOrigin(topologyMirrors, {}),
+           "Mirrors without local outputs were accepted.");
+
     expect(terra::workspaceMouseBlocker(true, 2, 2, true, true) == nullptr,
            "Eligible workspace mouse routing was disabled.");
     expect(terra::workspaceMouseBlocker(true, 3, 3, true, true) == nullptr,

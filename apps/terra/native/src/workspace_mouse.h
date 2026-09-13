@@ -74,6 +74,34 @@ inline std::vector<std::size_t> workspaceOutputOrder(std::span<const MouseRectan
     return order;
 }
 
+/**
+ * @brief Pair each mirrored workspace stream with the local output at the
+ * same desktop origin. Topology specs carry the client origin of every
+ * streamed output, so disabled outputs are never claimed. Returns nullopt
+ * unless every mirror matches exactly one unused local output.
+ */
+inline std::optional<std::vector<std::size_t>> workspacePairByOrigin(
+    std::span<const MouseRectangle> mirrors, std::span<const MouseRectangle> outputs) {
+    if (mirrors.empty() || mirrors.size() > outputs.size()) return std::nullopt;
+    std::vector<std::size_t> result;
+    result.reserve(mirrors.size());
+    std::vector<char> used(outputs.size(), 0);
+    for (const auto& mirror : mirrors) {
+        std::optional<std::size_t> match;
+        for (std::size_t index = 0; index < outputs.size(); ++index) {
+            if (used[index] || outputs[index].x != mirror.x || outputs[index].y != mirror.y) {
+                continue;
+            }
+            if (match) return std::nullopt;
+            match = index;
+        }
+        if (!match) return std::nullopt;
+        used[*match] = 1;
+        result.push_back(*match);
+    }
+    return result;
+}
+
 /** @brief Fullscreen local output paired with its remote workspace display. */
 struct WorkspaceMouseDisplay {
     MouseRectangle local;

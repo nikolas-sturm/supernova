@@ -332,6 +332,7 @@ describe('coreBridge host protocol', () => {
           hdr: false,
         },
         position: { x: 0, y: 0 },
+        clientOrigin: { x: 0, y: 0 },
         scale: 1,
         rotation: 0,
         primary: true,

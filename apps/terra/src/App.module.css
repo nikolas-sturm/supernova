@@ -1656,6 +1656,11 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
+.topologyNote {
+  margin-top: 14px;
+  color: var(--color-text-subtle);
+  font: 400 12px / 1.5 var(--font-body);
+}
 .selectSetting,
 .numberSetting {
   display: grid;

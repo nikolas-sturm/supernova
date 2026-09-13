@@ -43,9 +43,11 @@ forward directly through `moonlight-common-c` without crossing Neutralino IPC.
 ### Cross-display desktop dragging
 
 Fullscreen workspaces with two to four streams use one borderless stream window per local
-monitor, starting at the selected output and claiming physically adjacent outputs in desktop
-position order (wrapping cyclically), so an unrelated panel enumerated between two external
-monitors is skipped rather than streamed onto. With a Sol host advertising `workspace-mouse-v1`,
+monitor. Client-topology launches pair every stream with the output it mirrors on the Display &
+Topology tab (matched by desktop origin), so only enabled outputs are streamed onto and disabled
+panels are never claimed. When a topology pairing cannot be resolved uniquely, Terra falls back
+to claiming physically adjacent outputs in desktop position order starting at the selection.
+With a Sol host advertising `workspace-mouse-v1`,
 mouse drags can cross those windows without releasing the remote button. The starting window
 retains capture and sends the whole gesture through its original encrypted connection.
 Local and remote resolutions may differ; coordinates account for letterboxing and negative

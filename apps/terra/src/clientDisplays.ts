@@ -11,6 +11,8 @@ export interface VirtualDisplaySpecification {
     hdr: boolean
   }
   position: { x: number; y: number }
+  /** Client output origin mirrored by this display; routes streams locally. */
+  clientOrigin: { x: number; y: number }
   scale: number
   rotation: number
   primary: boolean
@@ -85,6 +87,7 @@ export function clientDisplayVirtualDisplays(
         hdr,
       },
       position: { x: offset, y: 0 },
+      clientOrigin: { x: output.x, y: output.y },
       scale: 1,
       rotation: 0,
       primary: offset === 0,

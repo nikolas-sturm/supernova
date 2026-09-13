@@ -125,6 +125,14 @@ std::string prepareClientTopologyWorkspace(GameStreamClient& client, const HostR
         app.uuid.empty()) {
         throw std::invalid_argument("Client display topology is invalid.");
     }
+    // clientOrigin routes streams back to mirrored outputs locally and never
+    // reaches Sol's workspace schema.
+    Json displays = Json::array();
+    for (const auto& display : virtualDisplays) {
+        Json entry = display;
+        entry.erase("clientOrigin");
+        displays.push_back(std::move(entry));
+    }
     const Json definition = {
         {"schemaVersion", 1},
         {"name", "Terra client topology"},
@@ -136,7 +144,7 @@ std::string prepareClientTopologyWorkspace(GameStreamClient& client, const HostR
         {"streamProfileId", nullptr},
         {"launchProfileId", nullptr},
         {"sandboxProfileId", nullptr},
-        {"virtualDisplays", virtualDisplays},
+        {"virtualDisplays", std::move(displays)},
         {"peripheralPolicy",
          {{"requiredDeviceIds", Json::array()},
           {"requiredClasses", Json::array()},
@@ -982,31 +990,64 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
             for (const auto& display : localDisplays) {
                 localRects.push_back({display.x, display.y, display.width, display.height});
             }
-            const auto first = settings.displayIndex >= 0 &&
-                                       settings.displayIndex < static_cast<int>(localDisplays.size())
-                                   ? static_cast<std::size_t>(settings.displayIndex) : 0;
-            // Claim physically adjacent outputs starting at the selection:
-            // enumeration order can interleave an embedded panel between
-            // the intended external monitors.
-            const auto order = workspaceOutputOrder(localRects, first);
-            std::fprintf(stderr, "[terra-workspace] selected_output=%zu order=", first);
-            for (const auto outputIndex : order) {
-                const auto& rect = localRects[outputIndex];
-                std::fprintf(stderr, "%zu:%d,%d:%dx%d ", outputIndex, rect.x, rect.y,
-                             rect.width, rect.height);
+            // Mirror pairing: each topology spec carries the client origin of
+            // the output it mirrors, in the same order as the workspace
+            // displayIds, so streams land on exactly the enabled outputs and
+            // disabled panels are never claimed.
+            std::vector<MouseRectangle> mirrorOrigins;
+            if (virtualDisplays.is_array() &&
+                virtualDisplays.size() == displaySettings.size()) {
+                for (const auto& display : virtualDisplays) {
+                    if (!display.is_object() || !display.contains("clientOrigin")) continue;
+                    const auto& origin = display.at("clientOrigin");
+                    mirrorOrigins.push_back({origin.at("x").get<int>(), origin.at("y").get<int>(),
+                                             0, 0});
+                }
+                if (mirrorOrigins.size() != displaySettings.size()) mirrorOrigins.clear();
             }
-            std::fprintf(stderr, "\n");
+            const auto mirrored = workspacePairByOrigin(mirrorOrigins, localRects);
+            std::vector<std::size_t> streamLocal(displaySettings.size());
+            if (mirrored) {
+                streamLocal = *mirrored;
+                std::fprintf(stderr, "[terra-workspace] pairing=mirrored");
+                for (std::size_t index = 0; index < streamLocal.size(); ++index) {
+                    const auto& rect = localRects[streamLocal[index]];
+                    std::fprintf(stderr, " %zu:%d,%d:%dx%d", index, rect.x, rect.y, rect.width,
+                                 rect.height);
+                }
+                std::fprintf(stderr, "\n");
+            } else {
+                // Fallback: claim physically adjacent outputs starting at the
+                // selection; enumeration order can interleave an embedded
+                // panel between the intended external monitors.
+                const auto first = settings.displayIndex >= 0 &&
+                                           settings.displayIndex <
+                                               static_cast<int>(localDisplays.size())
+                                       ? static_cast<std::size_t>(settings.displayIndex) : 0;
+                const auto order = workspaceOutputOrder(localRects, first);
+                for (std::size_t index = 0; index < streamLocal.size(); ++index) {
+                    streamLocal[index] = order[index % order.size()];
+                }
+                std::fprintf(stderr, "[terra-workspace] pairing=positional selected_output=%zu order=",
+                             first);
+                for (const auto outputIndex : order) {
+                    const auto& rect = localRects[outputIndex];
+                    std::fprintf(stderr, "%zu:%d,%d:%dx%d ", outputIndex, rect.x, rect.y,
+                                 rect.width, rect.height);
+                }
+                std::fprintf(stderr, "\n");
+            }
             for (std::size_t index = 0; index < displaySettings.size(); ++index) {
                 auto& child = displaySettings[index];
                 if (!fullscreenWorkspace) continue;
-                child.displayIndex = static_cast<int>(order[index % order.size()]);
+                child.displayIndex = static_cast<int>(streamLocal[index]);
                 // Exclusive fullscreen in separate processes minimizes sibling streams on focus changes.
                 child.displayMode = DisplayMode::borderless;
                 child.input.fullscreen = true;
                 if (!workspaceMouse) continue;
                 for (std::size_t offset = 0; offset < displaySettings.size(); ++offset) {
                     const auto remoteIndex = (index + offset) % displaySettings.size();
-                    const auto& local = localRects[order[(index + offset) % order.size()]];
+                    const auto& local = localRects[streamLocal[(index + offset) % streamLocal.size()]];
                     child.input.workspaceMouse.push_back(
                         {local, remoteMouseDisplays[remoteIndex]});
                 }
