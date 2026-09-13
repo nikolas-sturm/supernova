@@ -37,13 +37,16 @@ struct Output {
     }
 };
 
-// Bind at most v3: geometry, mode, done and scale are the only possible events.
+// Bind at most v3: geometry, mode, done and scale are the only possible
+// events; name/description stay as inert v4 stubs.
 const wl_output_listener outputListener = {
     .geometry = [](void*, wl_output*, int32_t, int32_t, int32_t, int32_t,
                    int32_t, const char*, const char*, int32_t) noexcept {},
     .mode = [](void*, wl_output*, uint32_t, int32_t, int32_t, int32_t) noexcept {},
     .done = [](void*, wl_output*) noexcept {},
     .scale = [](void*, wl_output*, int32_t) noexcept {},
+    .name = [](void*, wl_output*, const char*) noexcept {},
+    .description = [](void*, wl_output*, const char*) noexcept {},
 };
 
 const zxdg_output_v1_listener logicalListener = {
@@ -204,7 +207,7 @@ void requestWaylandFullscreenOutput(SDL_Window* window, const MouseRectangle& as
         throw std::runtime_error(detail);
     }
     // Deliberately bypass SDL positioning and its cached fullscreen target.
-    xdg_toplevel_set_fullscreen(native.xdg_toplevel, target);
+    xdg_toplevel_set_fullscreen(native.xdg_toplevel, target->handle);
     if (wl_display_roundtrip(native.display) < 0)
         throw std::runtime_error("Wayland fullscreen request flush failed");
 }
