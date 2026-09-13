@@ -92,7 +92,7 @@ test('native targets stay uncached with complete configuration chains', () => {
     for (const operation of ['configure', 'build', 'test']) {
       const target = targets[`native:${operation}`]
       assert.equal(target.cache, false)
-      assert.equal(target.defaultConfiguration, 'debug')
+      assert.equal(target.defaultConfiguration, app === 'sol' ? 'dev' : 'debug')
       assert.ok(target.configurations.debug)
       assert.ok(target.configurations.release.command.endsWith(`${operation} release`))
       assert.equal(
@@ -101,8 +101,48 @@ test('native targets stay uncached with complete configuration chains', () => {
       )
     }
     assert.deepEqual(targets['native:build'].dependsOn, ['native:configure'])
-    assert.deepEqual(targets['native:test'].dependsOn, ['native:build'])
+    assert.deepEqual(targets['native:test'].dependsOn, [
+      app === 'sol' ? 'native:build-tests' : 'native:build',
+    ])
   }
+})
+
+test('Nx dev preparation selects the same Sol tree as default native builds, without test compilation', () => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      'node_modules/nx/dist/bin/nx.js',
+      'run-many',
+      '-t',
+      'dev:prepare',
+      '--projects=sol,terra',
+      '--graph=stdout',
+    ],
+    {
+      cwd: root,
+      env: { ...process.env, NX_DAEMON: 'false' },
+      encoding: 'utf8',
+      timeout: 20000,
+      maxBuffer: 8 * 1024 * 1024,
+    },
+  )
+  assert.equal(result.status, 0, result.stderr)
+  const { tasks, dependencies } = JSON.parse(result.stdout).tasks
+  assert.ok(tasks['sol:native:configure:dev'])
+  assert.ok(tasks['sol:native:build:dev'])
+  assert.ok(tasks['terra:native:configure:debug'])
+  assert.ok(tasks['terra:build:web'])
+  assert.ok(!Object.keys(tasks).some((id) => id.includes('test')))
+  assert.deepEqual(dependencies['sol:dev:prepare:dev'], ['sol:native:build:dev'])
+  assert.equal(tasks['terra:native:build:debug'].parallelism, false)
+  const sol = json('apps/sol/project.json').targets
+  assert.equal(sol['build:web'].cache, true)
+  assert.ok(sol['build:web'].inputs.includes('{projectRoot}/tsconfig*.json'))
+  assert.equal(sol['build:web'].options.env.SUPERNOVA_WEB_BUILD, '1')
+  assert.equal(
+    sol['native:build-tests'].configurations.dev.command,
+    'node tooling/native/build.mjs sol build debug --dev --tests',
+  )
 })
 
 test('Sol Git version definitions rebuild only version-reporting sources', () => {

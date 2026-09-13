@@ -1,9 +1,20 @@
 import assert from 'node:assert/strict'
 import { createSocket } from 'node:dgram'
-import { existsSync, readFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
 import net from 'node:net'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
 import { developmentPlan, main, runSession } from './dev.mjs'
+import { stageDevAssets } from './dev-assets.mjs'
 import { commandsFor, parseArgs } from './native/build.mjs'
 
 const node = (name, code, extra = {}) => ({
@@ -33,7 +44,7 @@ test('per-app commands build and run only their own native application', () => {
   const terra = developmentPlan('win32', 'x64', 'terra')
   assert.deepEqual(
     sol.services.map(({ name }) => name),
-    ['Sol backend', 'Sol frontend'],
+    ['Sol frontend', 'Sol backend'],
   )
   assert.deepEqual(
     terra.services.map(({ name }) => name),
@@ -45,45 +56,117 @@ test('per-app commands build and run only their own native application', () => {
   assert.ok(terra.required.some(([file]) => file === terra.shell))
   assert.deepEqual(terra.ports, [])
   assert.deepEqual(terra.udpPorts, [])
-  assert.equal(sol.services[0].exitTogether, true)
+  assert.equal(sol.services[1].exitTogether, true)
   assert.ok(!terra.services[0].args.some((arg) => arg.startsWith('--url=')))
   assert.throws(() => developmentPlan('win32', 'x64', 'unknown'), /Usage/)
 })
 
-test('development plan builds serially and launches native desktop after both frontends', () => {
+test('development preparation uses the shared Nx graph and starts one ready frontend before Sol', () => {
   for (const platform of ['win32', 'linux']) {
     const plan = developmentPlan(platform, 'x64')
     assert.deepEqual(
       plan.prepare.map(({ name }) => name),
-      [
-        'sol configure',
-        'sol build',
-        'terra configure',
-        'terra build',
-        'Sol web assets',
-        'Terra web assets',
-      ],
+      ['all preparation (Nx)'],
     )
     assert.deepEqual(
       plan.services.map(({ name }) => name),
-      ['Sol backend', 'Sol frontend', 'Terra desktop'],
+      ['Sol frontend', 'Sol backend', 'Terra desktop'],
     )
     assert.ok(plan.build.endsWith(`cmake-build-${platform}-dev-debug`))
     assert.ok(plan.services[2].args.includes('--window-exit-process-on-close=true'))
     assert.ok(!plan.services[2].args.some((arg) => arg.startsWith('--url=')))
     assert.ok(!plan.services[2].args.includes('--export-auth-info'))
-    assert.deepEqual(plan.services[0].args, ['port=47989'])
-    assert.deepEqual(plan.services[0].ports, [47989, 47990])
-    assert.deepEqual(plan.services[1].args.slice(1), ['build', '--watch'])
-    assert.equal(plan.services[1].env.SOL_ASSETS_DIR, plan.build)
+    assert.deepEqual(plan.services[1].args, ['port=47989'])
+    assert.deepEqual(plan.services[1].ports, [47989, 47990])
+    assert.ok(plan.services[0].args[0].endsWith(path.join('tooling', 'frontend', 'sol-watch.mjs')))
+    assert.equal(plan.services[0].readyMessage, true)
+    assert.equal(plan.services[0].env.SOL_ASSETS_DIR, plan.build)
+    assert.ok(plan.prepare[0].args.includes('--projects=sol,terra'))
+    assert.ok(plan.prepare[0].args.includes('--configuration=dev'))
+    assert.ok(plan.prepare[0].args.includes('--parallel=2'))
+    assert.equal(plan.prepare[0].env.NX_DAEMON, 'false')
     assert.ok(!plan.ports.includes(5173))
     assert.deepEqual(plan.ports, [47984, 47989, 47990, 48010])
     assert.deepEqual(plan.udpPorts, [47998, 47999, 48000])
-    if (platform === 'win32') assert.match(plan.services[0].env.PATH, /ucrt64/)
-    else assert.ok(plan.services[0].env.XDG_CONFIG_HOME.startsWith(plan.build))
+    if (platform === 'win32') assert.match(plan.services[1].env.PATH, /ucrt64/)
+    else assert.ok(plan.services[1].env.XDG_CONFIG_HOME.startsWith(plan.build))
   }
   assert.throws(() => developmentPlan('darwin', 'arm64'), /Unsupported/)
   assert.throws(() => developmentPlan('win32', 'arm64'), /Unsupported/)
+})
+
+test('asset staging skips identical files, web output and Windows shader junctions', () => {
+  const temporary = mkdtempSync(path.join(tmpdir(), 'supernova-dev-assets-'))
+  try {
+    const sol = path.join(temporary, 'sol')
+    const build = path.join(sol, 'cmake-build-fixture')
+    for (const platform of ['common', 'windows', 'linux']) {
+      const assets = path.join(sol, 'src_assets', platform, 'assets')
+      mkdirSync(assets, { recursive: true })
+      writeFileSync(path.join(assets, `${platform}.txt`), platform)
+    }
+    for (const [platform, directory] of [
+      ['common', 'web'],
+      ['windows', 'shaders'],
+    ]) {
+      const source = path.join(sol, 'src_assets', platform, 'assets', directory)
+      mkdirSync(source)
+      writeFileSync(path.join(source, 'excluded.txt'), 'excluded')
+    }
+    stageDevAssets(sol, build, 'win32')
+    const destination = path.join(build, 'assets/common.txt')
+    const time = statSync(destination).mtimeMs
+    stageDevAssets(sol, build, 'win32')
+    assert.equal(statSync(destination).mtimeMs, time)
+    assert.equal(existsSync(path.join(build, 'assets/web')), false)
+    assert.equal(existsSync(path.join(build, 'assets/shaders')), false)
+    assert.equal(existsSync(path.join(build, 'assets/linux.txt')), false)
+    writeFileSync(path.join(sol, 'src_assets/common/assets/common.txt'), 'changed')
+    stageDevAssets(sol, build, 'linux')
+    assert.equal(readFileSync(destination, 'utf8'), 'changed')
+    assert.equal(readFileSync(path.join(build, 'assets/linux.txt'), 'utf8'), 'linux')
+    assert.throws(() => stageDevAssets(sol, build, 'darwin'), /Unsupported/)
+  } finally {
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('IPC readiness gates dependent services and times out safely', {
+  timeout: 15000,
+}, async () => {
+  const temporary = mkdtempSync(path.join(tmpdir(), 'supernova-ready-'))
+  const marker = path.join(temporary, 'ready')
+  try {
+    await runSession({
+      services: [
+        node(
+          'frontend fixture',
+          `setTimeout(() => { require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); process.send('ready') }, 200); setInterval(() => {}, 1000)`,
+          { readyMessage: true },
+        ),
+        node(
+          'backend fixture',
+          `process.exit(require('node:fs').existsSync(${JSON.stringify(marker)}) ? 0 : 1)`,
+          { exitTogether: true },
+        ),
+      ],
+    })
+    await assert.rejects(
+      runSession({
+        services: [node('unready frontend', 'setInterval(() => {}, 1000)', { readyMessage: true })],
+        timeout: 100,
+      }),
+      /did not become ready/,
+    )
+    await assert.rejects(
+      runSession({
+        services: [node('failed frontend', 'process.exit(3)', { readyMessage: true })],
+      }),
+      /failed frontend exited \(3\)/,
+    )
+  } finally {
+    rmSync(temporary, { recursive: true, force: true })
+  }
 })
 
 test('Sol dev builds use isolated trees and runtime assets without changing normal builds', () => {

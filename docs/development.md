@@ -41,9 +41,14 @@ Each command builds and launches that application's native runtime, not a
 browser-only preview. Sol-only startup does not require Neutralino; Terra-only
 startup does not build Sol or reserve any host streaming ports.
 
-This single foreground command configures/builds Sol and Terra serially, stages
-runtime assets, starts Sol with its built-in HTTPS web UI and a frontend build
-watcher, then opens Terra desktop with its built frontend served by Neutralino.
+The foreground launcher checks ports and prerequisites, then delegates preparation
+to local Nx `dev:prepare` targets. Nx schedules up to two independent tasks;
+Terra native build/staging remains exclusive. Sol builds only the app executable,
+not the coverage-instrumented test executable. Unchanged native configure inputs
+reuse the existing configuration, and Ninja handles incremental compilation.
+After preparation, one Sol frontend watcher performs its initial build. The
+launcher waits for successful output before starting Sol's built-in HTTPS server,
+then opens Terra desktop with its built frontend served by Neutralino.
 Sol UI is at `https://localhost:47990`. Neither command starts a Vite HTTP
 server on 5173 or 5174. Sol assets rebuild on edits; refresh the browser to load
 changes. Restart `dev:terra` after Terra frontend or native changes.
@@ -93,6 +98,26 @@ native edits, stop and rerun `npm run dev`; native processes do not hot-reload.
 The development-only native wrapper suffix `--dev` is accepted for Sol debug
 configure/build/test operations. It selects the isolated tree and points compiled
 asset lookup at that tree, without changing release packaging paths.
+Sol's Nx native targets now default to the `dev` configuration, so normal Nx
+native builds reuse the same objects as `dev:sol`. Explicit `debug` retains the
+non-development debug tree; `release` remains separate. No old build tree or
+pairing identity is moved or deleted.
+
+```sh
+npx nx run sol:native:build
+npx nx run sol:native:build-tests
+npx nx run sol:native:test
+npx nx run sol:native:build --configuration=release
+npx nx run-many -t dev:prepare --projects=sol,terra --configuration=dev --parallel=2
+```
+
+`native:build-tests` compiles tests without running them; `native:test` builds and
+runs them. `dev:prepare` is finite and does not launch apps. Root dev commands keep
+the foreground process supervisor outside Nx so port checks precede preparation
+and shutdown owns every service. Preparation is not a second build architecture:
+it references the same Nx native and Terra web targets used independently.
+Sol's watcher builds once on startup, rather than building once in preparation
+and again when watch mode starts. Its first build is not served from Nx cache.
 
 The expected orchestration interface is the root npm scripts backed by local Nx:
 
@@ -104,7 +129,7 @@ npm run dev:terra
 npm run graph
 ```
 
-`check` includes tests. Root `build` runs `build:web` targets only. The optional
+`check` includes tests. Root `build` runs cached `build:web` targets only. The optional
 Terra browser-only Nx preview intentionally reports the native core unavailable.
 
 ### Nx Process Lifetime
@@ -181,6 +206,7 @@ and test separate:
 ```sh
 node tooling/native/build.mjs sol configure debug
 node tooling/native/build.mjs sol build debug
+node tooling/native/build.mjs sol build debug --tests
 node tooling/native/build.mjs sol test debug
 node tooling/native/build.mjs terra configure debug
 node tooling/native/build.mjs terra build debug
@@ -192,9 +218,49 @@ node tooling/native/build.mjs vdd test debug
 
 Use `release` instead of `debug` for the release configuration. Run each step only
 after the preceding step succeeds, and run tests only when authorized. Nx exposes
-`native:configure`, `native:build`, and `native:test` on both apps with debug as the
-default and a release configuration. Native targets disable caching and arrange
-configure/build/test dependencies. They use the same non-daemon workspace mode.
+`native:configure`, `native:build`, and `native:test` on both apps. Sol defaults to
+`dev` (isolated debug); Terra defaults to `debug`. Both expose `release`. Sol also
+exposes `native:build-tests`. Native targets disable Nx artifact caching and
+arrange configure/build/test dependencies. This does not disable Ninja object
+reuse or ccache. They use the same non-daemon workspace mode.
+
+### Incremental Builds
+
+The wrapper records a successful configure fingerprint in the selected build
+tree. It includes configure arguments, relevant environment, tool versions,
+Git version metadata, wrapper implementation, and CMake cache contents. Failed
+configure attempts never produce a reusable stamp. CMake/Ninja still regenerate
+their graph when tracked CMake inputs change. Use `configure ... --fresh` to
+force configure after external SDK/package changes or manual environment repair;
+this does not delete objects or runtime state. Do not reuse a tree across toolchains.
+
+Native builds pass an explicit Ninja job limit. `CMAKE_BUILD_PARALLEL_LEVEL`
+overrides it and must be a positive integer. Standalone native builds and
+single-app dev sessions default to available CPU parallelism; combined dev uses
+half per native build to leave capacity for other preparation work. Nx task
+parallelism and Ninja compiler parallelism are independent limits. More jobs
+cannot parallelize a single translation unit or a serial linker.
+
+ccache is optional and automatically selected without installation. An absolute
+`SUPERNOVA_CCACHE` path overrides discovery; `SUPERNOVA_CCACHE=off` disables it.
+Windows prefers `C:\Tools\ccache.exe`, then UCRT64's ccache, then PATH. Linux
+uses PATH. This avoids an older bundled ccache on a stale Windows PATH shadowing
+the explicitly installed copy. CMake C/C++ compiler launchers use the resolved
+absolute executable; the compiler remains UCRT64 GCC/G++ on Windows. VDD does
+not use this GCC compiler cache. No unsafe ccache sloppiness is enabled.
+
+```powershell
+$env:CMAKE_BUILD_PARALLEL_LEVEL = '12'
+$env:SUPERNOVA_CCACHE = 'C:\Tools\ccache.exe'
+npm run dev:sol
+& 'C:\Tools\ccache.exe' --show-stats
+```
+
+Enabling ccache changes compiler command lines, so the first build can recompile
+existing objects while filling the cache. Subsequent no-op builds should have
+no compilation; ccache helps when Ninja must compile again. Native/runtime trees
+are never restored from Nx cache because they contain machine-local build state
+and development configuration/identities.
 
 | App | CMake source root | Build trees |
 | --- | --- | --- |
@@ -309,10 +375,13 @@ packaging, and hardware streaming need separate validation after native
 prerequisites are repaired. Original product workflows remain under the imported
 app directories and do not run as Supernova workflows.
 
-Sol's web build remains uncached because upstream supports environment-
-selected output directories and bundle-analysis side effects. Terra's pure web
-build and deterministic frontend checks declare cache inputs. Native targets
-remain uncached. Changes to ignored vendored dependency contents must be reviewed
+Sol's Nx `build:web` sets `SUPERNOVA_WEB_BUILD=1`: fixed source/output paths,
+clean generated web output, and no Codecov bundle-analysis/upload side effects.
+It ignores upstream path overrides and caches only `apps/sol/build/assets/web`.
+Direct workspace/CMake web builds retain upstream path overrides and analysis
+behavior and are not cached by Nx. Terra's pure web build and deterministic
+frontend checks also declare cache inputs. Native targets remain uncached by Nx.
+Changes to ignored vendored dependency contents must be reviewed
 with their Git submodule pins and validated explicitly, not inferred solely from
 Nx affected-project selection.
 

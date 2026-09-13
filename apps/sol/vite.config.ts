@@ -18,10 +18,12 @@ import { solApiProxy, solHtmlRewrite } from './vite.auth.ts'
  */
 let assetsSrcPath = 'src_assets/common/assets/web'
 let assetsDstPath = 'build/assets/web'
+const workspaceBuild = process.env.SUPERNOVA_WEB_BUILD === '1'
 
-if (process.env.SOL_BUILD_HOMEBREW) {
+// Nx caches only the fixed workspace output, never external paths or upload side effects.
+if (!workspaceBuild && process.env.SOL_BUILD_HOMEBREW) {
   console.log('Building for homebrew, using default paths')
-} else {
+} else if (!workspaceBuild) {
   // If the paths supplied in the environment variables contain any symbolic links
   // at any point in the series of directories, the entire build will fail with
   // a cryptic error message. Resolve potential symlinks using `fs.realpathSync`.
@@ -50,14 +52,15 @@ export default defineConfig({
     reactCompiler(),
     solHtmlRewrite(),
     // The Codecov vite plugin should be after all other plugins
-    codecovVitePlugin({
-      enableBundleAnalysis: true,
-      bundleName: 'sol',
-      ...(process.env.CODECOV_TOKEN ? { uploadToken: process.env.CODECOV_TOKEN } : {}),
-      gitService: 'github',
-      dryRun: process.env.GITHUB_REPOSITORY !== 'LizardByte/Sunshine',
-      telemetry: process.env.GITHUB_REPOSITORY === 'LizardByte/Sunshine',
-    }),
+    !workspaceBuild &&
+      codecovVitePlugin({
+        enableBundleAnalysis: true,
+        bundleName: 'sol',
+        ...(process.env.CODECOV_TOKEN ? { uploadToken: process.env.CODECOV_TOKEN } : {}),
+        gitService: 'github',
+        dryRun: process.env.GITHUB_REPOSITORY !== 'LizardByte/Sunshine',
+        telemetry: process.env.GITHUB_REPOSITORY === 'LizardByte/Sunshine',
+      }),
   ],
   root: resolve(assetsSrcPath),
   server: {
@@ -70,6 +73,7 @@ export default defineConfig({
     },
   },
   build: {
+    ...(workspaceBuild ? { emptyOutDir: true } : {}),
     outDir: resolve(assetsDstPath),
     target: browserTarget,
     rollupOptions: {

@@ -7,17 +7,36 @@
     "typecheck": { "command": "npm run typecheck --workspace apps/sol" },
     "test": { "command": "npm run test --workspace apps/sol" },
     "build:web": {
-      "cache": false,
-      "command": "npm run build --workspace apps/sol",
+      "executor": "nx:run-commands",
+      "cache": true,
+      "options": {
+        "command": "npm run build --workspace apps/sol",
+        "env": { "SUPERNOVA_WEB_BUILD": "1" }
+      },
       "outputs": ["{projectRoot}/build/assets/web"],
       "inputs": [
-        "production",
+        "{projectRoot}/src_assets/common/assets/web/**/*",
+        "{projectRoot}/vite*.ts",
+        "{projectRoot}/tsconfig*.json",
+        "{projectRoot}/package.json",
+        "{projectRoot}/project.json",
+        "sharedGlobals",
         "^production",
-        { "env": "SOL_SOURCE_ASSETS_DIR" },
-        { "env": "SOL_ASSETS_DIR" },
-        { "env": "SOL_BUILD_HOMEBREW" },
-        { "env": "GITHUB_REPOSITORY" }
+        { "env": "NODE_ENV" }
       ]
+    },
+    "dev": {
+      "command": "node tooling/dev.mjs sol",
+      "continuous": true,
+      "cache": false
+    },
+    "dev:prepare": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "defaultConfiguration": "dev",
+      "configurations": { "dev": {} },
+      "dependsOn": ["native:build"],
+      "options": { "command": "node tooling/dev-assets.mjs" }
     },
     "dev:web": {
       "command": "npm run dev --workspace apps/sol",
@@ -27,10 +46,11 @@
     "native:configure": {
       "executor": "nx:run-commands",
       "cache": false,
-      "defaultConfiguration": "debug",
+      "defaultConfiguration": "dev",
       "options": { "command": "node tooling/native/build.mjs sol configure debug" },
       "configurations": {
         "debug": {},
+        "dev": { "command": "node tooling/native/build.mjs sol configure debug --dev" },
         "release": { "command": "node tooling/native/build.mjs sol configure release" }
       }
     },
@@ -38,21 +58,36 @@
       "executor": "nx:run-commands",
       "cache": false,
       "dependsOn": ["native:configure"],
-      "defaultConfiguration": "debug",
+      "defaultConfiguration": "dev",
       "options": { "command": "node tooling/native/build.mjs sol build debug" },
       "configurations": {
         "debug": {},
+        "dev": { "command": "node tooling/native/build.mjs sol build debug --dev" },
         "release": { "command": "node tooling/native/build.mjs sol build release" }
+      }
+    },
+    "native:build-tests": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "parallelism": false,
+      "dependsOn": ["native:configure"],
+      "defaultConfiguration": "dev",
+      "options": { "command": "node tooling/native/build.mjs sol build debug --tests" },
+      "configurations": {
+        "debug": {},
+        "dev": { "command": "node tooling/native/build.mjs sol build debug --dev --tests" },
+        "release": { "command": "node tooling/native/build.mjs sol build release --tests" }
       }
     },
     "native:test": {
       "executor": "nx:run-commands",
       "cache": false,
-      "dependsOn": ["native:build"],
-      "defaultConfiguration": "debug",
+      "dependsOn": ["native:build-tests"],
+      "defaultConfiguration": "dev",
       "options": { "command": "node tooling/native/build.mjs sol test debug" },
       "configurations": {
         "debug": {},
+        "dev": { "command": "node tooling/native/build.mjs sol test debug --dev" },
         "release": { "command": "node tooling/native/build.mjs sol test release" }
       }
     },

@@ -4,12 +4,13 @@ Run from any working directory using Node.js; no npm dependencies are needed by
 the wrapper. Supported hosts: Windows MSYS2 UCRT64 and Linux only.
 
 ```text
-node tooling/native/build.mjs <sol|terra|vdd> <configure|build|test> <debug|release> [--dev]
+node tooling/native/build.mjs <sol|terra|vdd> <configure|build|test> <debug|release> [--dev] [--tests] [--fresh]
 node --test tooling/native/build.test.mjs
 ```
 
 Operations are separate: configure first, build second, test last. Build and test
-do not silently configure or install dependencies. Sol tests run
+do not silently configure or install dependencies. Sol `build` builds the `sol`
+target only; `build ... --tests` builds `test_sol` instead. Sol tests run
 `tests/test_sol` with the build tree's `tests` directory as its working
 directory; Terra tests use CTest and fail if no tests are registered.
 
@@ -18,6 +19,29 @@ directory; Terra tests use CTest and fail if no tests are registered.
 | Sol | `apps/sol` | `apps/sol/cmake-build-<win32\|linux>-<debug\|release>` |
 | Terra | `apps/terra/native` | `apps/terra/cmake-build-<win32\|linux>-<debug\|release>` |
 | VDD | `apps/sol/third-party/solvdd` | `apps/sol/cmake-build-win32-vdd-<debug\|release>` |
+
+`--dev` selects Sol's `cmake-build-<platform>-dev-debug` tree and compiled asset
+path; it is valid only for Sol debug. `--tests` is valid only for Sol build and can
+be combined with `--dev`. `--fresh` forces configure without deleting the tree.
+
+## Configure Reuse And Compiler Cache
+
+Successful configure records a fingerprint of arguments, relevant environment,
+tool versions, Git version metadata, wrapper source and CMake cache contents.
+Matching invocations skip explicit configure; Ninja still regenerates for tracked
+CMake input changes. Missing/corrupt state and failed configure runs cannot be
+reused. External SDK/package changes may require `configure ... --fresh`.
+
+`CMAKE_BUILD_PARALLEL_LEVEL` sets a positive integer job count; standalone builds
+default to available CPU parallelism. This controls Ninja jobs, not Nx tasks.
+
+Optional ccache discovery prefers an absolute `SUPERNOVA_CCACHE` override,
+then (on Windows) `C:\Tools\ccache.exe` and UCRT64's ccache, then PATH.
+`SUPERNOVA_CCACHE=off` disables discovery and clears the wrapper-managed C/C++
+compiler launchers on configure. Missing optional ccache leaves normal compilation
+available; an invalid explicit path fails. VDD never receives GCC launchers.
+No compiler/toolchain or dependency pins change, and no tools are installed.
+The first ccache-enabled build may recompile objects to fill the cache.
 
 ## Prerequisites
 
@@ -51,6 +75,13 @@ Use the interface above from Nx run-commands targets. Set `cache: false` on ever
 native target. Configure/build/test dependencies belong in Nx; this wrapper and
 CMake never invoke Nx. Do not schedule competing operations against the same
 app/configuration build directory.
+
+Sol native targets default to the `dev` configuration, sharing the launcher tree;
+explicit `debug` and `release` retain their own trees. Terra defaults to `debug`.
+Sol `native:build-tests` depends on configure; `native:test` depends on that test
+build, not the app build. Both apps expose finite `dev:prepare` targets consumed
+by the root foreground launcher. Native task caching remains off: Ninja and
+ccache own native reuse, and runtime identities must never enter Nx artifacts.
 
 ## Web assets
 

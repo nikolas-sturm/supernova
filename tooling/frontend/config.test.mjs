@@ -4,8 +4,100 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { createServer } from 'vite'
+import { fileURLToPath } from 'node:url'
+import { createServer, loadConfigFromFile } from 'vite'
+import { runSession } from '../dev.mjs'
 import { designSystemSource, nativeWatchIgnored } from './config.ts'
+
+test('cacheable Sol web configuration ignores external paths and disables bundle upload', async () => {
+  const values = {
+    SUPERNOVA_WEB_BUILD: '1',
+    SOL_ASSETS_DIR: '/missing-output',
+    SOL_SOURCE_ASSETS_DIR: '/missing-input',
+    SOL_BUILD_HOMEBREW: '1',
+  }
+  const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]))
+  try {
+    Object.assign(process.env, values)
+    const result = await loadConfigFromFile(
+      { command: 'build', mode: 'production' },
+      fileURLToPath(new URL('../../apps/sol/vite.config.ts', import.meta.url)),
+    )
+    assert.ok(result.config.build.outDir.endsWith(path.join('build', 'assets', 'web')))
+    assert.ok(result.config.root.endsWith(path.join('src_assets', 'common', 'assets', 'web')))
+    assert.equal(result.config.build.emptyOutDir, true)
+    assert.equal(result.config.plugins.at(-1), false)
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+})
+
+test('real frontend watch build reports ready only after emitting initial assets', {
+  timeout: 20000,
+}, async () => {
+  const temporary = mkdtempSync(path.join(tmpdir(), 'supernova-build-watch-'))
+  try {
+    writeFileSync(path.join(temporary, 'index.html'), '<html><body>fixture</body></html>')
+    await runSession({
+      timeout: 10000,
+      services: [
+        {
+          name: 'watch fixture',
+          command: process.execPath,
+          args: [fileURLToPath(new URL('./sol-watch.mjs', import.meta.url))],
+          cwd: temporary,
+          readyMessage: true,
+        },
+        {
+          name: 'verify output',
+          command: process.execPath,
+          args: [
+            '-e',
+            `process.exit(require('node:fs').readFileSync(${JSON.stringify(path.join(temporary, 'dist/index.html'))}, 'utf8').includes('fixture') ? 0 : 1)`,
+          ],
+          exitTogether: true,
+        },
+      ],
+    })
+  } finally {
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
+
+test('initial frontend compilation errors abort startup instead of accepting stale assets', {
+  timeout: 20000,
+}, async () => {
+  const temporary = mkdtempSync(path.join(tmpdir(), 'supernova-watch-error-'))
+  try {
+    writeFileSync(
+      path.join(temporary, 'index.html'),
+      '<script type="module" src="./missing.js"></script>',
+    )
+    mkdirSync(path.join(temporary, 'dist'))
+    writeFileSync(path.join(temporary, 'dist/index.html'), 'stale output')
+    await assert.rejects(
+      runSession({
+        timeout: 10000,
+        services: [
+          {
+            name: 'broken watcher',
+            command: process.execPath,
+            args: [fileURLToPath(new URL('./sol-watch.mjs', import.meta.url))],
+            cwd: temporary,
+            readyMessage: true,
+          },
+          { name: 'must not start', command: process.execPath, args: ['-e', 'process.exit(99)'] },
+        ],
+      }),
+      /broken watcher exited \(1\)/,
+    )
+  } finally {
+    rmSync(temporary, { recursive: true, force: true })
+  }
+})
 
 test('both apps resolve the design system without a workspace package link', () => {
   assert.equal(readFileSync(path.join(designSystemSource, 'styles.css'), 'utf8').length > 0, true)

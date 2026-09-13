@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from 'node:child_process'
 import { createSocket } from 'node:dgram'
-import { cpSync, existsSync, mkdirSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import net from 'node:net'
+import { availableParallelism } from 'node:os'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -29,7 +30,7 @@ export function developmentPlan(platform = process.platform, arch = process.arch
     `neutralino-${platform === 'win32' ? 'win' : 'linux'}_${arch}${suffix}`,
   )
   const vite = path.join(root, 'node_modules/vite/bin/vite.js')
-  const native = path.join(root, 'tooling/native/build.mjs')
+  const nx = path.join(root, 'node_modules/nx/dist/bin/nx.js')
   const node = (name, args, cwd = root, env) => ({
     name,
     command: process.execPath,
@@ -43,6 +44,7 @@ export function developmentPlan(platform = process.platform, arch = process.arch
     build,
     shell,
     required: [
+      [nx, 'Run npm ci from the repository root with the pinned Node/npm versions.'],
       [vite, 'Run npm ci from the repository root with the pinned Node/npm versions.'],
       [
         shell,
@@ -52,21 +54,37 @@ export function developmentPlan(platform = process.platform, arch = process.arch
     ports: [47984, 47989, 47990, 48010],
     udpPorts: [47998, 47999, 48000],
     prepare: [
-      ...['sol', 'terra'].flatMap((app) =>
-        ['configure', 'build'].map((operation) =>
-          node(`${app} ${operation}`, [
-            native,
-            app,
-            operation,
-            'debug',
-            ...(app === 'sol' ? ['--dev'] : []),
-          ]),
-        ),
+      node(
+        `${app} preparation (Nx)`,
+        [
+          nx,
+          'run-many',
+          '-t',
+          'dev:prepare',
+          `--projects=${app === 'all' ? 'sol,terra' : app}`,
+          '--configuration=dev',
+          '--parallel=2',
+          '--outputStyle=stream',
+        ],
+        root,
+        {
+          NX_DAEMON: 'false',
+          CMAKE_BUILD_PARALLEL_LEVEL:
+            process.env.CMAKE_BUILD_PARALLEL_LEVEL ||
+            String(Math.max(1, Math.floor(availableParallelism() / (app === 'all' ? 2 : 1)))),
+        },
       ),
-      node('Sol web assets', [vite, 'build'], sol, { SOL_ASSETS_DIR: build }),
-      node('Terra web assets', [vite, 'build'], terra),
     ],
     services: [
+      {
+        ...node('Sol frontend', [path.join(root, 'tooling/frontend/sol-watch.mjs')], sol, {
+          SOL_ASSETS_DIR: build,
+          SUPERNOVA_WEB_BUILD: '0',
+          SOL_BUILD_HOMEBREW: '',
+          SOL_SOURCE_ASSETS_DIR: '',
+        }),
+        readyMessage: true,
+      },
       {
         name: 'Sol backend',
         command: path.join(build, `sol${suffix}`),
@@ -85,9 +103,6 @@ export function developmentPlan(platform = process.platform, arch = process.arch
               },
       },
       {
-        ...node('Sol frontend', [vite, 'build', '--watch'], sol, { SOL_ASSETS_DIR: build }),
-      },
-      {
         name: 'Terra desktop',
         command: shell,
         cwd: terra,
@@ -103,7 +118,6 @@ export function developmentPlan(platform = process.platform, arch = process.arch
     ],
   }
   if (app !== 'all') {
-    plan.prepare = plan.prepare.filter(({ name }) => name.toLowerCase().startsWith(app))
     plan.services = plan.services.filter(({ name }) => name.toLowerCase().startsWith(app))
     plan.ports = app === 'sol' ? plan.ports : []
     plan.udpPorts = app === 'sol' ? plan.udpPorts : []
@@ -173,10 +187,15 @@ export async function runSession({
     const child = spawn(spec.command, spec.args ?? [], {
       cwd: spec.cwd ?? root,
       env: { ...env, ...spec.env },
-      stdio: 'inherit',
+      stdio: spec.readyMessage ? ['inherit', 'inherit', 'inherit', 'ipc'] : 'inherit',
       // Linux process groups let cleanup reach descendants without a shell or unref().
       detached: process.platform === 'linux',
     })
+    let ready = !spec.readyMessage
+    if (spec.readyMessage)
+      child.on('message', (message) => {
+        if (message === 'ready') ready = true
+      })
     children.add(child)
     const exited = new Promise((resolve) => {
       child.once('error', (error) => {
@@ -194,7 +213,7 @@ export async function runSession({
         resolve()
       })
     })
-    return { child, exited }
+    return { child, exited, isReady: () => ready }
   }
 
   try {
@@ -215,8 +234,13 @@ export async function runSession({
     }
     for (const spec of services) {
       if (controller.signal.aborted) break
-      launch(spec, true)
+      const service = launch(spec, true)
       const deadline = Date.now() + timeout
+      while (!controller.signal.aborted && !service.isReady()) {
+        if (Date.now() >= deadline)
+          throw new Error(`${spec.name} did not become ready within ${timeout}ms.`)
+        await delay(100)
+      }
       for (const port of spec.ports ?? []) {
         while (!controller.signal.aborted && !(await portReady(port))) {
           if (Date.now() >= deadline)
@@ -298,28 +322,7 @@ export async function main(args) {
   const plan = developmentPlan(process.platform, process.arch, app)
   const missing = plan.required.filter(([file]) => !existsSync(file))
   if (missing.length) throw new Error(missing.map(([file, hint]) => `${file}\n${hint}`).join('\n'))
-  await runSession({
-    ...plan,
-    beforePrepare() {
-      if (app === 'terra') return
-      mkdirSync(path.join(plan.build, 'assets'), { recursive: true })
-      for (const platform of ['common', process.platform === 'win32' ? 'windows' : 'linux']) {
-        cpSync(
-          path.join(plan.sol, 'src_assets', platform, 'assets'),
-          path.join(plan.build, 'assets'),
-          {
-            recursive: true,
-            filter: (source) =>
-              source !== path.join(plan.sol, 'src_assets/common/assets/web') &&
-              !(
-                process.platform === 'win32' &&
-                source === path.join(plan.sol, 'src_assets/windows/assets/shaders')
-              ),
-          },
-        )
-      }
-    },
-  })
+  await runSession(plan)
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

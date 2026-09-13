@@ -15,7 +15,12 @@
       "continuous": true,
       "cache": false
     },
-    "dev": { "command": "npm run dev --workspace apps/terra", "continuous": true, "cache": false },
+    "dev": { "command": "node tooling/dev.mjs terra", "continuous": true, "cache": false },
+    "dev:prepare": {
+      "executor": "nx:noop",
+      "cache": false,
+      "dependsOn": ["native:build", "build:web"]
+    },
     "bundle": {
       "command": "npm run bundle --workspace apps/terra",
       "cache": false,

@@ -14,7 +14,14 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { commandsFor, parseArgs, shellQuote } from './build.mjs'
+import {
+  buildJobs,
+  commandsFor,
+  configureIfNeeded,
+  findCcache,
+  parseArgs,
+  shellQuote,
+} from './build.mjs'
 
 test('accepts every documented app, operation and configuration', () => {
   for (const app of ['sol', 'terra', 'vdd']) {
@@ -36,8 +43,121 @@ test('rejects missing, extra, unknown and shell-injection arguments', () => {
     ['terra', 'build', 'Debug'],
     ['terra', 'build', 'debug', '--unknown'],
     ['terra; echo bad', 'build', 'debug'],
+    ['sol', 'configure', 'debug', '--tests'],
+    ['sol', 'test', 'debug', '--tests'],
+    ['terra', 'build', 'debug', '--tests'],
+    ['sol', 'build', 'debug', '--fresh'],
+    ['sol', 'configure', 'debug', '--dev', '--dev'],
   ]) {
     assert.throws(() => parseArgs(args), /Usage:/)
+  }
+})
+
+test('Sol app and test builds are explicit, parallel targets in the same configuration tree', () => {
+  for (const dev of [false, true]) {
+    const options = { app: 'sol', operation: 'build', config: 'debug', dev, jobs: 8 }
+    const app = commandsFor(options)[0]
+    const tests = commandsFor({ ...options, tests: true })[0]
+    assert.deepEqual(app.slice(-4), ['--parallel', '8', '--target', 'sol'])
+    assert.deepEqual(tests.slice(-4), ['--parallel', '8', '--target', 'test_sol'])
+    assert.equal(app[2], tests[2])
+  }
+  assert.deepEqual(parseArgs(['sol', 'build', 'debug', '--dev', '--tests']), {
+    app: 'sol',
+    operation: 'build',
+    config: 'debug',
+    dev: true,
+    tests: true,
+  })
+  assert.equal(parseArgs(['sol', 'configure', 'debug', '--fresh']).fresh, true)
+})
+
+test('native job limits honor explicit values and reject unsafe input', () => {
+  assert.equal(buildJobs('', 12), 12)
+  assert.equal(buildJobs('6'), 6)
+  for (const value of ['0', '-1', '1.5', '4; echo bad', 'Infinity', '9007199254740992'])
+    assert.throws(() => buildJobs(value), /positive integer/)
+})
+
+test('ccache selection supports PATH, explicit paths, missing tools and opt-out', () => {
+  const directory = path.dirname(process.execPath)
+  assert.equal(findCcache({ SUPERNOVA_CCACHE: process.execPath }), process.execPath)
+  assert.equal(findCcache({ SUPERNOVA_CCACHE: 'off' }), '')
+  assert.throws(() => findCcache({ SUPERNOVA_CCACHE: directory }), /ccache executable/)
+  assert.throws(() => findCcache({ SUPERNOVA_CCACHE: 'relative/ccache' }), /absolute/)
+  assert.equal(findCcache({ PATH: '/missing-supernova-tools' }, 'linux'), '')
+  const temporary = mkdtempSync(path.join(tmpdir(), 'supernova-ccache-'))
+  try {
+    const executable = path.join(temporary, process.platform === 'win32' ? 'ccache.exe' : 'ccache')
+    writeFileSync(executable, 'fixture', { mode: 0o755 })
+    assert.equal(findCcache({ PATH: temporary }, process.platform, []), executable)
+    if (process.platform === 'win32')
+      assert.equal(findCcache({ PATH: temporary }, 'win32', [process.execPath]), process.execPath)
+  } finally {
+    rmSync(temporary, { recursive: true, force: true })
+  }
+  for (const ccache of ['', 'C:\\Tools\\ccache.exe']) {
+    const command = commandsFor(
+      { app: 'sol', operation: 'configure', config: 'debug', ccache },
+      'win32',
+    )[0]
+    for (const language of ['C', 'CXX'])
+      assert.ok(
+        command.includes(`-DCMAKE_${language}_COMPILER_LAUNCHER=${ccache.replaceAll('\\', '/')}`),
+      )
+    assert.ok(command.includes('-DCMAKE_CXX_COMPILER=g++'))
+    const vdd = commandsFor(
+      { app: 'vdd', operation: 'configure', config: 'debug', ccache },
+      'win32',
+    )[0]
+    assert.ok(!vdd.some((value) => value.includes('COMPILER_LAUNCHER')))
+  }
+})
+
+test('configure reuse requires matching inputs, cache, build graph and a successful prior run', () => {
+  const temporary = mkdtempSync(path.join(tmpdir(), 'supernova-configure-'))
+  const command = ['cmake', '-S', 'fixture', '-B', temporary]
+  const cache = path.join(temporary, 'CMakeCache.txt')
+  const graph = path.join(temporary, 'build.ninja')
+  const stamp = path.join(temporary, '.supernova-configure.json')
+  let count = 0
+  const run = () => {
+    count++
+    writeFileSync(cache, `configured ${count}`)
+    writeFileSync(graph, 'fixture graph')
+  }
+  const configure = (extra = {}) =>
+    configureIfNeeded(command, { fingerprint: 'inputs', run, ...extra })
+  try {
+    assert.equal(configure(), true)
+    assert.equal(configure(), false)
+    assert.equal(count, 1)
+    assert.equal(configure({ fingerprint: 'changed compiler/options/environment/version' }), true)
+    assert.equal(configure(), true)
+    writeFileSync(cache, 'manually changed options')
+    assert.equal(configure(), true)
+    rmSync(graph)
+    assert.equal(configure(), true)
+    rmSync(cache)
+    assert.equal(configure(), true)
+    writeFileSync(stamp, 'broken stamp')
+    assert.equal(configure(), true)
+    assert.equal(configure({ fresh: true }), true)
+    assert.throws(
+      () =>
+        configure({
+          fresh: true,
+          run: () => {
+            throw new Error('configure failed')
+          },
+        }),
+      /configure failed/,
+    )
+    assert.equal(existsSync(stamp), false)
+    assert.equal(configure(), true)
+    assert.equal(configure(), false)
+  } finally {
+    rmSync(temporary, { recursive: true, force: true })
   }
 })
 
