@@ -2,10 +2,25 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <optional>
 #include <vector>
 
 namespace terra {
+
+/** @brief Explain why launch-time workspace routing is unavailable; null means enabled. */
+inline const char* workspaceMouseBlocker(bool fullscreen, std::size_t streams,
+                                       std::size_t localOutputs, bool layoutEligible,
+                                       bool hostSupported) {
+    if (streams < 2 || streams > 4) return "Workspace mouse requires two to four streams.";
+    if (!fullscreen) {
+        return "Stream display mode is Windowed; select Fullscreen or Borderless in Workstation Settings before launching. Toggling a running window does not enable workspace routing.";
+    }
+    if (streams > localOutputs) return "More workspace streams than detected local outputs.";
+    if (!layoutEligible) return "Host display scaling or rotation is not eligible for workspace mouse routing.";
+    if (!hostSupported) return "Host does not advertise workspace-mouse-v1; update or reconnect to the intended Sol host.";
+    return nullptr;
+}
 
 /** @brief Pixel rectangle in a local or remote desktop. */
 struct MouseRectangle {

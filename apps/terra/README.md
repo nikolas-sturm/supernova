@@ -71,6 +71,18 @@ host processing, receive/reassembly, decode and presentation stalls; frame-loss 
 do not prove a network bottleneck. Sol logs each workspace coordinate rejection reason only
 once per transport. These diagnostics do not log individual mouse packets or input keys.
 
+Every workspace launch also emits a `terra-workspace` summary with the requested stream display
+mode, stream count, detected local output count, host capability, layout eligibility, selected
+mouse routing and aggregate configured video bitrate (before transport/FEC overhead). Disabled
+workspace routing includes its reason. `terra-worker` reports each child's configuration;
+`terra-input` reports the actual SDL backend and workspace-map count, even when that map is empty.
+Frame timing diagnostics remain enabled in ordinary per-display routing, too.
+
+The workstation settings **Display mode** must be Fullscreen or Borderless at launch for
+workspace routing. The main UI's fullscreen setting is separate, and making an already-running
+Windowed stream fullscreen does not retroactively negotiate workspace mouse input. Existing
+Windowed preferences are preserved rather than silently overridden.
+
 ## Prerequisites
 
 - Node.js 20.19+, 22.12+, or newer

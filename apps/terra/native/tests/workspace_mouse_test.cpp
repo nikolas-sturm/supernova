@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -31,6 +32,22 @@ void roundTrip(const std::vector<terra::WorkspaceMouseDisplay>& displays,
 }  // namespace
 
 int main() {
+    expect(terra::workspaceMouseBlocker(true, 2, 2, true, true) == nullptr,
+           "Eligible workspace mouse routing was disabled.");
+    expect(terra::workspaceMouseBlocker(true, 3, 3, true, true) == nullptr,
+           "Three-output workspace mouse routing was disabled.");
+    const auto explained = [](const char* reason, std::string_view expected) {
+        expect(reason && std::string_view{reason}.find(expected) != std::string_view::npos,
+               "Workspace routing blocker is missing or incorrect.");
+    };
+    explained(terra::workspaceMouseBlocker(false, 2, 2, true, true), "Windowed");
+    explained(terra::workspaceMouseBlocker(true, 3, 2, true, true), "local outputs");
+    explained(terra::workspaceMouseBlocker(true, 2, 2, false, true), "scaling or rotation");
+    explained(terra::workspaceMouseBlocker(true, 2, 2, true, false), "workspace-mouse-v1");
+    expect(terra::workspaceMouseBlocker(true, 1, 2, true, true) != nullptr &&
+               terra::workspaceMouseBlocker(true, 5, 5, true, true) != nullptr,
+           "Unsupported stream count enabled workspace mouse routing.");
+
     std::vector<terra::WorkspaceMouseDisplay> displays{
         {{0, 0, 1920, 1080}, {0, 0, 1920, 1080}},
         {{1920, 0, 2560, 1440}, {1920, 0, 3840, 2160}},

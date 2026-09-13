@@ -964,8 +964,19 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
             const auto localDisplays = enumerateClientDisplays();
             const bool fullscreenWorkspace = settings.displayMode != DisplayMode::windowed &&
                                               displayIds.size() <= localDisplays.size();
-            const bool workspaceMouse = fullscreenWorkspace && workspaceMouseEligible && displayIds.size() > 1 &&
-                std::ranges::contains(current.capabilities, "workspace-mouse-v1");
+            const bool hostWorkspaceMouse = std::ranges::contains(current.capabilities, "workspace-mouse-v1");
+            const auto* mouseBlocker = workspaceMouseBlocker(
+                settings.displayMode != DisplayMode::windowed, displayIds.size(), localDisplays.size(),
+                workspaceMouseEligible, hostWorkspaceMouse);
+            const bool workspaceMouse = mouseBlocker == nullptr;
+            const char* displayMode = settings.displayMode == DisplayMode::windowed ? "windowed" :
+                                      settings.displayMode == DisplayMode::fullscreen ? "fullscreen" : "borderless";
+            std::fprintf(stderr,
+                "[terra-workspace] display_mode=%s streams=%zu local_outputs=%zu layout_eligible=%d host_workspace_mouse=%d mouse_routing=%s total_video_bitrate_kbps=%llu\n",
+                displayMode, displayIds.size(), localDisplays.size(), workspaceMouseEligible,
+                hostWorkspaceMouse, workspaceMouse ? "workspace" : "per-display",
+                static_cast<unsigned long long>(settings.bitrateKbps) * displayIds.size());
+            if (mouseBlocker) std::fprintf(stderr, "[terra-workspace] %s\n", mouseBlocker);
             for (std::size_t index = 0; index < displaySettings.size(); ++index) {
                 auto& child = displaySettings[index];
                 if (!fullscreenWorkspace) continue;

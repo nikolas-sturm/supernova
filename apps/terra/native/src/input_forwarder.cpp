@@ -3150,6 +3150,13 @@ void InputForwarder::start(SDL_Window* window, InputSettings settings, int width
     }
     if (settings.controllersEnabled) impl_->startControllers();
     const auto* driver = SDL_GetCurrentVideoDriver();
+    SDL_version sdlVersion{};
+    SDL_GetVersion(&sdlVersion);
+    std::fprintf(stderr,
+        "[terra-input] sdl=%u.%u.%u video_driver=%s absolute_mouse=%d fullscreen=%d workspace_mouse_displays=%zu\n",
+        static_cast<unsigned>(sdlVersion.major), static_cast<unsigned>(sdlVersion.minor),
+        static_cast<unsigned>(sdlVersion.patch), driver ? driver : "unavailable",
+        settings.absoluteMouseMode, settings.fullscreen, settings.workspaceMouse.size());
     if (settings.absoluteMouseMode && !settings.workspaceMouse.empty() && driver &&
         std::string_view{driver} == "wayland") {
         impl_->waylandPointer.start(window);

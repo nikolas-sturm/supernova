@@ -202,7 +202,10 @@ int runStreamWorker() {
     return 2;
   auto config = parseStreamWorkerConfig(*frame);
   const int displayIndex = config.settings.displayIndex;
-  const bool workspaceMouse = !config.settings.input.workspaceMouse.empty();
+  std::fprintf(stderr,
+      "[terra-worker] display=%d video=%dx%d fps=%d bitrate_kbps=%d workspace_mouse_displays=%zu\n",
+      displayIndex, config.settings.width, config.settings.height, config.settings.fps,
+      config.settings.bitrateKbps, config.settings.input.workspaceMouse.size());
   std::mutex outputMutex;
   const auto send = [&](nlohmann::json value) {
     std::scoped_lock lock{outputMutex};
@@ -222,8 +225,7 @@ int runStreamWorker() {
               {"hostEnded", hostEnded},
               {"userEnded", userEnded}});
       }, {},
-      [displayIndex, workspaceMouse](const StreamStatisticsSample &sample) {
-        if (!workspaceMouse) return;
+      [displayIndex](const StreamStatisticsSample &sample) {
         const auto &s = sample.statistics;
         if (sample.sequence % 5 != 0 && s.frameLossPercent == 0 && s.queueDrops == 0) return;
         // Once per sample at most, never per frame or mouse packet. stderr is separate
