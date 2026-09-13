@@ -569,6 +569,7 @@ namespace stream {
     bool primary_stream {true};  ///< Whether this transport owns audio and controller roles.
     terra_api::input_permissions_t input_permissions;  ///< Input classes permitted for this stream.
     input::mouse_mode_e profile_mouse_mode {input::mouse_mode_e::any};  ///< Stream-profile mouse-coordinate mode.
+    std::vector<input::mouse_viewport_t> mouse_viewports;  ///< Authorized workspace mouse displays, source first.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
     std::uint64_t telemetry_generation {1};  ///< Counter generation retained in snapshots.
@@ -2517,7 +2518,7 @@ namespace stream {
      * @brief Start the audio, video, and control workers for a streaming session.
      */
     int start(session_t &session, const std::string &addr_string) {
-      session.input = input::alloc(session.mail, session.input_session_id, session.input_permissions, session.profile_mouse_mode, session.display_id);
+      session.input = input::alloc(session.mail, session.input_session_id, session.input_permissions, session.profile_mouse_mode, session.display_id, session.mouse_viewports);
 
       session.broadcast_ref = broadcast.ref();
       if (!session.broadcast_ref) {
@@ -2588,6 +2589,7 @@ namespace stream {
       session->primary_stream = launch_session.primary_stream;
       session->input_permissions = launch_session.input_permissions;
       session->profile_mouse_mode = launch_session.profile_mouse_mode;
+      session->mouse_viewports = launch_session.mouse_viewports;
       session->client_cert = launch_session.client_cert;
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
       session->telemetry_generation = launch_session.telemetry_generation;

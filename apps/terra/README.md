@@ -40,6 +40,23 @@ VAAPI decode, fall back to software decoding, and present through SDL2. Opus pac
 PCM and play through the default WASAPI or SDL2 output device. Keyboard, mouse, and connected gamepads
 forward directly through `moonlight-common-c` without crossing Neutralino IPC.
 
+### Cross-display desktop dragging
+
+Fullscreen workspaces with two to four streams use one borderless stream window per local
+monitor, starting at the selected output. With a Sol host advertising `workspace-mouse-v1`,
+mouse drags can cross those windows without releasing the remote button. The starting window
+retains capture and sends the whole gesture through its original encrypted connection.
+Local and remote resolutions may differ; coordinates account for letterboxing and negative
+desktop origins. Matching monitor arrangements gives the most natural crossing behavior.
+
+This mode requires enough local monitors for the workspace, unrotated host displays at scale
+1, and absolute desktop input. Other layouts and older hosts retain ordinary per-stream input;
+relative gaming input is unchanged. Grouped windows stay borderless fullscreen until disconnected
+(the per-window fullscreen toggle is inactive). Actual focus loss, capture loss, overlays, and
+disconnects release held buttons. Reconnect after changing monitor layout or resolution; stale
+maps are not reused. Linux uses SDL capture on X11 and the compositor's implicit drag grab on
+Wayland; compositor-specific cross-output behavior still needs live validation.
+
 ## Prerequisites
 
 - Node.js 20.19+, 22.12+, or newer

@@ -19,6 +19,7 @@
 #include <openssl/evp.h>
 
 #include "audio_renderer.h"
+#include "client_displays.h"
 #include "gamestream_client.h"
 #include "input_forwarder.h"
 #include "logical_session_control.h"
@@ -875,6 +876,8 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
     LaunchResult launched;
     std::vector<std::string> displayIds;
     std::vector<StreamSettings> displaySettings;
+    std::vector<MouseRectangle> remoteMouseDisplays;
+    bool workspaceMouseEligible = true;
     auto effectiveSettings = settings;
     auto effectiveWorkspaceId = workspaceId;
     bool generatedTopologyWorkspace = false;
@@ -937,7 +940,10 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                 const auto displayResponse = gameStream_->apiRequest(
                     current.address, current.apiPort, current.serverCertificate, "GET",
                     "/eclipse/v1/virtual-displays/" + displayId);
-                const auto& mode = displayResponse.body.at("virtualDisplay").at("actualMode");
+                const auto& display = displayResponse.body.at("virtualDisplay");
+                const auto& mode = display.at("actualMode");
+                workspaceMouseEligible = workspaceMouseEligible && display.at("scale") == 1.0 &&
+                                         display.at("rotation") == 0;
                 const auto refreshNumerator = mode.at("refreshNumerator").get<int>();
                 const auto refreshDenominator = mode.at("refreshDenominator").get<int>();
                 if (refreshNumerator <= 0 || refreshDenominator <= 0) {
@@ -950,7 +956,33 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                 childSettings.fps =
                     (refreshNumerator + refreshDenominator / 2) / refreshDenominator;
                 childSettings.enableHdr = mode.at("hdr").get<bool>();
+                remoteMouseDisplays.push_back({display.at("position").at("x").get<int>(),
+                                               display.at("position").at("y").get<int>(),
+                                               childSettings.width, childSettings.height});
                 displaySettings.push_back(std::move(childSettings));
+            }
+            const auto localDisplays = enumerateClientDisplays();
+            const bool fullscreenWorkspace = settings.displayMode != DisplayMode::windowed &&
+                                              displayIds.size() <= localDisplays.size();
+            const bool workspaceMouse = fullscreenWorkspace && workspaceMouseEligible && displayIds.size() > 1 &&
+                std::ranges::contains(current.capabilities, "workspace-mouse-v1");
+            for (std::size_t index = 0; index < displaySettings.size(); ++index) {
+                auto& child = displaySettings[index];
+                if (!fullscreenWorkspace) continue;
+                const auto first = settings.displayIndex >= 0 &&
+                                           settings.displayIndex < static_cast<int>(localDisplays.size())
+                                       ? static_cast<std::size_t>(settings.displayIndex) : 0;
+                child.displayIndex = static_cast<int>((first + index) % localDisplays.size());
+                // Exclusive fullscreen in separate processes minimizes sibling streams on focus changes.
+                child.displayMode = DisplayMode::borderless;
+                child.input.fullscreen = true;
+                if (!workspaceMouse) continue;
+                for (std::size_t offset = 0; offset < displaySettings.size(); ++offset) {
+                    const auto remoteIndex = (index + offset) % displaySettings.size();
+                    const auto& local = localDisplays[(first + remoteIndex) % localDisplays.size()];
+                    child.input.workspaceMouse.push_back(
+                        {{local.x, local.y, local.width, local.height}, remoteMouseDisplays[remoteIndex]});
+                }
             }
             effectiveSettings = displaySettings.front();
         }

@@ -49,7 +49,7 @@ namespace terra_api {
     "host.control",
   };  ///< Stable certificate-bound authorization scope names.
 
-  constexpr std::array<std::string_view, 14> KNOWN_CAPABILITIES {
+  constexpr std::array<std::string_view, 15> KNOWN_CAPABILITIES {
     "client-permissions",
     "catalog-v2",
     "session-ids",
@@ -64,6 +64,7 @@ namespace terra_api {
     "sandboxes-v1",
     "discovery-v1",
     "multi-display-streaming-v1",
+    "workspace-mouse-v1",
   };  ///< Stable Terra API capability names, including unavailable features.
 
   constexpr std::array<std::string_view, 4> CAPABILITIES {

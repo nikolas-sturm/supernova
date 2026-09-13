@@ -766,7 +766,8 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
              ? ""
              : "&eclipseLaunchProfileId=" + urlEncode(launchProfileId)) +
         (workspaceId.empty() ? "" : "&eclipseWorkspaceId=" + urlEncode(workspaceId)) +
-        (displayId.empty() ? "" : "&eclipseDisplayId=" + urlEncode(displayId));
+        (displayId.empty() ? "" : "&eclipseDisplayId=" + urlEncode(displayId)) +
+        (settings.input.workspaceMouse.empty() ? "" : "&eclipseWorkspaceMouse=1");
     const auto endpoint = parseEndpoint(address);
     const auto response =
         request(endpoint, httpsPort == 0 ? kDefaultHttpsPort : httpsPort, true,
@@ -777,6 +778,9 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
     result.sessionUrl = childText(root, "sessionUrl0");
     result.logicalSessionId = childText(root, "EclipseSessionId");
     result.childStreamId = childText(root, "EclipseStreamId");
+    if (!settings.input.workspaceMouse.empty() && childText(root, "EclipseWorkspaceMouse") != "1") {
+        throw std::runtime_error("Host did not accept workspace mouse coordinates.");
+    }
     if (result.sessionUrl.empty()) {
         throw std::runtime_error("Sol launch response is missing session URL.");
     }

@@ -1146,6 +1146,7 @@ namespace nvhttp {
     launch_session->session_id = session_id.empty() ? uuid_util::uuid_t::generate().string() : std::move(session_id);
     launch_session->stream_id = uuid_util::uuid_t::generate().string();
     launch_session->display_id = get_arg(args, "eclipseDisplayId", "");
+    launch_session->workspace_mouse_requested = get_arg(args, "eclipseWorkspaceMouse", "0") == "1";
     launch_session->client_uuid = client.uuid;
     launch_session->client_cert = client.cert;
     launch_session->client_name = client.name;
@@ -2450,6 +2451,7 @@ namespace nvhttp {
     if (terra_v1) {
       tree.put("root.EclipseSessionId", launch_session->session_id);
       tree.put("root.EclipseStreamId", launch_session->stream_id);
+      tree.put("root.EclipseWorkspaceMouse", launch_session->mouse_viewports.empty() ? 0 : 1);
     }
 
     // Stream was started successfully, we will revert the config when the app or session terminates
@@ -2696,6 +2698,7 @@ namespace nvhttp {
     if (terra_v1) {
       tree.put("root.EclipseSessionId", launch_session->session_id);
       tree.put("root.EclipseStreamId", launch_session->stream_id);
+      tree.put("root.EclipseWorkspaceMouse", launch_session->mouse_viewports.empty() ? 0 : 1);
     }
   }
 
@@ -3062,6 +3065,7 @@ namespace nvhttp {
     if (terra_workspace_unavailable_reason().empty()) {
       capabilities.emplace_back("workspaces-v1");
       capabilities.emplace_back("multi-display-streaming-v1");
+      capabilities.emplace_back("workspace-mouse-v1");
     }
     if (terra_operation_store && terra_operation_store->available() && terra_sandbox_manager && terra_sandbox_manager->available() && terra::windows::sandbox::health().available) {
       capabilities.emplace_back("sandboxes-v1");
@@ -3897,6 +3901,31 @@ namespace nvhttp {
       if (!workspace->definition.virtual_displays.empty() && session.capture_output_name.empty()) {
         error_message = "Workspace has no capture-ready attached display";
         return false;
+      }
+      if (session.workspace_mouse_requested) {
+        if (workspace->display_ids.size() < 2 || workspace->display_ids.size() > 4 ||
+            session.profile_mouse_mode == input::mouse_mode_e::relative) {
+          error_message = "Workspace mouse input requires two to four absolute-mode displays";
+          return false;
+        }
+        session.mouse_viewports.clear();
+        const auto mouse_generation = input::workspace_mouse_generation();
+        for (const auto &display_id : workspace->display_ids) {
+          const auto display = terra_virtual_display_manager->get(display_id);
+          if (!display || display->workspace_id != workspace->id || display->state != terra_virtual_display::state_t::attached ||
+              display->scale != 1.0 || display->rotation != 0) {
+            error_message = "Workspace mouse topology is unavailable or has unsupported host scaling or rotation";
+            return false;
+          }
+          const input::mouse_viewport_t viewport {
+            display->position.x, display->position.y, display->actual_mode.width, display->actual_mode.height, mouse_generation
+          };
+          if (display_id == session.display_id) {
+            session.mouse_viewports.insert(session.mouse_viewports.begin(), viewport);
+          } else {
+            session.mouse_viewports.push_back(viewport);
+          }
+        }
       }
     }
 #endif
@@ -9950,6 +9979,12 @@ namespace nvhttp {
     auto virtual_display_ready_promise = std::make_shared<std::promise<void>>();
     const auto virtual_display_ready = virtual_display_ready_promise->get_future().share();
     virtual_display_callbacks.changed = [virtual_display_ready](const std::optional<terra_virtual_display::resource_t> &previous, const std::optional<terra_virtual_display::resource_t> &current) {
+      if (!previous || !current || previous->position.x != current->position.x || previous->position.y != current->position.y ||
+          previous->actual_mode.width != current->actual_mode.width || previous->actual_mode.height != current->actual_mode.height ||
+          previous->scale != current->scale || previous->rotation != current->rotation || previous->state != current->state ||
+          previous->workspace_id != current->workspace_id) {
+        input::invalidate_workspace_mouse();
+      }
       if (terra_operation_pool.running()) {
         terra_operation_pool.push([previous, current, virtual_display_ready]() {
           virtual_display_ready.wait();

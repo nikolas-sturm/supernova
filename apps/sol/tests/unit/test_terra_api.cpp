@@ -366,6 +366,7 @@ TEST(TerraApiTest, BuildsCompleteCapabilityDocument) {
   EXPECT_TRUE(document["features"]["profiles-v1"]["available"]);
   EXPECT_TRUE(document["features"]["workspaces-v1"]["available"]);
   EXPECT_EQ(document["features"]["multi-display-streaming-v1"]["available"], document["features"]["workspaces-v1"]["available"]);
+  EXPECT_EQ(document["features"]["workspace-mouse-v1"]["available"], document["features"]["workspaces-v1"]["available"]);
   EXPECT_TRUE(document["features"]["telemetry-v1"]["available"]);
   EXPECT_FALSE(document["features"]["discovery-v1"]["available"]);
   EXPECT_EQ(document["features"]["discovery-v1"]["reasonCode"], "server_unavailable");

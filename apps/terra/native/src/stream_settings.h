@@ -1,5 +1,7 @@
 #pragma once
 
+#include "workspace_mouse.h"
+
 namespace terra {
 
 enum class DisplayMode {
@@ -64,6 +66,7 @@ struct InputSettings {
     bool forceGamepad = false;
     bool backgroundGamepad = false;
     bool controllersEnabled = true;
+    std::vector<WorkspaceMouseDisplay> workspaceMouse;  ///< Runtime-only map, source display first.
 };
 
 struct StreamSettings {

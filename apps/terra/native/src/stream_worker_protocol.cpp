@@ -13,6 +13,14 @@ namespace {
 constexpr std::uint32_t kMaxFrameBytes = 1024 * 1024;
 
 nlohmann::json settingsJson(const StreamSettings &settings) {
+  auto workspaceMouse = nlohmann::json::array();
+  for (const auto &display : settings.input.workspaceMouse) {
+    const auto rectangle = [](const MouseRectangle &rect) {
+      return nlohmann::json::array({rect.x, rect.y, rect.width, rect.height});
+    };
+    workspaceMouse.push_back({{"local", rectangle(display.local)},
+                              {"remote", rectangle(display.remote)}});
+  }
   return {
       {"width", settings.width},
       {"height", settings.height},
@@ -34,6 +42,7 @@ nlohmann::json settingsJson(const StreamSettings &settings) {
       {"enableYuv444", settings.enableYuv444},
       {"input",
        {{"absoluteMouseMode", settings.input.absoluteMouseMode},
+        {"workspaceMouse", std::move(workspaceMouse)},
         {"captureSystemKeys",
          static_cast<int>(settings.input.captureSystemKeys)},
         {"fullscreen", settings.input.fullscreen},
@@ -72,6 +81,14 @@ StreamSettings parseSettings(const nlohmann::json &value) {
   settings.enableYuv444 = value.at("enableYuv444").get<bool>();
   const auto &input = value.at("input");
   settings.input.absoluteMouseMode = input.at("absoluteMouseMode").get<bool>();
+  for (const auto &display : input.at("workspaceMouse")) {
+    const auto rectangle = [](const nlohmann::json &rect) {
+      const auto values = rect.get<std::array<int, 4>>();
+      return MouseRectangle{values[0], values[1], values[2], values[3]};
+    };
+    settings.input.workspaceMouse.push_back(
+        {rectangle(display.at("local")), rectangle(display.at("remote"))});
+  }
   settings.input.captureSystemKeys =
       static_cast<SystemKeyCapture>(input.at("captureSystemKeys").get<int>());
   settings.input.fullscreen = input.at("fullscreen").get<bool>();

@@ -22,7 +22,7 @@ Sol advertises only capabilities whose complete routes and runtime dependencies 
 operational: `client-permissions`, `session-ids`, `structured-errors`, `catalog-v2`, `events-v1`,
 `telemetry-v1`, and `peripherals-v1` on every supported platform, plus `discovery-v1` while local
 discovery is reachable. Windows additionally advertises `profiles-v1`, `workspaces-v1`,
-`multi-display-streaming-v1`, `sandboxes-v1`, `virtual-displays-v1`, and `displays-v1` while their
+`multi-display-streaming-v1`, `workspace-mouse-v1`, `sandboxes-v1`, `virtual-displays-v1`, and `displays-v1` while their
 complete persistence and provider dependencies stay healthy. Incomplete and unhealthy
 provider-backed domains remain listed as unavailable under `features`.
 
@@ -92,6 +92,25 @@ host layout.
 responses include stable `EclipseSessionId` and unique `EclipseStreamId` fields. One logical session
 supports at most four child streams. Terra virtual-display streams and legacy Moonlight streams are
 mutually exclusive while either topology is active.
+
+Hosts advertising `workspace-mouse-v1` accept `eclipseWorkspaceMouse=1` for workspaces
+with two to four attached, unrotated displays at scale 1 using absolute mouse input.
+Successful negotiation returns `EclipseWorkspaceMouse=1`; clients must verify this before
+sending extended coordinates. Ordinary launches return `0` and retain clamped per-display input.
+Unsupported layouts should use ordinary input rather than request this extension.
+
+The encrypted Moonlight absolute-mouse packet keeps its existing format. With this extension,
+signed `x`/`y` are relative to the transport's source display and may fall outside its bounds;
+positive reference dimensions still represent that source display's full pixel dimensions.
+Sol maps the point to its authorized workspace display rectangles and rejects desktop gaps and
+unbound outputs. Mouse permissions still apply. Clients retain one connection for a complete drag,
+including its final position and button release. The pinned Moonlight client subtracts one from
+reference dimensions during wire encoding, which callers must account for.
+
+Virtual-display topology mutations invalidate negotiated maps and cancel held mouse buttons;
+resume renegotiates the map and waits for a fresh capture touch port. Clients must reconnect after
+local monitor topology changes instead of reusing launch-time geometry. Video streams, ordinary
+touch/pen packets, and relative gaming input retain their existing coordinate conventions.
 
 ### GET /eclipse/v1/capabilities
 

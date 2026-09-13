@@ -446,6 +446,30 @@ int main(int argc, char** argv) {
                "Repeated renderer failures did not terminate recovery loop.");
     }
 
+    {
+        auto config = testConfig();
+        config.settings.input.workspaceMouse = {
+            {{0, 0, 1920, 1080}, {0, 0, 1920, 1080}},
+            {{1920, 0, 1920, 1080}, {1920, 0, 1920, 1080}},
+        };
+        int disconnects = 0;
+        terra::StreamSession session(config, [](const auto&) {}, [&](auto event, bool hostEnded, bool userEnded) {
+            ++disconnects;
+            expect(event.message.find("reconnect the workspace") != std::string::npos,
+                   "Workspace topology failure did not explain recovery.");
+            expect(!hostEnded && !userEnded, "Topology failure was treated as user quit.");
+        });
+        session.start();
+        savedCallbacks.connectionStarted();
+        expect(savedVideoCallbacks.setup(VIDEO_FORMAT_H264, 1920, 1080, 60, nullptr, 0) == DR_OK,
+               "Workspace renderer setup failed.");
+        nextRecoveryDisplay = 1;
+        forceVideoRecovery.store(true);
+        DECODE_UNIT unit{};
+        static_cast<void>(savedVideoCallbacks.submitDecodeUnit(&unit));
+        expect(disconnects == 1, "Stale workspace map survived a local display change.");
+    }
+
     for (const auto [audioConfig, expected] : {
              std::pair{terra::AudioConfig::surround51, AUDIO_CONFIGURATION_51_SURROUND},
              std::pair{terra::AudioConfig::surround71, AUDIO_CONFIGURATION_71_SURROUND},
@@ -494,11 +518,17 @@ int main(int argc, char** argv) {
         auto config = testConfig();
         config.audioEnabled = false;
         config.controllerEnabled = false;
+        config.settings.input.workspaceMouse = {
+            {{0, 0, 1920, 1080}, {0, 0, 1920, 1080}},
+            {{-2560, 0, 2560, 1440}, {-3840, 0, 3840, 2160}},
+        };
         config.launch.logicalSessionId = "11111111-1111-4111-8111-111111111111";
         config.launch.childStreamId = "22222222-2222-4222-8222-222222222222";
         const auto parsed = terra::parseStreamWorkerConfig(terra::streamWorkerConfigJson(config));
         expect(!parsed.audioEnabled && !parsed.controllerEnabled,
                "Worker role flags did not survive serialization.");
+        expect(parsed.settings.input.workspaceMouse == config.settings.input.workspaceMouse,
+               "Worker workspace mouse map did not survive serialization.");
         expect(parsed.launch.logicalSessionId == config.launch.logicalSessionId &&
                    parsed.launch.childStreamId == config.launch.childStreamId,
                "Worker stream identifiers did not survive serialization.");

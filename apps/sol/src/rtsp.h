@@ -71,6 +71,8 @@ namespace rtsp_stream {
     std::optional<int> profile_audio_channels;  ///< Stream-profile channel-count override.
     std::optional<int> profile_audio_mask;  ///< Stream-profile channel-mask override.
     input::mouse_mode_e profile_mouse_mode {input::mouse_mode_e::any};  ///< Stream-profile mouse-coordinate mode.
+    bool workspace_mouse_requested {};  ///< Client requested negotiated workspace-wide mouse coordinates.
+    std::vector<input::mouse_viewport_t> mouse_viewports;  ///< Authorized workspace displays, source first.
     bool profile_stream_applied {};  ///< Whether dimensions, frame rate, and HDR came from a stream profile.
     bool profile_encryption_required {};  ///< Whether negotiated audio and video encryption are mandatory.
     std::string capture_output_name;  ///< Exact display-device identifier selected by profile or workspace attachment.

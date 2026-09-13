@@ -378,6 +378,21 @@ if(BUILD_TESTING)
   endif()
   add_test(NAME display-mode COMMAND terra-display-mode-test)
 
+  add_executable(terra-workspace-mouse-test tests/workspace_mouse_test.cpp)
+  target_include_directories(terra-workspace-mouse-test PRIVATE src)
+  add_test(NAME workspace-mouse COMMAND terra-workspace-mouse-test)
+
+  if(WIN32)
+    add_executable(terra-input-forwarder-windows-test
+      tests/input_forwarder_windows_test.cpp
+      src/input_forwarder.cpp
+    )
+    target_include_directories(terra-input-forwarder-windows-test PRIVATE src "${MOONLIGHT_COMMON_ROOT}/src")
+    target_compile_definitions(terra-input-forwarder-windows-test PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 NOMINMAX)
+    target_link_libraries(terra-input-forwarder-windows-test PRIVATE user32)
+    add_test(NAME input-forwarder-windows COMMAND terra-input-forwarder-windows-test)
+  endif()
+
   add_executable(
     terra-wake-on-lan-test
     tests/wake_on_lan_test.cpp

@@ -15,11 +15,18 @@
 
 // local includes
 #include "platform/common.h"
+#include "input_workspace.h"
 #include "terra_api.h"
 #include "thread_safe.h"
 
 namespace input {
   struct input_t;
+
+  /** @brief Read the current workspace mouse topology generation. @return Current generation. */
+  std::uint64_t workspace_mouse_generation();
+
+  /** @brief Invalidate negotiated mouse maps and cancel held mouse buttons after a topology mutation. */
+  void invalidate_workspace_mouse();
 
   /**
    * @brief Optional mouse-coordinate mode enforced for one stream.
@@ -128,10 +135,11 @@ namespace input {
    * @param session_id Stable paired-client identity shared by launch and resume connections.
     * @param permissions Input classes permitted for this paired client.
     * @param mouse_mode Mouse input policy for this stream.
-    * @param display_id Stable display identity separating concurrent stream viewports.
+     * @param display_id Stable display identity separating concurrent stream viewports.
+     * @param mouse_viewports Authorized workspace mouse displays, source first; empty for ordinary input.
    * @return Shared input state bound to the stream mailbox.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, terra_api::input_permissions_t permissions = {}, mouse_mode_e mouse_mode = mouse_mode_e::any, std::string display_id = {});
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, terra_api::input_permissions_t permissions = {}, mouse_mode_e mouse_mode = mouse_mode_e::any, std::string display_id = {}, std::vector<mouse_viewport_t> mouse_viewports = {});
 
 #ifdef SOL_TESTS
   namespace testing {
@@ -191,6 +199,17 @@ namespace input {
      * @param release Whether the packet releases the key.
      */
     void send_keyboard_packet(std::shared_ptr<input_t> &input, std::uint16_t key_code, std::uint8_t modifiers, std::uint8_t flags, bool release);
+
+    /**
+     * @brief Process one absolute mouse packet synchronously through typed passthrough.
+     *
+     * @param input Retained input state; tests must install a fake platform backend first.
+     * @param x Signed source-relative X coordinate.
+     * @param y Signed source-relative Y coordinate.
+     * @param width Packet reference width.
+     * @param height Packet reference height.
+     */
+    void send_mouse_position_packet(std::shared_ptr<input_t> &input, std::int16_t x, std::int16_t y, std::int16_t width, std::int16_t height);
 
     /**
      * @brief Forget every key Sol tracks as pressed and cancel any pending key repeat.

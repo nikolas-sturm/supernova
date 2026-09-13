@@ -141,8 +141,8 @@ std::vector<ClientDisplayOutput> enumerateClientDisplays() {
         }
         SDL_DisplayMode desktop{};
         if (SDL_GetDesktopDisplayMode(index, &desktop) == 0) {
-            output.width = desktop.w;
-            output.height = desktop.h;
+            if (output.width <= 0) output.width = desktop.w;
+            if (output.height <= 0) output.height = desktop.h;
             output.refreshRate = desktop.refresh_rate > 0 ? desktop.refresh_rate : 60;
         }
         const auto modeCount = SDL_GetNumDisplayModes(index);

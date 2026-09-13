@@ -10,6 +10,7 @@ extern "C" {
 
 // standard includes
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cmath>
@@ -47,6 +48,12 @@ constexpr int WHEEL_DELTA = 120;  ///< Standard Windows wheel delta used to norm
 using namespace std::literals;
 
 namespace input {
+
+  std::atomic_uint64_t workspace_mouse_epoch {1};  ///< Invalidates input maps synchronously with topology changes.
+
+  std::uint64_t workspace_mouse_generation() {
+    return workspace_mouse_epoch.load();
+  }
 
   constexpr auto MAX_GAMEPADS = std::min((std::size_t) platf::MAX_GAMEPADS, sizeof(std::int16_t) * 8);  ///< Maximum gamepads representable by the active gamepad mask.
 /**
@@ -305,6 +312,7 @@ namespace input {
     platf::feedback_queue_t feedback_queue;  ///< Queue used to deliver controller feedback to the platform backend.
     terra_api::input_permissions_t permissions;  ///< Input classes permitted by paired-client policy.
     mouse_mode_e mouse_mode;  ///< Mouse-coordinate mode accepted from this stream.
+    std::vector<mouse_viewport_t> mouse_viewports;  ///< Authorized workspace displays, replaced on the input task thread.
     std::mutex permissions_mutex;  ///< Protects policy replacement and packet authorization on resumed streams.
 
     std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
@@ -830,6 +838,9 @@ namespace input {
 
     auto width = (float) util::endian::big(packet->width);
     auto height = (float) util::endian::big(packet->height);
+    if (width <= 0 || height <= 0) {
+      return;
+    }
 
     auto tpcoords = client_to_touchport(input, {x, y}, {width, height});
     if (!tpcoords) {
@@ -837,6 +848,24 @@ namespace input {
     }
 
     auto &touch_port = input->touch_port;
+
+    if (!input->mouse_viewports.empty()) {
+      if (input->mouse_viewports.front().generation != workspace_mouse_generation()) {
+        return;
+      }
+      const auto relative = workspace_mouse_position(input->mouse_viewports, x, y, width, height);
+      if (!relative) {
+        return;
+      }
+      const auto &source = input->mouse_viewports.front();
+      // Fail closed after a capture mode change; the client must rebuild its topology map.
+      if (std::abs((touch_port.width - 2 * touch_port.client_offsetX) * touch_port.scalar_inv - source.width) > 1 ||
+          std::abs((touch_port.height - 2 * touch_port.client_offsetY) * touch_port.scalar_inv - source.height) > 1) {
+        return;
+      }
+      tpcoords = std::pair {touch_port.offset_x + relative->first / touch_port.scalar_tpcoords,
+                           touch_port.offset_y + relative->second / touch_port.scalar_tpcoords};
+    }
 
     int touch_port_dim_x;
     int touch_port_dim_y;
@@ -870,6 +899,10 @@ namespace input {
     }
 
     auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
+    if (!release && !input->mouse_viewports.empty() &&
+        input->mouse_viewports.front().generation != workspace_mouse_generation()) {
+      return;
+    }
     auto button = util::endian::big(packet->button);
     if (button > 0 && button < mouse_press.size()) {
       if (mouse_press[button] != release) {
@@ -2250,6 +2283,20 @@ namespace input {
     }
   }
 
+  void invalidate_workspace_mouse() {
+    ++workspace_mouse_epoch;
+    dispatch_input_task([]() {
+      auto &state = retained_input_state();
+      std::lock_guard lock {state.mutex};
+      if (std::ranges::any_of(state.inputs, [](const auto &entry) {
+            return !entry.second->mouse_viewports.empty() &&
+                   entry.second->mouse_viewports.front().generation != workspace_mouse_generation();
+          })) {
+        reset_mouse_buttons();
+      }
+    });
+  }
+
   /**
    * @brief Release every pressed keyboard key tracked by Sol.
    */
@@ -2402,7 +2449,7 @@ namespace input {
   /**
    * @brief Allocate and initialize platform input state for a stream.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, const terra_api::input_permissions_t permissions, const mouse_mode_e mouse_mode, std::string display_id) {
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, const terra_api::input_permissions_t permissions, const mouse_mode_e mouse_mode, std::string display_id, std::vector<mouse_viewport_t> mouse_viewports) {
     const auto key = std::make_pair(std::move(session_id), std::move(display_id));
     std::shared_ptr<input_t> input;
     bool resumed = false;
@@ -2420,6 +2467,7 @@ namespace input {
           permissions,
           mouse_mode
         );
+        input->mouse_viewports = std::move(mouse_viewports);
         state.inputs.try_emplace(key, input);
       }
     }
@@ -2430,8 +2478,10 @@ namespace input {
         input->permissions = permissions;
         input->mouse_mode = mouse_mode;
       }
-      dispatch_input_task([input, mail = std::move(mail)]() {
+      dispatch_input_task([input, mail = std::move(mail), mouse_viewports = std::move(mouse_viewports)]() mutable {
         rebind_input(input, mail);
+        input->mouse_viewports = std::move(mouse_viewports);
+        input->touch_port = {};
       });
     }
 
@@ -2479,6 +2529,17 @@ namespace input {
       packet.flags = static_cast<char>(flags);
 
       // Keyboard packets are never batched, so this matches passthrough_next_message().
+      ::input::passthrough(input, &packet);
+    }
+
+    void send_mouse_position_packet(std::shared_ptr<input_t> &input, std::int16_t x, std::int16_t y, std::int16_t width, std::int16_t height) {
+      NV_ABS_MOUSE_MOVE_PACKET packet {};
+      packet.header.size = util::endian::big<std::uint32_t>(sizeof(packet) - sizeof(packet.header.size));
+      packet.header.magic = util::endian::little<std::uint32_t>(MOUSE_MOVE_ABS_MAGIC);
+      packet.x = util::endian::big(x);
+      packet.y = util::endian::big(y);
+      packet.width = util::endian::big(width);
+      packet.height = util::endian::big(height);
       ::input::passthrough(input, &packet);
     }
 

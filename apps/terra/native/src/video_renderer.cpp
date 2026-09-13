@@ -119,7 +119,10 @@ std::vector<DisplayMonitor> displayMonitors() {
         const bool leftPrimary = (left.info.dwFlags & MONITORINFOF_PRIMARY) != 0;
         const bool rightPrimary = (right.info.dwFlags & MONITORINFOF_PRIMARY) != 0;
         if (leftPrimary != rightPrimary) return leftPrimary;
-        return std::wcscmp(left.info.szDevice, right.info.szDevice) < 0;
+        if (left.info.rcMonitor.left != right.info.rcMonitor.left) {
+            return left.info.rcMonitor.left < right.info.rcMonitor.left;
+        }
+        return left.info.rcMonitor.top < right.info.rcMonitor.top;
     });
     return displays;
 }
@@ -370,6 +373,7 @@ struct VideoRenderer::Impl {
         if (!presentationInitialized.load()) return;
         const auto monitor = MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST);
         if (!topologyChanged && monitor == selectedDisplayHandle) return;
+        if (!settings.input.workspaceMouse.empty()) inputForwarder.setEnabled(false);
         const auto displays = displayMonitors();
         const auto display = std::find_if(displays.begin(), displays.end(), [&](const auto& value) {
             return value.handle == monitor;
@@ -540,6 +544,7 @@ struct VideoRenderer::Impl {
     }
 
     bool toggleFullscreen() {
+        if (!settings.input.workspaceMouse.empty()) return true;
         HWND handle = nullptr;
         {
             std::scoped_lock lock{windowMutex};
@@ -2313,7 +2318,8 @@ struct VideoRenderer::Impl {
             if (event.type == SDL_RENDER_DEVICE_RESET || event.type == SDL_RENDER_TARGETS_RESET) {
                 recoveryRequested.store(true);
             } else if (event.type == SDL_DISPLAYEVENT &&
-                       event.display.event == SDL_DISPLAYEVENT_DISCONNECTED) {
+                       (event.display.event == SDL_DISPLAYEVENT_DISCONNECTED ||
+                        !settings.input.workspaceMouse.empty())) {
                 requestDisplayRecovery(true);
             } else if (event.type == SDL_WINDOWEVENT &&
                        event.window.windowID == SDL_GetWindowID(window)) {
@@ -2357,6 +2363,7 @@ struct VideoRenderer::Impl {
     }
 
     bool toggleFullscreen() {
+        if (!settings.input.workspaceMouse.empty()) return true;
         const auto flags = SDL_GetWindowFlags(window);
         const bool fullscreen = (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
         if (SDL_SetWindowFullscreen(window, fullscreen ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP) < 0) {
@@ -2371,6 +2378,7 @@ struct VideoRenderer::Impl {
         const int displayIndex = SDL_GetWindowDisplayIndex(window);
         const int nextDisplay = displayIndex >= 0 ? displayIndex : 0;
         if (!force && nextDisplay == currentDisplayIndex && displayIndex >= 0) return;
+        if (!settings.input.workspaceMouse.empty()) inputForwarder.setEnabled(false);
         recoveryDisplayIndex.store(nextDisplay);
         recoveryRequested.store(true);
     }

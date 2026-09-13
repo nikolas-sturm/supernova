@@ -22,6 +22,7 @@ int rumbleEvents = 0;
 int keyboardEvents = 0;
 int mouseMoves = 0;
 int mousePositions = 0;
+std::array<short, 4> lastMousePosition{};
 int mouseButtonEvents = 0;
 int touchEvents = 0;
 int penEvents = 0;
@@ -65,8 +66,9 @@ extern "C" int LiSendMouseMoveEvent(short, short) {
     ++mouseMoves;
     return 0;
 }
-extern "C" int LiSendMousePositionEvent(short, short, short, short) {
+extern "C" int LiSendMousePositionEvent(short x, short y, short width, short height) {
     ++mousePositions;
+    lastMousePosition = {x, y, width, height};
     return 0;
 }
 extern "C" int LiSendHighResScrollEvent(short) { return 0; }
@@ -750,6 +752,51 @@ int main() {
     input.handleEvent(event);
     expect(ignoredOverlayOpens == 0, "Stream overlay opened without captured input.");
     input.stop();
+    {
+        SDL_Rect display{};
+        expect(SDL_GetDisplayBounds(0, &display) == 0, "No SDL display bounds for workspace test.");
+        SDL_SetWindowPosition(window, display.x, display.y);
+        SDL_SetWindowSize(window, display.w, display.h);
+        terra::InputSettings workspaceSettings;
+        workspaceSettings.absoluteMouseMode = true;
+        workspaceSettings.fullscreen = true;
+        workspaceSettings.controllersEnabled = false;
+        workspaceSettings.workspaceMouse = {
+            {{display.x, display.y, display.w, display.h}, {0, 0, display.w, display.h}},
+            {{display.x - display.w, display.y, display.w, display.h}, {-display.w, 0, display.w, display.h}},
+        };
+        terra::InputForwarder workspaceInput;
+        workspaceInput.start(window, workspaceSettings, display.w, display.h, 60);
+        workspaceInput.setEnabled(true);
+        event = {};
+        event.type = SDL_MOUSEMOTION;
+        event.motion.windowID = SDL_GetWindowID(window);
+        event.motion.x = -display.w / 2;
+        event.motion.y = display.h / 2;
+        const int beforeWorkspaceMotion = mousePositions;
+        workspaceInput.handleEvent(event);
+        const auto mapped = terra::workspaceMousePosition(workspaceSettings.workspaceMouse,
+            display.x + event.motion.x, display.y + event.motion.y);
+        expect(mapped && mousePositions == beforeWorkspaceMotion + 1 &&
+                   lastMousePosition == std::array<short, 4>{mapped->x, mapped->y, mapped->width, mapped->height},
+               "SDL workspace motion clamped to the source window.");
+        event.motion.x = -2 * display.w;
+        workspaceInput.handleEvent(event);
+        expect(mousePositions == beforeWorkspaceMotion + 1, "SDL forwarded motion outside the workspace.");
+        if (std::string{SDL_GetCurrentVideoDriver()} == "dummy") {
+            const int beforeButtons = mouseButtonEvents;
+            event = {};
+            event.type = SDL_MOUSEBUTTONDOWN;
+            event.button.windowID = SDL_GetWindowID(window);
+            event.button.button = SDL_BUTTON_LEFT;
+            event.button.state = SDL_PRESSED;
+            event.button.x = display.w / 2;
+            event.button.y = display.h / 2;
+            workspaceInput.handleEvent(event);
+            expect(mouseButtonEvents == beforeButtons, "SDL started a drag without capture support.");
+        }
+        workspaceInput.stop();
+    }
     SDL_DestroyWindow(window);
 #if SDL_VERSION_ATLEAST(2, 24, 0)
     expect(SDL_JoystickDetachVirtual(devices[0]) == 0, "Could not detach first controller.");

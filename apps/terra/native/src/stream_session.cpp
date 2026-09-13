@@ -585,6 +585,10 @@ bool StreamSession::recoverVideoRendererLocked(std::string& error) {
     }
     ++videoRecoveryAttempts_;
     if (const auto displayIndex = video_->recoveryDisplayIndex()) {
+        if (!config_.settings.input.workspaceMouse.empty()) {
+            error = "Display topology changed; reconnect the workspace to rebuild mouse mapping.";
+            return false;
+        }
         videoDisplayOverride_ = *displayIndex;
     }
     video_.reset();

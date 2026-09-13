@@ -182,6 +182,7 @@ struct InputForwarder::Impl {
     std::wstring streamLabel;
     bool enabled = false;
     bool mouseCaptured = false;
+    bool workspaceDragCaptured = false;
     bool cursorHidden = false;
     int streamWidth = 1;
     int streamHeight = 1;
@@ -399,6 +400,7 @@ struct InputForwarder::Impl {
             }
             if (!keysDown.empty() || !mouseButtonsDown.empty()) Sleep(1);
         }
+        if (std::exchange(workspaceDragCaptured, false) && GetCapture() == window) ReleaseCapture();
     }
 
     void cancelPointerState() {
@@ -694,7 +696,7 @@ struct InputForwarder::Impl {
                    : CallNextHookEx(self->keyboardHook, code, wparam, lparam);
     }
 
-    void sendMouseButton(int button, bool pressed) {
+    bool sendMouseButton(int button, bool pressed) {
         if (settings.swapMouseButtons) {
             if (button == BUTTON_LEFT) {
                 button = BUTTON_RIGHT;
@@ -702,13 +704,14 @@ struct InputForwarder::Impl {
                 button = BUTTON_LEFT;
             }
         }
-        if (!pressed && !mouseButtonsDown.contains(button)) return;
+        if (!pressed && !mouseButtonsDown.contains(button)) return true;
         const int input =
             LiSendMouseButtonEvent(pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, button);
         noteInputResult(input);
-        if (input != 0) return;
+        if (input != 0) return false;
         if (pressed) mouseButtonsDown.insert(button);
         else mouseButtonsDown.erase(button);
+        return true;
     }
 
     void handleRawInput(HRAWINPUT handle) {
@@ -777,8 +780,23 @@ struct InputForwarder::Impl {
         }
     }
 
-    void sendAbsoluteMousePosition(LPARAM value) {
-        if (!settings.absoluteMouseMode || !window) return;
+    bool sendAbsoluteMousePosition(LPARAM value) {
+        if (!settings.absoluteMouseMode || !window) return false;
+        if (!settings.workspaceMouse.empty()) {
+            POINT origin{};
+            RECT client{};
+            const auto& local = settings.workspaceMouse.front().local;
+            if (!settings.fullscreen || !ClientToScreen(window, &origin) ||
+                !GetClientRect(window, &client) || origin.x != local.x || origin.y != local.y ||
+                client.right != local.width || client.bottom != local.height) return false;
+            const auto position = workspaceMousePosition(settings.workspaceMouse,
+                origin.x + GET_X_LPARAM(value), origin.y + GET_Y_LPARAM(value));
+            if (!position) return false;
+            const int result = LiSendMousePositionEvent(position->x, position->y,
+                                                        position->width, position->height);
+            noteInputResult(result);
+            return result == 0;
+        }
         const auto bounds = videoBounds();
         const int width = std::min<int>(std::max<LONG>(bounds.right - bounds.left, 1), 32767);
         const int height = std::min<int>(std::max<LONG>(bounds.bottom - bounds.top, 1), 32767);
@@ -790,6 +808,26 @@ struct InputForwarder::Impl {
             std::max<LONG>(bounds.bottom - bounds.top, 1));
         noteInputResult(LiSendMousePositionEvent(
             x, y, static_cast<short>(width), static_cast<short>(height)));
+        return true;
+    }
+
+    void sendAbsoluteMouseButton(int button, bool pressed, LPARAM value) {
+        const bool positioned = absoluteInputCaptured && (pressed || !mouseButtonsDown.empty()) &&
+                                sendAbsoluteMousePosition(value);
+        if (pressed && !positioned) return;
+        if (pressed && !settings.workspaceMouse.empty() && !workspaceDragCaptured) {
+            SetCapture(window);
+            if (GetCapture() != window) return;
+            workspaceDragCaptured = true;
+        }
+        const bool sent = sendMouseButton(button, pressed);
+        if (!pressed && workspaceDragCaptured && (!positioned || !sent)) {
+            // Retry a failed release before relinquishing native capture. Never leave
+            // capture held merely because the transport queue rejected button-up.
+            releaseRemoteState();
+        }
+        if (mouseButtonsDown.empty() && std::exchange(workspaceDragCaptured, false) &&
+            GetCapture() == window) ReleaseCapture();
     }
 
     void emulateDirectPointer(UINT32 pointerId, std::uint8_t eventType, float x, float y) {
@@ -1259,20 +1297,20 @@ bool InputForwarder::handleMessage(UINT message, WPARAM wparam, LPARAM lparam, L
                     result = 0;
                     return true;
                 }
-                impl_->sendMouseButton(BUTTON_LEFT, true);
+                impl_->sendAbsoluteMouseButton(BUTTON_LEFT, true, lparam);
             } else if (!impl_->mouseCaptured) {
                 impl_->setMouseCaptured(true);
             }
             result = 0;
             return true;
         case WM_LBUTTONUP:
-            if (impl_->settings.absoluteMouseMode) impl_->sendMouseButton(BUTTON_LEFT, false);
+            if (impl_->settings.absoluteMouseMode) impl_->sendAbsoluteMouseButton(BUTTON_LEFT, false, lparam);
             result = 0;
             return impl_->settings.absoluteMouseMode;
         case WM_RBUTTONDOWN:
         case WM_RBUTTONUP:
             if (impl_->settings.absoluteMouseMode && impl_->absoluteInputCaptured) {
-                impl_->sendMouseButton(BUTTON_RIGHT, message == WM_RBUTTONDOWN);
+                impl_->sendAbsoluteMouseButton(BUTTON_RIGHT, message == WM_RBUTTONDOWN, lparam);
                 result = 0;
                 return true;
             }
@@ -1280,7 +1318,7 @@ bool InputForwarder::handleMessage(UINT message, WPARAM wparam, LPARAM lparam, L
         case WM_MBUTTONDOWN:
         case WM_MBUTTONUP:
             if (impl_->settings.absoluteMouseMode && impl_->absoluteInputCaptured) {
-                impl_->sendMouseButton(BUTTON_MIDDLE, message == WM_MBUTTONDOWN);
+                impl_->sendAbsoluteMouseButton(BUTTON_MIDDLE, message == WM_MBUTTONDOWN, lparam);
                 result = 0;
                 return true;
             }
@@ -1289,7 +1327,7 @@ bool InputForwarder::handleMessage(UINT message, WPARAM wparam, LPARAM lparam, L
         case WM_XBUTTONUP:
             if (impl_->settings.absoluteMouseMode && impl_->absoluteInputCaptured) {
                 const auto button = GET_XBUTTON_WPARAM(wparam) == XBUTTON1 ? BUTTON_X1 : BUTTON_X2;
-                impl_->sendMouseButton(button, message == WM_XBUTTONDOWN);
+                impl_->sendAbsoluteMouseButton(button, message == WM_XBUTTONDOWN, lparam);
                 result = TRUE;
                 return true;
             }
@@ -1333,9 +1371,16 @@ bool InputForwarder::handleMessage(UINT message, WPARAM wparam, LPARAM lparam, L
             }
             break;
         case WM_CAPTURECHANGED:
+            if (impl_->workspaceDragCaptured && reinterpret_cast<HWND>(lparam) != impl_->window) {
+                impl_->workspaceDragCaptured = false;
+                impl_->releaseRemoteState();
+            }
             if (impl_->mouseCaptured && reinterpret_cast<HWND>(lparam) != impl_->window) {
                 impl_->setMouseCaptured(false);
             }
+            break;
+        case WM_CANCELMODE:
+            if (impl_->workspaceDragCaptured) impl_->releaseRemoteState();
             break;
         case WM_MOVE:
         case WM_SIZE:
@@ -1655,6 +1700,7 @@ struct InputForwarder::Impl {
     };
 
     SDL_Window* window = nullptr;
+    bool workspaceDragCaptured = false;
     InputSettings settings;
     std::string streamLabel;
     std::string inputError;
@@ -2442,6 +2488,7 @@ struct InputForwarder::Impl {
         for (int attempt = 0; attempt < 20 && !releaseRemoteState(); ++attempt) {
             SDL_Delay(1);
         }
+        if (std::exchange(workspaceDragCaptured, false)) SDL_CaptureMouse(SDL_FALSE);
     }
 
     void cancelTouchState() {
@@ -2736,9 +2783,9 @@ struct InputForwarder::Impl {
         }
     }
 
-    void sendMouseButton(Uint8 sdlButton, bool pressed) {
+    bool sendMouseButton(Uint8 sdlButton, bool pressed) {
         auto button = terraMouseButton(sdlButton);
-        if (!button) return;
+        if (!button) return false;
         if (settings.swapMouseButtons) {
             if (*button == BUTTON_LEFT) {
                 *button = BUTTON_RIGHT;
@@ -2746,16 +2793,17 @@ struct InputForwarder::Impl {
                 *button = BUTTON_LEFT;
             }
         }
-        if (!pressed && !remoteMouseButtonsDown.contains(*button)) return;
+        if (!pressed && !remoteMouseButtonsDown.contains(*button)) return true;
         const int result = LiSendMouseButtonEvent(
             pressed ? BUTTON_ACTION_PRESS : BUTTON_ACTION_RELEASE, *button);
         noteInputResult(result);
-        if (result != 0) return;
+        if (result != 0) return false;
         if (pressed) {
             remoteMouseButtonsDown.insert(*button);
         } else {
             remoteMouseButtonsDown.erase(*button);
         }
+        return true;
     }
 
     void handleMouseButton(const SDL_MouseButtonEvent& event) {
@@ -2774,19 +2822,58 @@ struct InputForwarder::Impl {
             if (!pressed && event.button == SDL_BUTTON_LEFT) setMouseCaptured(true);
             return;
         }
-        if (settings.absoluteMouseMode && pressed) {
+        if (settings.absoluteMouseMode && pressed && !workspaceDragCaptured) {
             const auto bounds = videoBounds();
             if (event.x < bounds.x || event.x >= bounds.x + bounds.w || event.y < bounds.y ||
                 event.y >= bounds.y + bounds.h) {
                 return;
             }
         }
-        sendMouseButton(event.button, pressed);
+        bool positioned = true;
+        if (settings.absoluteMouseMode && !settings.workspaceMouse.empty()) {
+            positioned = sendWorkspaceMousePosition(event.x, event.y);
+            if (pressed && !positioned) return;
+            if (pressed && !workspaceDragCaptured) {
+                const auto* driver = SDL_GetCurrentVideoDriver();
+                // Wayland's button-down implicit grab delivers out-of-surface motion
+                // until release; SDL's explicit capture API is X11-only there.
+                if ((!driver || std::string_view{driver} != "wayland") &&
+                    SDL_CaptureMouse(SDL_TRUE) != 0) return;
+                workspaceDragCaptured = true;
+            }
+        }
+        const bool sent = sendMouseButton(event.button, pressed);
+        if (!pressed && workspaceDragCaptured && (!positioned || !sent)) releaseRemoteStateWithRetry();
+        if (remoteMouseButtonsDown.empty() && std::exchange(workspaceDragCaptured, false)) {
+            SDL_CaptureMouse(SDL_FALSE);
+        }
+    }
+
+    bool sendWorkspaceMousePosition(int x, int y) {
+        if (!settings.fullscreen || settings.workspaceMouse.empty()) return false;
+        const auto& local = settings.workspaceMouse.front().local;
+        int width = 0;
+        int height = 0;
+        SDL_GetWindowSize(window, &width, &height);
+        SDL_Rect display{};
+        if (SDL_GetDisplayBounds(SDL_GetWindowDisplayIndex(window), &display) != 0 ||
+            display.x != local.x || display.y != local.y || display.w != local.width ||
+            display.h != local.height || width != local.width || height != local.height) return false;
+        const auto position = workspaceMousePosition(settings.workspaceMouse, local.x + x, local.y + y);
+        if (!position) return false;
+        const int result = LiSendMousePositionEvent(position->x, position->y,
+                                                    position->width, position->height);
+        noteInputResult(result);
+        return result == 0;
     }
 
     void handleMouseMotion(const SDL_MouseMotionEvent& event) {
         if (event.which == SDL_TOUCH_MOUSEID || overlayCaptureSuspended) return;
         if (settings.absoluteMouseMode && !absoluteInputCaptured) return;
+        if (settings.absoluteMouseMode && !settings.workspaceMouse.empty()) {
+            sendWorkspaceMousePosition(event.x, event.y);
+            return;
+        }
         if (settings.absoluteMouseMode) {
             const auto bounds = videoBounds();
             const int referenceWidth = std::min(bounds.w, 32767);

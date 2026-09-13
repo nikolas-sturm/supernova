@@ -354,3 +354,208 @@ TEST_F(InputGamepadSessionTest, RefreshesSharedVirtualInputAfterLicenseStateChan
   EXPECT_NE(context().mouse->device_id(), original_mouse_id);
   EXPECT_EQ(runtime().active_device_count(), active_devices);
 }
+
+TEST_F(InputGamepadSessionTest, MapsSignedWorkspaceMouseRelativeToVirtualEnvironmentWithoutOrdinaryClamping) {
+  ASSERT_FALSE(task_pool.running());
+  ASSERT_EQ(runtime().backend_kind(), lvh::BackendKind::fake);
+  ASSERT_NE(context().mouse, nullptr);
+  config::input.mouse = true;
+  const auto generation = input::workspace_mouse_generation();
+  const std::vector<input::mouse_viewport_t> viewports {
+    {-1920, -1080, 1920, 1080, generation},
+    {-3840, -2160, 1920, 1080, generation},
+  };
+  // Desktop origin is (-3840, -2160); the source offset is (960, 540) at 200% scaling.
+  const input::touch_port_t port {{960, 540, 960, 540}, 5760, 3240, 0, 0, 2, 2, 2880, 1620};
+  auto ordinary_mail = std::make_shared<safe::mail_raw_t>();
+  auto ordinary = input::alloc(ordinary_mail, "ordinary-mouse-client");
+  ordinary_mail->event<input::touch_port_t>(mail::touch_port)->raise(port);
+  auto workspace_mail = std::make_shared<safe::mail_raw_t>();
+  auto workspace = input::alloc(workspace_mail, "workspace-mouse-client", {}, input::mouse_mode_e::absolute, "source", viewports);
+  workspace_mail->event<input::touch_port_t>(mail::touch_port)->raise(port);
+  auto &mouse = *context().mouse;
+  const auto before = mouse.submit_count();
+
+  input::testing::send_mouse_position_packet(ordinary, -480, -270, 960, 540);
+  ASSERT_EQ(mouse.submit_count(), before + 1);
+  auto event = mouse.last_submitted_event();
+  EXPECT_EQ(event.kind, lvh::MouseEventKind::absolute_motion);
+  EXPECT_EQ(event.x, 960);
+  EXPECT_EQ(event.y, 540);
+  EXPECT_EQ(event.width, 2880);
+  EXPECT_EQ(event.height, 1620);
+
+  input::testing::send_mouse_position_packet(workspace, -480, -270, 960, 540);
+  ASSERT_EQ(mouse.submit_count(), before + 2);
+  event = mouse.last_submitted_event();
+  EXPECT_EQ(event.kind, lvh::MouseEventKind::absolute_motion);
+  EXPECT_EQ(event.x, 480);
+  EXPECT_EQ(event.y, 270);
+  EXPECT_EQ(event.width, 2880);
+  EXPECT_EQ(event.height, 1620);
+
+  input::testing::send_mouse_position_packet(ordinary, 1440, 810, 960, 540);
+  ASSERT_EQ(mouse.submit_count(), before + 3);
+  event = mouse.last_submitted_event();
+  EXPECT_EQ(event.x, 1920);
+  EXPECT_EQ(event.y, 1080);
+}
+
+TEST_F(InputGamepadSessionTest, RejectsWorkspaceMouseWhenCaptureSourcePixelDimensionsChange) {
+  ASSERT_FALSE(task_pool.running());
+  ASSERT_EQ(runtime().backend_kind(), lvh::BackendKind::fake);
+  ASSERT_NE(context().mouse, nullptr);
+  config::input.mouse = true;
+  const auto generation = input::workspace_mouse_generation();
+  auto stream_mail = std::make_shared<safe::mail_raw_t>();
+  auto stream_input = input::alloc(stream_mail, "mouse-source-size-client", {}, input::mouse_mode_e::absolute, "source", {
+    {0, 0, 1920, 1080, generation},
+    {1920, 0, 1920, 1080, generation},
+  });
+  const input::touch_port_t port {{0, 0, 1000, 600}, 3840, 1080, 20, 30, 2, 1, 0, 0};
+  auto port_event = stream_mail->event<input::touch_port_t>(mail::touch_port);
+  port_event->raise(port);
+  auto &mouse = *context().mouse;
+  const auto before = mouse.submit_count();
+
+  // Packet resolution may differ; the letterbox-adjusted physical source must still match.
+  input::testing::send_mouse_position_packet(stream_input, 480, 270, 960, 540);
+  ASSERT_EQ(mouse.submit_count(), before + 1);
+  EXPECT_EQ(mouse.last_submitted_event().x, 960);
+  EXPECT_EQ(mouse.last_submitted_event().y, 540);
+
+  for (const bool change_width : {true, false}) {
+    auto changed_port = port;
+    if (change_width) {
+      changed_port.width += 2;
+    } else {
+      changed_port.height += 2;
+    }
+    port_event->raise(changed_port);
+    input::testing::send_mouse_position_packet(stream_input, 480, 270, 960, 540);
+    EXPECT_EQ(mouse.submit_count(), before + 1) << "change_width=" << change_width;
+  }
+
+  port_event->raise(port);
+  input::testing::send_mouse_position_packet(stream_input, 480, 270, 960, 540);
+  EXPECT_EQ(mouse.submit_count(), before + 2);
+}
+
+TEST_F(InputGamepadSessionTest, RejectsWorkspaceMouseInViewportGap) {
+  ASSERT_FALSE(task_pool.running());
+  ASSERT_EQ(runtime().backend_kind(), lvh::BackendKind::fake);
+  ASSERT_NE(context().mouse, nullptr);
+  config::input.mouse = true;
+  const auto generation = input::workspace_mouse_generation();
+  auto stream_mail = std::make_shared<safe::mail_raw_t>();
+  auto stream_input = input::alloc(stream_mail, "mouse-gap-client", {}, input::mouse_mode_e::absolute, "source", {
+    {0, 0, 1920, 1080, generation},
+    {2400, 0, 1920, 1080, generation},
+  });
+  stream_mail->event<input::touch_port_t>(mail::touch_port)->raise(input::touch_port_t {
+    {0, 0, 1920, 1080}, 4320, 1080, 0, 0, 1, 1, 0, 0,
+  });
+  auto &mouse = *context().mouse;
+  const auto before = mouse.submit_count();
+
+  input::testing::send_mouse_position_packet(stream_input, 2400, 540, 1920, 1080);
+  ASSERT_EQ(mouse.submit_count(), before + 1);
+  EXPECT_EQ(mouse.last_submitted_event().x, 2400);
+  EXPECT_EQ(mouse.last_submitted_event().width, 4320);
+  for (const std::int16_t x : {1920, 2160, 2399}) {
+    input::testing::send_mouse_position_packet(stream_input, x, 540, 1920, 1080);
+    EXPECT_EQ(mouse.submit_count(), before + 1) << "x=" << x;
+  }
+  input::testing::send_mouse_position_packet(stream_input, 1919, 540, 1920, 1080);
+  ASSERT_EQ(mouse.submit_count(), before + 2);
+  EXPECT_EQ(mouse.last_submitted_event().x, 1919);
+}
+
+TEST_F(InputGamepadSessionTest, WorkspaceGenerationInvalidationRejectsMovesAndPressesAndCancelsHeldButton) {
+  ASSERT_FALSE(task_pool.running());
+  ASSERT_EQ(runtime().backend_kind(), lvh::BackendKind::fake);
+  ASSERT_NE(context().mouse, nullptr);
+  config::input.mouse = true;
+  const auto generation = input::workspace_mouse_generation();
+  auto stream_mail = std::make_shared<safe::mail_raw_t>();
+  auto stream_input = input::alloc(stream_mail, "mouse-generation-client", {}, input::mouse_mode_e::absolute, "source", {
+    {0, 0, 1920, 1080, generation},
+    {1920, 0, 1920, 1080, generation},
+  });
+  stream_mail->event<input::touch_port_t>(mail::touch_port)->raise(input::touch_port_t {
+    {0, 0, 1920, 1080}, 3840, 1080, 0, 0, 1, 1, 0, 0,
+  });
+  auto &mouse = *context().mouse;
+  const auto before = mouse.submit_count();
+  input::testing::send_mouse_position_packet(stream_input, 2400, 540, 1920, 1080);
+  ASSERT_EQ(mouse.submit_count(), before + 1);
+  input::peripheral_forward_mouse_button(stream_input, 2, false);
+  const auto pressed = mouse.last_submitted_event();
+
+  // Invalidation is synchronous with the task pool stopped and also cleans up the held button.
+  input::invalidate_workspace_mouse();
+  const auto after_invalidation = mouse.submit_count();
+  const auto released = mouse.last_submitted_event();
+  // Clean up even if cancellation regresses, before any fatal assertion can end the test.
+  input::peripheral_forward_mouse_button(stream_input, 2, true);
+  EXPECT_EQ(input::workspace_mouse_generation(), generation + 1);
+  ASSERT_EQ(after_invalidation, before + 3);
+  ASSERT_EQ(mouse.submit_count(), before + 3);
+  EXPECT_EQ(pressed.kind, lvh::MouseEventKind::button);
+  EXPECT_EQ(pressed.button, lvh::MouseButton::middle);
+  EXPECT_TRUE(pressed.pressed);
+  EXPECT_EQ(released.kind, lvh::MouseEventKind::button);
+  EXPECT_EQ(released.button, lvh::MouseButton::middle);
+  EXPECT_FALSE(released.pressed);
+
+  input::testing::send_mouse_position_packet(stream_input, 2400, 540, 1920, 1080);
+  EXPECT_EQ(mouse.submit_count(), before + 3);
+  input::peripheral_forward_mouse_button(stream_input, 2, false);
+  const auto after_denied_press = mouse.submit_count();
+  input::peripheral_forward_mouse_button(stream_input, 2, true);
+  EXPECT_EQ(after_denied_press, before + 3);
+  EXPECT_EQ(mouse.submit_count(), before + 3);
+}
+
+TEST_F(InputGamepadSessionTest, ResumedMouseClearsObsoleteWorkspaceAndRequiresFreshTouchPort) {
+  ASSERT_FALSE(task_pool.running());
+  ASSERT_EQ(runtime().backend_kind(), lvh::BackendKind::fake);
+  ASSERT_NE(context().mouse, nullptr);
+  config::input.mouse = true;
+  const auto generation = input::workspace_mouse_generation();
+  auto old_mail = std::make_shared<safe::mail_raw_t>();
+  auto stream_input = input::alloc(old_mail, "mouse-resume-client", {}, input::mouse_mode_e::absolute, "source", {
+    {0, 0, 1920, 1080, generation},
+    {-1920, 0, 1920, 1080, generation},
+  });
+  const input::touch_port_t old_port {{1920, 0, 1920, 1080}, 3840, 1080, 0, 0, 1, 1, 0, 0};
+  auto old_port_event = old_mail->event<input::touch_port_t>(mail::touch_port);
+  old_port_event->raise(old_port);
+  auto &mouse = *context().mouse;
+  const auto before = mouse.submit_count();
+  input::testing::send_mouse_position_packet(stream_input, -480, 270, 960, 540);
+  ASSERT_EQ(mouse.submit_count(), before + 1);
+  EXPECT_EQ(mouse.last_submitted_event().x, 960);
+  input::invalidate_workspace_mouse();
+
+  auto resumed_mail = std::make_shared<safe::mail_raw_t>();
+  auto resumed = input::alloc(resumed_mail, "mouse-resume-client", {}, input::mouse_mode_e::absolute, "source");
+  ASSERT_EQ(resumed, stream_input);
+  input::testing::send_mouse_position_packet(resumed, -480, 270, 960, 540);
+  EXPECT_EQ(mouse.submit_count(), before + 1);
+  old_port_event->raise(old_port);
+  input::testing::send_mouse_position_packet(resumed, -480, 270, 960, 540);
+  EXPECT_EQ(mouse.submit_count(), before + 1);
+
+  resumed_mail->event<input::touch_port_t>(mail::touch_port)->raise(input::touch_port_t {
+    {100, 50, 1280, 720}, 2560, 1440, 0, 0, 1, 1, 0, 0,
+  });
+  input::testing::send_mouse_position_packet(resumed, -480, 270, 960, 540);
+  ASSERT_EQ(mouse.submit_count(), before + 2);
+  const auto event = mouse.last_submitted_event();
+  EXPECT_EQ(event.kind, lvh::MouseEventKind::absolute_motion);
+  EXPECT_EQ(event.x, 100);
+  EXPECT_EQ(event.y, 410);
+  EXPECT_EQ(event.width, 2560);
+  EXPECT_EQ(event.height, 1440);
+}
