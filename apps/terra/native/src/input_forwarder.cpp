@@ -1451,12 +1451,14 @@ bool InputForwarder::handleMessage(UINT message, WPARAM wparam, LPARAM lparam, L
 #elif defined(__linux__) && defined(TERRA_HAS_LINUX_VIDEO)
 
 #include <Limelight.h>
+#include "wayland_workspace_pointer.h"
 
 #include <SDL.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
@@ -1740,6 +1742,7 @@ struct InputForwarder::Impl {
 
     SDL_Window* window = nullptr;
     bool workspaceDragCaptured = false;
+    WaylandWorkspacePointer waylandPointer;
     InputSettings settings;
     std::string streamLabel;
     std::string inputError;
@@ -2498,7 +2501,7 @@ struct InputForwarder::Impl {
                                 SDL_HINT_OVERRIDE);
     }
 
-    bool releaseRemoteState() {
+    bool releaseRemoteState(bool releaseMouse = true) {
         for (auto key = remoteKeysDown.begin(); key != remoteKeysDown.end();) {
             const int result = LiSendKeyboardEvent2(
                 static_cast<short>(0x8000U | static_cast<unsigned short>(key->first)),
@@ -2510,6 +2513,7 @@ struct InputForwarder::Impl {
                 ++key;
             }
         }
+        if (!releaseMouse) return remoteKeysDown.empty();
         for (auto button = remoteMouseButtonsDown.begin();
              button != remoteMouseButtonsDown.end();) {
             const int result = LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, *button);
@@ -2523,11 +2527,13 @@ struct InputForwarder::Impl {
         return remoteKeysDown.empty() && remoteMouseButtonsDown.empty();
     }
 
-    void releaseRemoteStateWithRetry() {
-        for (int attempt = 0; attempt < 20 && !releaseRemoteState(); ++attempt) {
+    void releaseRemoteStateWithRetry(bool releaseMouse = true) {
+        for (int attempt = 0; attempt < 20 && !releaseRemoteState(releaseMouse); ++attempt) {
             SDL_Delay(1);
         }
-        if (std::exchange(workspaceDragCaptured, false)) SDL_CaptureMouse(SDL_FALSE);
+        if (releaseMouse && std::exchange(workspaceDragCaptured, false) && !waylandPointer.active()) {
+            SDL_CaptureMouse(SDL_FALSE);
+        }
     }
 
     void cancelTouchState() {
@@ -2595,6 +2601,7 @@ struct InputForwarder::Impl {
         if (absoluteInputCaptured) {
             applyPointerRegionLock();
         } else {
+            waylandPointer.discardPendingEvents();
             releaseRemoteStateWithRetry();
 #if SDL_VERSION_ATLEAST(2, 0, 18)
             SDL_SetWindowMouseRect(window, nullptr);
@@ -2621,6 +2628,7 @@ struct InputForwarder::Impl {
             restoreRelativeCapture = !settings.absoluteMouseMode && mouseCaptured;
             restoreAbsoluteCapture = settings.absoluteMouseMode && absoluteInputCaptured;
         }
+        waylandPointer.discardPendingEvents();
         overlayCaptureSuspended = true;
         overlayResumePending = false;
         overlayResumeRetryAt = 0;
@@ -2873,17 +2881,17 @@ struct InputForwarder::Impl {
             positioned = sendWorkspaceMousePosition(event.x, event.y);
             if (pressed && !positioned) return;
             if (pressed && !workspaceDragCaptured) {
-                const auto* driver = SDL_GetCurrentVideoDriver();
-                // Wayland's button-down implicit grab delivers out-of-surface motion
-                // until release; SDL's explicit capture API is X11-only there.
-                if ((!driver || std::string_view{driver} != "wayland") &&
-                    SDL_CaptureMouse(SDL_TRUE) != 0) return;
+                if (!waylandPointer.active() && SDL_CaptureMouse(SDL_TRUE) != 0) return;
                 workspaceDragCaptured = true;
             }
         }
         const bool sent = sendMouseButton(event.button, pressed);
-        if (!pressed && workspaceDragCaptured && (!positioned || !sent)) releaseRemoteStateWithRetry();
-        if (remoteMouseButtonsDown.empty() && std::exchange(workspaceDragCaptured, false)) {
+        if (!pressed && workspaceDragCaptured && (!positioned || !sent)) {
+            waylandPointer.discardPendingEvents();
+            releaseRemoteStateWithRetry();
+        }
+        if (remoteMouseButtonsDown.empty() && std::exchange(workspaceDragCaptured, false) &&
+            !waylandPointer.active()) {
             SDL_CaptureMouse(SDL_FALSE);
         }
     }
@@ -2904,6 +2912,26 @@ struct InputForwarder::Impl {
                                                     position->width, position->height);
         noteInputResult(result);
         return result == 0;
+    }
+
+    void handleWorkspacePointerEvent(const WorkspacePointerEvent& event) {
+        if (event.type == WorkspacePointerEventType::cancel) {
+            if (workspaceDragCaptured) releaseRemoteStateWithRetry();
+            return;
+        }
+        if (!enabled || overlayCaptureSuspended || !window ||
+            (SDL_GetWindowFlags(window) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED)) != 0) return;
+        if (event.type == WorkspacePointerEventType::position) {
+            if (absoluteInputCaptured) sendWorkspaceMousePosition(event.x, event.y);
+        } else if (event.type == WorkspacePointerEventType::button) {
+            SDL_MouseButtonEvent button{};
+            button.windowID = SDL_GetWindowID(window);
+            button.button = event.button;
+            button.state = event.pressed ? SDL_PRESSED : SDL_RELEASED;
+            button.x = event.x;
+            button.y = event.y;
+            handleMouseButton(button);
+        }
     }
 
     void handleMouseMotion(const SDL_MouseMotionEvent& event) {
@@ -3121,6 +3149,12 @@ void InputForwarder::start(SDL_Window* window, InputSettings settings, int width
         impl_->previousAltTabHint = previous;
     }
     if (settings.controllersEnabled) impl_->startControllers();
+    const auto* driver = SDL_GetCurrentVideoDriver();
+    if (settings.absoluteMouseMode && !settings.workspaceMouse.empty() && driver &&
+        std::string_view{driver} == "wayland") {
+        impl_->waylandPointer.start(window);
+        std::fprintf(stderr, "[terra-mouse] Native Wayland workspace pointer enabled\n");
+    }
     impl_->updateWindowTitle();
 }
 
@@ -3135,6 +3169,7 @@ void InputForwarder::updateOverlay() { impl_->updateOverlay(); }
 void InputForwarder::setEnabled(bool enabled) {
     if (!impl_->window || impl_->enabled == enabled) return;
     if (!enabled) {
+        impl_->waylandPointer.discardPendingEvents();
         impl_->cancelTouchState();
         impl_->stopGamepadRumble();
         if (impl_->mouseCaptured) {
@@ -3200,6 +3235,7 @@ void InputForwarder::updateGamepads() {
 void InputForwarder::stop() {
     if (!impl_->window) return;
     setEnabled(false);
+    impl_->waylandPointer.stop();
     SDL_SetRelativeMouseMode(SDL_FALSE);
     SDL_SetWindowGrab(impl_->window, SDL_FALSE);
     SDL_SetWindowKeyboardGrab(impl_->window, SDL_FALSE);
@@ -3229,6 +3265,10 @@ void InputForwarder::stop() {
 
 void InputForwarder::handleEvent(const SDL_Event& event) {
     if (!impl_->window) return;
+    if (const auto pointer = impl_->waylandPointer.decodeEvent(event)) {
+        impl_->handleWorkspacePointerEvent(*pointer);
+        return;
+    }
     if (event.type == SDL_CONTROLLERDEVICEADDED || event.type == SDL_CONTROLLERDEVICEREMOVED ||
         event.type == SDL_CONTROLLERDEVICEREMAPPED) {
         impl_->handleControllerDevice(event.cdevice);
@@ -3266,10 +3306,14 @@ void InputForwarder::handleEvent(const SDL_Event& event) {
             break;
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
-            if (event.button.windowID == windowId) impl_->handleMouseButton(event.button);
+            if (!impl_->waylandPointer.active() && event.button.windowID == windowId) {
+                impl_->handleMouseButton(event.button);
+            }
             break;
         case SDL_MOUSEMOTION:
-            if (event.motion.windowID == windowId) impl_->handleMouseMotion(event.motion);
+            if (!impl_->waylandPointer.active() && event.motion.windowID == windowId) {
+                impl_->handleMouseMotion(event.motion);
+            }
             break;
         case SDL_MOUSEWHEEL:
             if (event.wheel.windowID == windowId) impl_->handleMouseWheel(event.wheel);
@@ -3284,7 +3328,9 @@ void InputForwarder::handleEvent(const SDL_Event& event) {
                 if (impl_->mouseCaptured) {
                     impl_->setMouseCaptured(false);
                 } else {
-                    impl_->releaseRemoteStateWithRetry();
+                    // Wayland keyboard focus and the pointer's implicit grab are
+                    // independent. Only pointer leave/cancellation ends that drag.
+                    impl_->releaseRemoteStateWithRetry(!impl_->waylandPointer.active());
                 }
                 impl_->setControllerFocus(false);
                 impl_->cancelTouchState();
@@ -3294,9 +3340,21 @@ void InputForwarder::handleEvent(const SDL_Event& event) {
                 impl_->setControllerFocus(true);
                 impl_->updateKeyboardGrab();
                 if (impl_->overlayResumePending) impl_->resumeAfterOverlay();
+            } else if (event.window.event == SDL_WINDOWEVENT_HIDDEN ||
+                       event.window.event == SDL_WINDOWEVENT_MINIMIZED) {
+                impl_->waylandPointer.discardPendingEvents();
+                impl_->releaseRemoteStateWithRetry();
+                impl_->cancelTouchState();
             }
             break;
         default: break;
+    }
+}
+
+void InputForwarder::processWorkspacePointerEvents() {
+    if (!impl_->waylandPointer.active()) return;
+    for (const auto& event : impl_->waylandPointer.takeEvents()) {
+        impl_->handleWorkspacePointerEvent(event);
     }
 }
 

@@ -52,14 +52,20 @@ desktop origins. Matching monitor arrangements gives the most natural crossing b
 This mode requires enough local monitors for the workspace, unrotated host displays at scale
 1, and absolute desktop input. Other layouts and older hosts retain ordinary per-stream input;
 relative gaming input is unchanged. Grouped windows stay borderless fullscreen until disconnected
-(the per-window fullscreen toggle is inactive). Actual focus loss, capture loss, overlays, and
+(the per-window fullscreen toggle is inactive). Capture loss, hidden windows, overlays, and
 disconnects release held buttons. Reconnect after changing monitor layout or resolution; stale
-maps are not reused. Linux uses SDL capture on X11 and the compositor's implicit drag grab on
-Wayland; compositor-specific cross-output behavior still needs live validation.
+maps are not reused. Linux uses SDL capture on X11. Wayland workspaces use a separate native
+`wl_pointer` on SDL's existing connection, retaining unclamped surface coordinates during the
+compositor's implicit grab. Keyboard focus loss releases keys without ending that pointer grab;
+native pointer leave cancels the drag. SDL mouse duplicates are suppressed, and native events
+share SDL's queue to preserve modifier/button ordering. Multi-seat Wayland configurations are
+rejected explicitly rather than selecting an ambiguous pointer. Compositor-specific cross-output
+behavior still needs live validation.
 
-For intermittent crossing problems, the native terminal emits bounded `terra-mouse` drag
-summaries (foreground/capture ownership, crossing, delivered movement count and longest event
-gap) and `terra-stream` frame timing samples. Frame samples appear every five seconds, or once
+For intermittent crossing problems, Windows emits bounded `terra-mouse` drag summaries
+(foreground/capture ownership, crossing, delivered movement count and longest event gap).
+Wayland logs native workspace pointer activation. Workspace workers on both platforms emit
+`terra-stream` frame timing samples. Frame samples appear every five seconds, or once
 per second when frame loss/queue drops occur. They distinguish missing pointer delivery from
 host processing, receive/reassembly, decode and presentation stalls; frame-loss warnings alone
 do not prove a network bottleneck. Sol logs each workspace coordinate rejection reason only

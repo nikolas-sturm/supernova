@@ -112,6 +112,8 @@ class InputForwarder {
     void updateGamepads();
     void stop();
     void handleEvent(const SDL_Event& event);
+    // Check for native Wayland cancellation/errors after SDL pumps its shared connection.
+    void processWorkspacePointerEvents();
 
  private:
     struct Impl;

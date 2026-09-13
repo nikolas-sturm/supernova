@@ -2348,6 +2348,7 @@ struct VideoRenderer::Impl {
             }
             windowHidden = true;
         }
+        inputForwarder.processWorkspacePointerEvents();
     }
 
     void togglePerformanceOverlay() {

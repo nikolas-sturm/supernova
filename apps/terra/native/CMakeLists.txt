@@ -253,7 +253,8 @@ if(WIN32)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TERRA_ENABLE_LINUX_VIDEO)
-  target_link_libraries(terra-core PRIVATE PkgConfig::LINUX_VIDEO)
+  target_sources(terra-core PRIVATE src/wayland_workspace_pointer.cpp)
+  target_link_libraries(terra-core PRIVATE PkgConfig::LINUX_VIDEO PkgConfig::LINUX_WAYLAND)
   target_compile_definitions(terra-core PRIVATE TERRA_HAS_LINUX_VIDEO=1)
   if(TARGET PkgConfig::LINUX_VAAPI_X11)
     target_link_libraries(terra-core PRIVATE PkgConfig::LINUX_VAAPI_X11)
@@ -382,6 +383,10 @@ if(BUILD_TESTING)
   target_include_directories(terra-workspace-mouse-test PRIVATE src)
   add_test(NAME workspace-mouse COMMAND terra-workspace-mouse-test)
 
+  add_executable(terra-workspace-pointer-test tests/workspace_pointer_test.cpp)
+  target_include_directories(terra-workspace-pointer-test PRIVATE src)
+  add_test(NAME workspace-pointer COMMAND terra-workspace-pointer-test)
+
   if(WIN32)
     add_executable(terra-input-forwarder-windows-test
       tests/input_forwarder_windows_test.cpp
@@ -450,6 +455,7 @@ if(BUILD_TESTING)
       src/input_forwarder.cpp
       src/stream_statistics.cpp
       src/video_renderer.cpp
+      src/wayland_workspace_pointer.cpp
     )
     target_include_directories(
       terra-input-forwarder-test
@@ -457,7 +463,7 @@ if(BUILD_TESTING)
         src
         "${MOONLIGHT_COMMON_ROOT}/src"
     )
-    target_link_libraries(terra-input-forwarder-test PRIVATE PkgConfig::LINUX_VIDEO)
+    target_link_libraries(terra-input-forwarder-test PRIVATE PkgConfig::LINUX_VIDEO PkgConfig::LINUX_WAYLAND)
     target_compile_definitions(terra-input-forwarder-test PRIVATE TERRA_HAS_LINUX_VIDEO=1)
     if(TARGET PkgConfig::LINUX_LIBPLACEBO)
       target_sources(terra-input-forwarder-test PRIVATE src/placebo_libav.c)
@@ -467,6 +473,17 @@ if(BUILD_TESTING)
     target_compile_options(terra-input-forwarder-test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME input-forwarder COMMAND terra-input-forwarder-test)
     set_tests_properties(input-forwarder PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
+
+    add_executable(terra-wayland-input-forwarder-test
+      tests/wayland_input_forwarder_test.cpp
+      src/input_forwarder.cpp
+    )
+    target_include_directories(terra-wayland-input-forwarder-test PRIVATE src "${MOONLIGHT_COMMON_ROOT}/src")
+    target_link_libraries(terra-wayland-input-forwarder-test PRIVATE PkgConfig::LINUX_VIDEO)
+    target_compile_definitions(terra-wayland-input-forwarder-test PRIVATE TERRA_HAS_LINUX_VIDEO=1)
+    target_compile_options(terra-wayland-input-forwarder-test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME wayland-input-forwarder COMMAND terra-wayland-input-forwarder-test)
+    set_tests_properties(wayland-input-forwarder PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
   endif()
 endif()
 
