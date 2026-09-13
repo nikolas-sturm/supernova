@@ -977,21 +977,28 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                 hostWorkspaceMouse, workspaceMouse ? "workspace" : "per-display",
                 static_cast<unsigned long long>(settings.bitrateKbps) * displayIds.size());
             if (mouseBlocker) std::fprintf(stderr, "[terra-workspace] %s\n", mouseBlocker);
+            std::vector<MouseRectangle> localRects;
+            localRects.reserve(localDisplays.size());
+            for (const auto& display : localDisplays) {
+                localRects.push_back({display.x, display.y, display.width, display.height});
+            }
+            const auto first = settings.displayIndex >= 0 &&
+                                       settings.displayIndex < static_cast<int>(localDisplays.size())
+                                   ? static_cast<std::size_t>(settings.displayIndex) : 0;
+            // Claim physically adjacent outputs starting at the selection:
+            // enumeration order can interleave an embedded panel between
+            // the intended external monitors.
+            const auto order = workspaceOutputOrder(localRects, first);
+            std::fprintf(stderr, "[terra-workspace] selected_output=%zu order=", first);
+            for (const auto outputIndex : order) {
+                const auto& rect = localRects[outputIndex];
+                std::fprintf(stderr, "%zu:%d,%d:%dx%d ", outputIndex, rect.x, rect.y,
+                             rect.width, rect.height);
+            }
+            std::fprintf(stderr, "\n");
             for (std::size_t index = 0; index < displaySettings.size(); ++index) {
                 auto& child = displaySettings[index];
                 if (!fullscreenWorkspace) continue;
-                const auto first = settings.displayIndex >= 0 &&
-                                           settings.displayIndex < static_cast<int>(localDisplays.size())
-                                       ? static_cast<std::size_t>(settings.displayIndex) : 0;
-                std::vector<MouseRectangle> localRects;
-                localRects.reserve(localDisplays.size());
-                for (const auto& display : localDisplays) {
-                    localRects.push_back({display.x, display.y, display.width, display.height});
-                }
-                // Claim physically adjacent outputs starting at the selection:
-                // enumeration order can interleave an embedded panel between
-                // the intended external monitors.
-                const auto order = workspaceOutputOrder(localRects, first);
                 child.displayIndex = static_cast<int>(order[index % order.size()]);
                 // Exclusive fullscreen in separate processes minimizes sibling streams on focus changes.
                 child.displayMode = DisplayMode::borderless;
