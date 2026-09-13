@@ -2148,7 +2148,60 @@ namespace stream {
   }
 
   /**
-   * @brief Receive ping data.
+   * @brief Wait for a matching startup ping or session shutdown.
+   * @param messages Queue populated by the broadcast receiver.
+   * @param shutdown_event Session shutdown event, observed without consuming it.
+   * @param session_id_supported Whether legacy PING packets are forbidden.
+   * @param expected_payload Negotiated ping payload.
+   * @param peer Endpoint updated only after a matching ping.
+   * @param timeout Maximum total wait, including discarded packets.
+   * @return Zero on a matching ping, or -1 on shutdown, queue closure, or timeout.
+   */
+  int wait_for_ping(safe::queue_t<std::pair<udp::endpoint, std::string>> &messages, safe::event_t<bool> &shutdown_event, bool session_id_supported, std::string_view expected_payload, udp::endpoint &peer, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (true) {
+      // Use the locked, non-consuming read: both startup workers share this event.
+      if (shutdown_event.view(0ms)) {
+        return -1;
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        BOOST_LOG(error) << "Initial Ping Timeout"sv;
+        return -1;
+      }
+
+      // The packet queue cannot wait on the shutdown event, so bound each sleep.
+      auto msg_opt = messages.pop(std::min(deadline - now, std::chrono::steady_clock::duration {100ms}));
+      if (shutdown_event.view(0ms)) {
+        return -1;
+      }
+      if (!msg_opt) {
+        if (!messages.running()) {
+          return -1;
+        }
+        continue;
+      }
+
+      TUPLE_2D_REF(recv_peer, msg, *msg_opt);
+      if (msg.find(expected_payload) != std::string::npos) {
+        // Match the new PING payload format
+        BOOST_LOG(debug) << "Received ping [v2] from "sv << recv_peer.address() << ':' << recv_peer.port() << " ["sv << util::hex_vec(msg) << ']';
+      } else if (!session_id_supported && msg == "PING"sv) {
+        // Match the legacy fixed PING payload only if the new type is not supported
+        BOOST_LOG(debug) << "Received ping [v1] from "sv << recv_peer.address() << ':' << recv_peer.port() << " ["sv << util::hex_vec(msg) << ']';
+      } else {
+        BOOST_LOG(debug) << "Received non-ping from "sv << recv_peer.address() << ':' << recv_peer.port() << " ["sv << util::hex_vec(msg) << ']';
+        continue;
+      }
+
+      peer = recv_peer;
+      return 0;
+    }
+  }
+
+  /**
+   * @brief Register the startup ping queue and wait for a ping or session shutdown.
    *
    * @param session Active streaming or pairing session for the request.
    * @param ref Reference frame metadata used by the encoder.
@@ -2178,37 +2231,7 @@ namespace stream {
       ref->message_queue_queue->raise(type, session_id, nullptr);
     });
 
-    auto start_time = std::chrono::steady_clock::now();
-    auto current_time = start_time;
-
-    while (current_time - start_time < config::stream.ping_timeout) {
-      auto delta_time = current_time - start_time;
-
-      auto msg_opt = messages->pop(config::stream.ping_timeout - delta_time);
-      if (!msg_opt) {
-        break;
-      }
-
-      TUPLE_2D_REF(recv_peer, msg, *msg_opt);
-      if (msg.find(expected_payload) != std::string::npos) {
-        // Match the new PING payload format
-        BOOST_LOG(debug) << "Received ping [v2] from "sv << recv_peer.address() << ':' << recv_peer.port() << " ["sv << util::hex_vec(msg) << ']';
-      } else if (!(session->config.mlFeatureFlags & ML_FF_SESSION_ID_V1) && msg == "PING"sv) {
-        // Match the legacy fixed PING payload only if the new type is not supported
-        BOOST_LOG(debug) << "Received ping [v1] from "sv << recv_peer.address() << ':' << recv_peer.port() << " ["sv << util::hex_vec(msg) << ']';
-      } else {
-        BOOST_LOG(debug) << "Received non-ping from "sv << recv_peer.address() << ':' << recv_peer.port() << " ["sv << util::hex_vec(msg) << ']';
-        current_time = std::chrono::steady_clock::now();
-        continue;
-      }
-
-      // Update connection details.
-      peer = recv_peer;
-      return 0;
-    }
-
-    BOOST_LOG(error) << "Initial Ping Timeout"sv;
-    return -1;
+    return wait_for_ping(*messages, *session->shutdown_event, session->config.mlFeatureFlags & ML_FF_SESSION_ID_V1, expected_payload, peer, timeout);
   }
 
   /**
