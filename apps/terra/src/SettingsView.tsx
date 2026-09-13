@@ -510,7 +510,7 @@ export function SettingsView({ section = 'profile' }: { section?: 'profile' | 'g
             <div className={styles.toggleStack}>
               <Toggle
                 label="Optimize mouse for remote desktop instead of games"
-                note="Uses absolute host pointer positioning without capture"
+                note="Applied when the next stream starts; uses absolute positioning without capture"
                 checked={settings.absoluteMouseMode}
                 onChange={(absoluteMouseMode) => update({ absoluteMouseMode })}
               />

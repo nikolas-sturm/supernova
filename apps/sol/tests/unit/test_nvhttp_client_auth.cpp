@@ -18,6 +18,14 @@
 
 namespace fs = std::filesystem;
 
+TEST(NvHttpLaunchPolicyTest, ResolvesCursorCaptureAndRejectsInvalidTerraValues) {
+  EXPECT_EQ(nvhttp::test_support::launch_cursor_capture(false, "0"), true);
+  EXPECT_EQ(nvhttp::test_support::launch_cursor_capture(true, ""), true);
+  EXPECT_EQ(nvhttp::test_support::launch_cursor_capture(true, "1"), true);
+  EXPECT_EQ(nvhttp::test_support::launch_cursor_capture(true, "0"), false);
+  EXPECT_EQ(nvhttp::test_support::launch_cursor_capture(true, "false"), std::nullopt);
+}
+
 /**
  * @brief Isolate paired-client authorization tests from the user's Sol state.
  */

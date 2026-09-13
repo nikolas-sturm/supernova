@@ -25,6 +25,10 @@ bool writeStreamWorkerFrame(std::ostream &output, const nlohmann::json &value);
 [[nodiscard]] std::optional<nlohmann::json>
 readStreamWorkerFrame(std::istream &input);
 
+/** @brief Preserve explicit user quit intent across worker disconnects. */
+[[nodiscard]] bool workerDisconnectQuitsHost(const nlohmann::json &event,
+                                             bool quitAppAfter);
+
 /** @brief Run worker protocol on standard input and output. */
 int runStreamWorker();
 

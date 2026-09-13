@@ -449,15 +449,6 @@ struct InputForwarder::Impl {
         updateWindowTitle();
     }
 
-    void toggleMouseMode() {
-        if (!settings.absoluteMouseMode) setMouseCaptured(false);
-        settings.absoluteMouseMode = !settings.absoluteMouseMode;
-        if (settings.absoluteMouseMode) absoluteInputCaptured = true;
-        if (!settings.absoluteMouseMode) setMouseCaptured(true);
-        updateCursorClip();
-        updateWindowTitle();
-    }
-
     void toggleInputCapture() {
         if (!settings.absoluteMouseMode) {
             setMouseCaptured(!mouseCaptured);
@@ -625,8 +616,8 @@ struct InputForwarder::Impl {
             ((GetKeyState(VK_SHIFT) & 0x8000) != 0 || (modifiers() & MODIFIER_SHIFT) != 0);
         const bool overlayShortcut = key == 'O' && overlayShortcutActive();
         if (pressed && !repeated && shortcutModifiers &&
-            (key == 'Q' || key == 'Z' || key == 'X' || key == 'S' || key == 'M' ||
-             key == 'V' || key == 'D' || key == 'C' || key == 'L' || overlayShortcut)) {
+            (key == 'Q' || key == 'Z' || key == 'X' || key == 'S' || key == 'V' || key == 'D' ||
+             key == 'C' || key == 'L' || overlayShortcut)) {
             consumedShortcutKeys.insert(key);
             releaseRemoteState();
             if (key == 'Q') {
@@ -637,8 +628,6 @@ struct InputForwarder::Impl {
                 if (toggleStatistics) toggleStatistics();
             } else if (key == 'Z') {
                 toggleInputCapture();
-            } else if (key == 'M') {
-                toggleMouseMode();
             } else if (key == 'V') {
                 sendClipboardText();
             } else if (key == 'D') {
@@ -2511,16 +2500,6 @@ struct InputForwarder::Impl {
 #endif
     }
 
-    void toggleMouseMode() {
-        if (!settings.absoluteMouseMode) setMouseCaptured(false);
-        settings.absoluteMouseMode = !settings.absoluteMouseMode;
-        if (settings.absoluteMouseMode) absoluteInputCaptured = true;
-        if (!settings.absoluteMouseMode) setMouseCaptured(true);
-        applyPointerRegionLock();
-        updateKeyboardGrab();
-        updateWindowTitle();
-    }
-
     void toggleInputCapture() {
         if (!settings.absoluteMouseMode) {
             setMouseCaptured(!mouseCaptured);
@@ -2696,11 +2675,10 @@ struct InputForwarder::Impl {
         if (pressed && event.repeat == 0 && (modifiers & KMOD_CTRL) != 0 &&
             (modifiers & KMOD_ALT) != 0 && (modifiers & KMOD_SHIFT) != 0 &&
              (event.keysym.scancode == SDL_SCANCODE_Q ||
-               event.keysym.scancode == SDL_SCANCODE_Z ||
-               event.keysym.scancode == SDL_SCANCODE_X ||
-               event.keysym.scancode == SDL_SCANCODE_S ||
-               event.keysym.scancode == SDL_SCANCODE_M ||
-               event.keysym.scancode == SDL_SCANCODE_V ||
+                event.keysym.scancode == SDL_SCANCODE_Z ||
+                event.keysym.scancode == SDL_SCANCODE_X ||
+                event.keysym.scancode == SDL_SCANCODE_S ||
+                event.keysym.scancode == SDL_SCANCODE_V ||
                event.keysym.scancode == SDL_SCANCODE_D ||
                event.keysym.scancode == SDL_SCANCODE_C ||
                 event.keysym.scancode == SDL_SCANCODE_L || overlayShortcut)) {
@@ -2716,8 +2694,6 @@ struct InputForwarder::Impl {
                 if (toggleStatistics) toggleStatistics();
             } else if (event.keysym.scancode == SDL_SCANCODE_Z) {
                 toggleInputCapture();
-            } else if (event.keysym.scancode == SDL_SCANCODE_M) {
-                toggleMouseMode();
             } else if (event.keysym.scancode == SDL_SCANCODE_V) {
                 sendClipboardText();
             } else if (event.keysym.scancode == SDL_SCANCODE_D) {
@@ -3007,6 +2983,10 @@ void InputForwarder::start(SDL_Window* window, InputSettings settings, int width
     impl_->restoreRelativeCapture = overlayState.captureSuspended && !settings.absoluteMouseMode;
     impl_->restoreAbsoluteCapture = overlayState.captureSuspended && settings.absoluteMouseMode;
     impl_->windowFocused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    impl_->localCursorVisible = true;
+    if (settings.absoluteMouseMode) {
+        SDL_ShowCursor(SDL_ENABLE);
+    }
     impl_->streamWidth = std::max(width, 1);
     impl_->streamHeight = std::max(height, 1);
     impl_->streamLabel = std::to_string(width) + "x" + std::to_string(height) + " @ " +

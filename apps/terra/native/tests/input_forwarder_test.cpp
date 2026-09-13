@@ -21,6 +21,7 @@ short lastMask = 0;
 int rumbleEvents = 0;
 int keyboardEvents = 0;
 int mouseMoves = 0;
+int mousePositions = 0;
 int mouseButtonEvents = 0;
 int touchEvents = 0;
 int penEvents = 0;
@@ -64,7 +65,10 @@ extern "C" int LiSendMouseMoveEvent(short, short) {
     ++mouseMoves;
     return 0;
 }
-extern "C" int LiSendMousePositionEvent(short, short, short, short) { return 0; }
+extern "C" int LiSendMousePositionEvent(short, short, short, short) {
+    ++mousePositions;
+    return 0;
+}
 extern "C" int LiSendHighResScrollEvent(short) { return 0; }
 extern "C" int LiSendHighResHScrollEvent(short) { return LI_ERR_UNSUPPORTED; }
 extern "C" std::uint32_t LiGetHostFeatureFlags() { return hostFeatureFlags; }
@@ -348,19 +352,11 @@ int main() {
     event.key.keysym.scancode = SDL_SCANCODE_M;
     event.key.keysym.mod = static_cast<SDL_Keymod>(KMOD_LCTRL | KMOD_LALT | KMOD_LSHIFT);
     input.handleEvent(event);
-    expect(keyboardEvents == keyboardEventsBeforeMouseMode,
-           "Local mouse-mode shortcut leaked to remote keyboard.");
-
-    const int cursorState = SDL_ShowCursor(SDL_QUERY);
-    event = {};
-    event.type = SDL_KEYDOWN;
-    event.key.windowID = SDL_GetWindowID(window);
-    event.key.state = SDL_PRESSED;
-    event.key.keysym.scancode = SDL_SCANCODE_C;
-    event.key.keysym.mod = static_cast<SDL_Keymod>(KMOD_LCTRL | KMOD_LALT | KMOD_LSHIFT);
+    event.type = SDL_KEYUP;
+    event.key.state = SDL_RELEASED;
     input.handleEvent(event);
-    expect(SDL_ShowCursor(SDL_QUERY) != cursorState,
-           "Local cursor shortcut did not toggle cursor visibility.");
+    expect(keyboardEvents == keyboardEventsBeforeMouseMode + 2,
+           "Removed mouse-mode shortcut was still handled locally.");
 
     const int keyboardEventsBeforePointerLock = keyboardEvents;
     event = {};
@@ -687,6 +683,34 @@ int main() {
     input.start(window, settings, 1920, 1080, 60, {}, {},
                 [&](std::uint64_t, bool) { ++ignoredOverlayOpens; });
     input.setEnabled(true);
+    const int positionsBeforeMotion = mousePositions;
+    event = {};
+    event.type = SDL_MOUSEMOTION;
+    event.motion.windowID = SDL_GetWindowID(window);
+    event.motion.x = 320;
+    event.motion.y = 180;
+    input.handleEvent(event);
+    expect(mousePositions == positionsBeforeMotion + 1,
+           "Absolute mouse motion was not forwarded immediately.");
+    expect(SDL_ShowCursor(SDL_QUERY) == SDL_ENABLE,
+           "Absolute mouse mode hid the responsive local cursor.");
+    event = {};
+    event.type = SDL_KEYDOWN;
+    event.key.windowID = SDL_GetWindowID(window);
+    event.key.state = SDL_PRESSED;
+    event.key.keysym.scancode = SDL_SCANCODE_C;
+    event.key.keysym.mod = static_cast<SDL_Keymod>(KMOD_LCTRL | KMOD_LALT | KMOD_LSHIFT);
+    input.handleEvent(event);
+    expect(SDL_ShowCursor(SDL_QUERY) == SDL_DISABLE,
+           "Local cursor shortcut did not hide the absolute cursor.");
+    event.type = SDL_KEYUP;
+    event.key.state = SDL_RELEASED;
+    input.handleEvent(event);
+    event.type = SDL_KEYDOWN;
+    event.key.state = SDL_PRESSED;
+    input.handleEvent(event);
+    expect(SDL_ShowCursor(SDL_QUERY) == SDL_ENABLE,
+           "Local cursor shortcut did not restore the absolute cursor.");
     event = {};
     event.type = SDL_KEYDOWN;
     event.key.windowID = SDL_GetWindowID(window);

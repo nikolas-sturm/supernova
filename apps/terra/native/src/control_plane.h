@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -165,6 +166,9 @@ private:
                                   bool hostEnded, bool quitHost);
     void cleanupSessions();
     void finishSessionDisconnect(const DisconnectRequest& request);
+    void stopSession(const std::string& hostId, bool quitHost,
+                     std::optional<std::uint64_t> expectedGeneration,
+                     std::string_view expectedLogicalSessionId);
     void startApiEvents(const HostRecord& host);
     void stopApiEvents(const std::string& hostId);
 

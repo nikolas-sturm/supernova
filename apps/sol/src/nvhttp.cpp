@@ -566,6 +566,25 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Resolve host cursor capture from optional Terra launch policy.
+   *
+   * Legacy and older Terra clients retain Moonlight-compatible host cursor capture.
+   *
+   * @param terra_v1 Whether request uses Terra API v1.
+   * @param value Terra cursor argument, empty when omitted.
+   * @return Cursor capture policy, or no value for an invalid Terra argument.
+   */
+  static std::optional<bool> launch_cursor_capture(bool terra_v1, std::string_view value) {
+    if (!terra_v1 || value.empty() || value == "1") {
+      return true;
+    }
+    if (value == "0") {
+      return false;
+    }
+    return std::nullopt;
+  }
+
+  /**
    * @brief Format a TCP endpoint for verified-connection identity lookup.
    *
    * @param endpoint Remote TLS endpoint.
@@ -2065,6 +2084,13 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "Client certificate lacks stream.launch permission");
       return;
     }
+    const auto capture_cursor = launch_cursor_capture(terra_v1, get_arg(args, "eclipseCaptureCursor", ""));
+    if (!capture_cursor) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "eclipseCaptureCursor must be 0 or 1");
+      return;
+    }
     const bool has_legacy_app_id = args.find("appid"s) != std::end(args);
     const bool has_terra_app_id = terra_v1 && args.find("eclipseAppUuid"s) != std::end(args);
     if (
@@ -2404,6 +2430,7 @@ namespace nvhttp {
 #endif
       return;
     }
+    display_cursor = *capture_cursor;
     if (terra_v1) {
       publish_terra_event({"session.created", launch_session->session_id, 1, std::move(created_resource)}, "session.control", client->uuid, {launch_session->app_uuid});
       session_event_lock.unlock();
@@ -2476,6 +2503,13 @@ namespace nvhttp {
 
     auto args = request->parse_query_string();
     const bool terra_v1 = terra_api::api_v1_requested(get_arg(args, "eclipseApiVersion", ""));
+    const auto capture_cursor = launch_cursor_capture(terra_v1, get_arg(args, "eclipseCaptureCursor", ""));
+    if (!capture_cursor) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "eclipseCaptureCursor must be 0 or 1");
+      return;
+    }
     const auto active_transports = rtsp_stream::transport_sessions();
     const bool terra_transport_active = std::ranges::any_of(active_transports, [](const auto &session) {
       return session.terra;
@@ -2645,6 +2679,7 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "Another stream launch is already pending");
       return;
     }
+    display_cursor = *capture_cursor;
     revert_display_configuration = false;
 
     tree.put("root.<xmlattr>.status_code", 200);
@@ -11454,6 +11489,10 @@ namespace nvhttp {
 
     bool http_header_contains_token(const std::string_view value, const std::string_view token) {
       return terra_header_contains_token(value, token);
+    }
+
+    std::optional<bool> launch_cursor_capture(const bool terra_v1, const std::string_view value) {
+      return nvhttp::launch_cursor_capture(terra_v1, value);
     }
 
     std::string operational_capabilities_csv() {

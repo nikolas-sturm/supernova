@@ -195,9 +195,10 @@ without bound.
 
 In game-oriented mouse mode, click the native stream window to capture input; press
 `Ctrl+Alt+Shift+Z` or change focus to release it. Windows uses raw mouse reports; Linux uses SDL2
-relative mode. Remote-desktop
-mouse mode sends absolute pointer positions without capture. Focus loss releases every forwarded key
-and mouse button to prevent stuck remote input. Gamepad input supports up to four XInput controllers
+relative mode. Remote-desktop mouse mode sends absolute pointer positions without capture and uses the
+responsive local cursor instead of the captured host cursor. Mouse mode is fixed when the stream starts;
+change the setting and restart the stream to switch modes. Focus loss releases every forwarded key and
+mouse button to prevent stuck remote input. Gamepad input supports up to four XInput controllers
 on Windows and sixteen SDL2 controllers on Linux, including stable slots, hot-plug, standard buttons,
 analog sticks, and triggers. Linux builds bundle Moonlight's SDL controller mapping database.
 Controller rumble routes by slot; SDL2 trigger rumble is enabled when supported. A controller enqueue
@@ -212,8 +213,8 @@ System-key capture can be disabled, limited to fullscreen, or enabled whenever i
 Linux uses SDL keyboard grab and Windows uses a low-level keyboard hook; secure-desktop combinations
 such as `Ctrl+Alt+Del` remain reserved by the operating system.
 
-Moonlight's PC shortcuts are supported: `Ctrl+Alt+Shift+Q` disconnects, `Z` toggles input capture,
-`X` toggles fullscreen, `S` toggles performance statistics, `M` toggles mouse mode, `V` sends up to
+Moonlight's PC shortcuts are supported where compatible: `Ctrl+Alt+Shift+Q` disconnects, `Z` toggles
+input capture, `X` toggles fullscreen, `S` toggles performance statistics, `V` sends up to
 16 KiB of validated UTF-8 clipboard text, `D` minimizes, `C` toggles the local cursor in direct mouse
 mode, and `L` locks the pointer to the video area in direct mouse mode. Each shortcut requires the
 full `Ctrl+Alt+Shift` chord, remains local, and releases forwarded modifier state before acting.

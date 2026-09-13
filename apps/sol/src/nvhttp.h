@@ -471,6 +471,15 @@ namespace nvhttp {
     bool http_header_contains_token(std::string_view value, std::string_view token);
 
     /**
+     * @brief Resolve host cursor capture for one launch request.
+     *
+     * @param terra_v1 Whether request uses Terra API v1.
+     * @param value Terra cursor argument, empty when omitted.
+     * @return Cursor capture policy, or no value for an invalid Terra argument.
+     */
+    std::optional<bool> launch_cursor_capture(bool terra_v1, std::string_view value);
+
+    /**
      * @brief Serialize live operational capabilities through production logic.
      *
      * @return Comma-separated capability names advertised by authenticated server information.

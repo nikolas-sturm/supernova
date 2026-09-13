@@ -1,12 +1,14 @@
 import { useThemeStore } from '@supernova/design-system/theme'
 import { fireEvent, render, screen } from '@testing-library/react'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { App } from './App'
+import * as coreBridge from './native/coreBridge'
 import { defaultSettings, defaultSettingsByMode } from './settings'
 import { useClientStore } from './store/clientStore'
 
 describe('App', () => {
   beforeEach(() => {
+    vi.restoreAllMocks()
     localStorage.clear()
     useThemeStore.getState().setTheme('dark')
     useClientStore.setState({
@@ -419,6 +421,16 @@ describe('App', () => {
     expect(await screen.findByText('D3D11VA video and WASAPI audio playback active.')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Disconnect' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Resume Desktop' })).toBeDisabled()
+
+    const cancel = vi.spyOn(coreBridge, 'cancelCoreSession').mockResolvedValue(undefined)
+    fireEvent.click(screen.getByRole('button', { name: 'Workstation' }))
+    expect(screen.getByRole('button', { name: /Active Sessions/ })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
+    expect(cancel).toHaveBeenLastCalledWith('host-1', false)
+    fireEvent.click(screen.getByRole('button', { name: 'Stop host app' }))
+    expect(cancel).toHaveBeenLastCalledWith('host-1', true)
+    fireEvent.click(screen.getByRole('button', { name: /Active Sessions/ }))
+    expect(screen.getByRole('heading', { name: 'Logical sessions' })).toBeVisible()
   })
 
   it('allows recovery of an orphaned host application', async () => {
@@ -449,6 +461,8 @@ describe('App', () => {
     render(<App />)
 
     expect(await screen.findByText('Running host application')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Stop host app' })).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Workstation' }))
     expect(screen.getByRole('button', { name: 'Stop host app' })).toBeEnabled()
   })
 

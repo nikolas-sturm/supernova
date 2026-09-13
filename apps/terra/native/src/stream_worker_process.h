@@ -24,6 +24,8 @@ public:
   void start(const StreamSessionConfig &config);
   /** @brief Wait for child's Moonlight connection callback. */
   [[nodiscard]] bool waitConnected(std::chrono::milliseconds timeout);
+  /** @brief Ask the child to stop without waiting for its reader thread. */
+  void requestStop() noexcept;
   /** @brief Request child stop and reap process. */
   void stop() noexcept;
 
