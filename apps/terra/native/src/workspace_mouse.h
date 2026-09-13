@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <numeric>
 #include <optional>
+#include <ranges>
 #include <span>
+#include <tuple>
 #include <vector>
 
 namespace terra {
@@ -50,6 +53,25 @@ inline bool workspaceWindowMatches(const MouseRectangle& assigned, const MouseRe
                                    int width, int height) {
     return assigned.width > 0 && assigned.height > 0 && assigned == actual &&
            width == assigned.width && height == assigned.height;
+}
+
+/**
+ * @brief Order local output indices by desktop position starting at the
+ * selected output, wrapping cyclically. Workspace streams must claim
+ * physically adjacent outputs; enumeration order may interleave unrelated
+ * panels such as an embedded display between two external monitors.
+ */
+inline std::vector<std::size_t> workspaceOutputOrder(std::span<const MouseRectangle> outputs,
+                                                     std::size_t selected) {
+    std::vector<std::size_t> order(outputs.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::ranges::sort(order, [&](std::size_t left, std::size_t right) {
+        return std::tie(outputs[left].x, outputs[left].y) <
+               std::tie(outputs[right].x, outputs[right].y);
+    });
+    const auto start = std::ranges::find(order, selected);
+    if (start != order.end()) std::ranges::rotate(order, start);
+    return order;
 }
 
 /** @brief Fullscreen local output paired with its remote workspace display. */

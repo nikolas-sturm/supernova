@@ -43,7 +43,9 @@ forward directly through `moonlight-common-c` without crossing Neutralino IPC.
 ### Cross-display desktop dragging
 
 Fullscreen workspaces with two to four streams use one borderless stream window per local
-monitor, starting at the selected output. With a Sol host advertising `workspace-mouse-v1`,
+monitor, starting at the selected output and claiming physically adjacent outputs in desktop
+position order (wrapping cyclically), so an unrelated panel enumerated between two external
+monitors is skipped rather than streamed onto. With a Sol host advertising `workspace-mouse-v1`,
 mouse drags can cross those windows without releasing the remote button. The starting window
 retains capture and sends the whole gesture through its original encrypted connection.
 Local and remote resolutions may differ; coordinates account for letterboxing and negative

@@ -48,6 +48,23 @@ int main() {
     expect(!terra::workspaceWindowMatches(assigned, assigned, 1280, 720),
            "An unsettled window size enabled mapped input.");
 
+    // Enumeration interleaves an embedded panel between two externals; the
+    // selection must claim physically adjacent outputs by desktop origin.
+    const std::vector<terra::MouseRectangle> mixedScale{
+        {1440, 0, 2560, 1440},   // selected external, enumeration 0
+        {0, 270, 2880, 1800},    // embedded panel, enumeration 1
+        {4000, 0, 2560, 1440},   // second external, enumeration 2
+    };
+    expect((terra::workspaceOutputOrder(mixedScale, 0) == std::vector<std::size_t>{0, 2, 1}),
+           "Output order included the embedded panel between adjacent externals.");
+    expect((terra::workspaceOutputOrder(mixedScale, 2) == std::vector<std::size_t>{2, 1, 0}),
+           "Output order did not wrap from the rightmost output.");
+    expect((terra::workspaceOutputOrder(mixedScale, 1) == std::vector<std::size_t>{1, 0, 2}),
+           "Panel selection did not proceed to the next output by position.");
+    expect((terra::workspaceOutputOrder(mixedScale, 9) == std::vector<std::size_t>{1, 0, 2}),
+           "Out-of-range selection did not fall back to leftmost position order.");
+    expect(terra::workspaceOutputOrder({}, 0).empty(), "Empty enumeration produced an output order.");
+
     expect(terra::workspaceMouseBlocker(true, 2, 2, true, true) == nullptr,
            "Eligible workspace mouse routing was disabled.");
     expect(terra::workspaceMouseBlocker(true, 3, 3, true, true) == nullptr,

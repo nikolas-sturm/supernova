@@ -983,16 +983,25 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                 const auto first = settings.displayIndex >= 0 &&
                                            settings.displayIndex < static_cast<int>(localDisplays.size())
                                        ? static_cast<std::size_t>(settings.displayIndex) : 0;
-                child.displayIndex = static_cast<int>((first + index) % localDisplays.size());
+                std::vector<MouseRectangle> localRects;
+                localRects.reserve(localDisplays.size());
+                for (const auto& display : localDisplays) {
+                    localRects.push_back({display.x, display.y, display.width, display.height});
+                }
+                // Claim physically adjacent outputs starting at the selection:
+                // enumeration order can interleave an embedded panel between
+                // the intended external monitors.
+                const auto order = workspaceOutputOrder(localRects, first);
+                child.displayIndex = static_cast<int>(order[index % order.size()]);
                 // Exclusive fullscreen in separate processes minimizes sibling streams on focus changes.
                 child.displayMode = DisplayMode::borderless;
                 child.input.fullscreen = true;
                 if (!workspaceMouse) continue;
                 for (std::size_t offset = 0; offset < displaySettings.size(); ++offset) {
                     const auto remoteIndex = (index + offset) % displaySettings.size();
-                    const auto& local = localDisplays[(first + remoteIndex) % localDisplays.size()];
+                    const auto& local = localRects[order[(index + offset) % order.size()]];
                     child.input.workspaceMouse.push_back(
-                        {{local.x, local.y, local.width, local.height}, remoteMouseDisplays[remoteIndex]});
+                        {local, remoteMouseDisplays[remoteIndex]});
                 }
             }
             effectiveSettings = displaySettings.front();
