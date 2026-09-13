@@ -339,6 +339,7 @@ if(BUILD_TESTING)
     src/network_route.cpp
     src/stream_session.cpp
     src/stream_statistics.cpp
+    src/stream_worker_process.cpp
     src/stream_worker_protocol.cpp
   )
   target_include_directories(

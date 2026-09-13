@@ -21,9 +21,11 @@
 #include "audio_renderer.h"
 #include "gamestream_client.h"
 #include "input_forwarder.h"
+#include "logical_session_control.h"
 #include "sse_decoder.h"
 #include "stream_session.h"
 #include "stream_worker_process.h"
+#include "stream_worker_protocol.h"
 #include "video_renderer.h"
 #include "wake_on_lan.h"
 
@@ -754,6 +756,9 @@ nlohmann::json ControlPlane::mutateApiResource(const std::string& hostId, const 
                                                const bool idempotent) {
     HostRecord current;
     std::function<void(const ApiResourceUpdate&)> listener;
+    bool localSessionAction = false;
+    std::uint64_t localSessionGeneration = 0;
+    std::string localLogicalSessionId;
     {
         std::scoped_lock lock{mutex_};
         const auto host = std::ranges::find(hosts_, hostId, &HostRecord::id);
@@ -763,6 +768,14 @@ nlohmann::json ControlPlane::mutateApiResource(const std::string& hostId, const 
         }
         current = *host;
         listener = apiResourceListener_;
+        if (session_) {
+            localSessionAction = isLocalLogicalSessionMutation(
+                session_->hostId, session_->logicalSessionId, hostId, method, path);
+            if (localSessionAction) {
+                localSessionGeneration = sessionGeneration_;
+                localLogicalSessionId = session_->logicalSessionId;
+            }
+        }
     }
     if (!body.is_object()) throw std::invalid_argument("Sol API mutation body must be an object.");
     body["schemaVersion"] = 1;
@@ -771,6 +784,9 @@ nlohmann::json ControlPlane::mutateApiResource(const std::string& hostId, const 
     if (idempotent) headers["Idempotency-Key"] = ix::uuid4();
     const auto response = gameStream_->apiRequest(
         current.address, current.apiPort, current.serverCertificate, method, path, body, headers);
+    if (localSessionAction) {
+        stopSession(hostId, false, localSessionGeneration, localLogicalSessionId);
+    }
     if (listener) listener({hostId, "mutation", response.body});
     return response.body;
 }
@@ -928,6 +944,7 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                     throw std::runtime_error("Workspace display refresh rate is invalid.");
                 }
                 auto childSettings = settings;
+                childSettings.input.absoluteMouseMode = true;
                 childSettings.width = mode.at("width").get<int>();
                 childSettings.height = mode.at("height").get<int>();
                 childSettings.fps =
@@ -1061,7 +1078,8 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
                                 generation, hostId, appId, appName, resumed,
                                 {type == "error" ? "error" : event.value("state", "stopped"),
                                  event.value("message", "Stream worker stopped.")},
-                                event.value("hostEnded", false), quitAppAfter);
+                                event.value("hostEnded", false),
+                                workerDisconnectQuitsHost(event, quitAppAfter));
                         }
                     });
                 worker->start({.hostId = hostId,
@@ -1244,6 +1262,12 @@ SessionRecord ControlPlane::launchApp(const std::string& hostId, int appId,
 }
 
 void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
+    stopSession(hostId, quitHost, std::nullopt, {});
+}
+
+void ControlPlane::stopSession(const std::string& hostId, bool quitHost,
+                               const std::optional<std::uint64_t> expectedGeneration,
+                               const std::string_view expectedLogicalSessionId) {
     HostRecord current;
     std::string clientId;
     std::shared_ptr<StreamSession> transport;
@@ -1259,6 +1283,11 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
             throw std::invalid_argument("Host no longer exists.");
         }
         ownsSession = session_ && session_->hostId == hostId;
+        if (expectedGeneration &&
+            (!ownsSession || sessionGeneration_ != *expectedGeneration ||
+             session_->logicalSessionId != expectedLogicalSessionId)) {
+            return;
+        }
         if (!ownsSession && (!quitHost || host->currentGameId == 0)) {
             return;
         }
@@ -1274,11 +1303,11 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
         }
     }
 
-    if (transport) {
-        transport->requestStop();
-    } else if (!streamWorkers.empty()) {
-        for (const auto& worker : streamWorkers) worker->stop();
-    } else if (ownsSession) {
+    if (transport) transport->requestStop();
+    if (!streamWorkers.empty()) {
+        for (const auto& worker : streamWorkers) worker->requestStop();
+    }
+    if (!transport && streamWorkers.empty() && ownsSession) {
         LiInterruptConnection();
     }
 
@@ -1287,7 +1316,11 @@ void ControlPlane::stopSession(const std::string& hostId, bool quitHost) {
         std::scoped_lock lock{mutex_};
         if (sessionGeneration_ == generation) transport = transport_;
     }
-    if (transport) transport->stop();
+    if (transport) {
+        transport->stop();
+    } else {
+        for (const auto& worker : streamWorkers) worker->stop();
+    }
     {
         std::scoped_lock lock{mutex_};
         if (ownsSession && sessionGeneration_ == generation) {
@@ -1344,27 +1377,38 @@ void ControlPlane::requestSessionDisconnect(std::uint64_t generation, std::strin
                                             std::string appName, bool resumed,
                                             StreamSessionEvent event, bool hostEnded,
                                             bool quitHost) {
+    std::vector<std::shared_ptr<StreamWorkerProcess>> streamWorkers;
     {
         std::scoped_lock lock{mutex_};
         if (sessionGeneration_ != generation) return;
+        if (!sessionStopRequested_) {
+            sessionStopRequested_ = true;
+            streamWorkers = streamWorkers_;
+        }
     }
     LiInterruptConnection();
     {
         std::scoped_lock lock{disconnectMutex_};
         if (shuttingDown_) return;
-        disconnectRequest_ = DisconnectRequest{
-            .generation = generation,
-            .hostEnded = hostEnded,
-            .quitHost = quitHost,
-            .hostId = std::move(hostId),
-            .appId = appId,
-            .appName = std::move(appName),
-            .resumed = resumed,
-            .state = std::move(event.state),
-            .message = std::move(event.message),
-        };
+        if (disconnectRequest_ && disconnectRequest_->generation == generation) {
+            disconnectRequest_->hostEnded |= hostEnded;
+            disconnectRequest_->quitHost |= quitHost;
+        } else {
+            disconnectRequest_ = DisconnectRequest{
+                .generation = generation,
+                .hostEnded = hostEnded,
+                .quitHost = quitHost,
+                .hostId = std::move(hostId),
+                .appId = appId,
+                .appName = std::move(appName),
+                .resumed = resumed,
+                .state = std::move(event.state),
+                .message = std::move(event.message),
+            };
+        }
     }
     disconnectCondition_.notify_one();
+    for (const auto& worker : streamWorkers) worker->requestStop();
 }
 
 void ControlPlane::cleanupSessions() {

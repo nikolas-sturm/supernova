@@ -67,6 +67,7 @@ type GamingView =
   | 'gamepad'
 type WorkstationView =
   | 'workspaces'
+  | 'active-sessions'
   | 'display-topology'
   | 'app-sandboxes'
   | 'workstation-settings'
@@ -83,6 +84,7 @@ const navigation = {
   ],
   workstation: [
     { id: 'workspaces', label: 'Workspaces & Desktops', icon: Monitor },
+    { id: 'active-sessions', label: 'Active Sessions', icon: Activity },
     { id: 'display-topology', label: 'Display & Topology', icon: LayoutGrid },
     { id: 'app-sandboxes', label: 'App Sandboxes', icon: Boxes },
     { id: 'workstation-settings', label: 'Workstation Settings', icon: SlidersHorizontal },
@@ -869,7 +871,10 @@ export function App() {
                 </div>
                 <div>
                   <h3>No active stream</h3>
-                  <p>Launch or resume an application from Game Library.</p>
+                  <p>
+                    Launch or resume an application from{' '}
+                    {appMode === 'gaming' ? 'Game Library' : 'Workspaces & Desktops'}.
+                  </p>
                 </div>
               </div>
             )}
@@ -1205,12 +1210,35 @@ export function App() {
                     </div>
                     <button
                       type="button"
-                      onClick={() => void handleStopSession(selectedHost.id, settings.quitAppAfter)}
+                      onClick={() => void handleStopSession(selectedHost.id, false)}
                     >
                       <Square size={13} /> Disconnect
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleStopSession(selectedHost.id, true)}
+                    >
+                      <Power size={13} /> Stop host app
+                    </button>
                   </div>
                 )}
+
+                {(!activeSession || activeSession.state === 'stopped') &&
+                  selectedHost.currentGameId !== 0 && (
+                    <div className={`${styles.sessionBanner} ${styles.connected}`}>
+                      <div>
+                        <span>host busy</span>
+                        <strong>Running host application</strong>
+                        <p>Resume it below or stop the host application.</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void handleStopSession(selectedHost.id, true)}
+                      >
+                        <Square size={13} /> Stop host app
+                      </button>
+                    </div>
+                  )}
 
                 <div className={styles.workspaceLayout}>
                   <section className={styles.spatialPanel} aria-labelledby="spatial-heading">

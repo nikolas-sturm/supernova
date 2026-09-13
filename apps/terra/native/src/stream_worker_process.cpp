@@ -130,9 +130,13 @@ struct StreamWorkerProcess::Impl {
   bool connected = false;
   bool failed = false;
   bool stopping = false;
+  bool stopRequested = false;
+  bool cleanupStarted = false;
+  bool cleanupComplete = false;
   NativeHandle input = kInvalidHandle;
   NativeHandle output = kInvalidHandle;
   std::jthread reader;
+  std::thread::id readerId;
 #ifdef _WIN32
   PROCESS_INFORMATION process{};
 #else
@@ -270,7 +274,13 @@ void StreamWorkerProcess::start(const StreamSessionConfig &config) {
     stop();
     throw std::runtime_error("Failed to configure stream worker process.");
   }
-  impl_->reader = std::jthread{[this] { impl_->readMessages(); }};
+  impl_->reader = std::jthread{[this] {
+    {
+      std::lock_guard lock{impl_->mutex};
+      impl_->readerId = std::this_thread::get_id();
+    }
+    impl_->readMessages();
+  }};
 }
 
 bool StreamWorkerProcess::waitConnected(
@@ -281,44 +291,73 @@ bool StreamWorkerProcess::waitConnected(
   return impl_->connected && !impl_->failed;
 }
 
-void StreamWorkerProcess::stop() noexcept {
-  if (impl_->input == kInvalidHandle)
+void StreamWorkerProcess::requestStop() noexcept {
+  std::lock_guard lock{impl_->mutex};
+  if (impl_->input == kInvalidHandle || impl_->stopRequested)
     return;
+  impl_->stopping = true;
+  impl_->stopRequested = true;
+  static_cast<void>(writeFrame(impl_->input, {{"type", "stop"}}));
+}
+
+void StreamWorkerProcess::stop() noexcept {
+  NativeHandle input = kInvalidHandle;
+  bool readerThread = false;
+  {
+    std::unique_lock lock{impl_->mutex};
+    readerThread = impl_->readerId == std::this_thread::get_id();
+    if (readerThread) {
+      // requestStop() acquires this mutex after it is released below.
+    } else if (!impl_->cleanupStarted) {
+      impl_->cleanupStarted = true;
+      impl_->stopping = true;
+      input = std::exchange(impl_->input, kInvalidHandle);
+    } else {
+      impl_->condition.wait(lock, [&] { return impl_->cleanupComplete; });
+      return;
+    }
+  }
+  if (readerThread) {
+    requestStop();
+    return;
+  }
+
+#ifdef _WIN32
+  if (input != kInvalidHandle) {
+    CloseHandle(input);
+    if (WaitForSingleObject(impl_->process.hProcess, 5000) == WAIT_TIMEOUT) {
+      TerminateProcess(impl_->process.hProcess, 1);
+    }
+    if (impl_->reader.joinable()) impl_->reader.join();
+    CloseHandle(impl_->output);
+    CloseHandle(impl_->process.hThread);
+    CloseHandle(impl_->process.hProcess);
+    impl_->output = kInvalidHandle;
+    impl_->process = {};
+  }
+#else
+  if (input != kInvalidHandle) {
+    close(input);
+    for (int attempt = 0; attempt < 50; ++attempt) {
+      if (waitpid(impl_->process, nullptr, WNOHANG) == impl_->process)
+        break;
+    }
+    if (waitpid(impl_->process, nullptr, WNOHANG) == 0) {
+      kill(impl_->process, SIGTERM);
+      waitpid(impl_->process, nullptr, 0);
+    }
+    if (impl_->reader.joinable()) impl_->reader.join();
+    close(impl_->output);
+    impl_->output = kInvalidHandle;
+    impl_->process = -1;
+  }
+#endif
+
   {
     std::lock_guard lock{impl_->mutex};
-    impl_->stopping = true;
+    impl_->cleanupComplete = true;
   }
-#ifdef _WIN32
-  CloseHandle(impl_->input);
-  impl_->input = kInvalidHandle;
-  if (WaitForSingleObject(impl_->process.hProcess, 5000) == WAIT_TIMEOUT) {
-    TerminateProcess(impl_->process.hProcess, 1);
-  }
-  if (impl_->reader.joinable())
-    impl_->reader.join();
-  CloseHandle(impl_->output);
-  CloseHandle(impl_->process.hThread);
-  CloseHandle(impl_->process.hProcess);
-  impl_->output = kInvalidHandle;
-  impl_->process = {};
-#else
-  close(impl_->input);
-  impl_->input = kInvalidHandle;
-  for (int attempt = 0; attempt < 50; ++attempt) {
-    if (waitpid(impl_->process, nullptr, WNOHANG) == impl_->process)
-      break;
-    std::this_thread::sleep_for(std::chrono::milliseconds{100});
-  }
-  if (waitpid(impl_->process, nullptr, WNOHANG) == 0) {
-    kill(impl_->process, SIGTERM);
-    waitpid(impl_->process, nullptr, 0);
-  }
-  if (impl_->reader.joinable())
-    impl_->reader.join();
-  close(impl_->output);
-  impl_->output = kInvalidHandle;
-  impl_->process = -1;
-#endif
+  impl_->condition.notify_all();
 }
 
 } // namespace terra

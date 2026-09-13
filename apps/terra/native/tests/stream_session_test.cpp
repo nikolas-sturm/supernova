@@ -1,5 +1,7 @@
 #include "audio_renderer.h"
+#include "logical_session_control.h"
 #include "stream_session.h"
+#include "stream_worker_process.h"
 #include "stream_worker_protocol.h"
 #include "video_renderer.h"
 
@@ -7,9 +9,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -177,7 +181,38 @@ bool AudioRenderer::recoveryRequired() const noexcept { return impl_->recoveryRe
 bool AudioRenderer::supportsOutputChannels(int) noexcept { return true; }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view{argv[1]} == "--stream-worker") {
+        if (!terra::readStreamWorkerFrame(std::cin)) return 2;
+        terra::writeStreamWorkerFrame(
+            std::cout, {{"type", "status"}, {"state", "connected"}});
+        const auto command = terra::readStreamWorkerFrame(std::cin);
+        if (!command || command->value("type", "") != "stop") return 3;
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        terra::writeStreamWorkerFrame(
+            std::cout, {{"type", "disconnected"}, {"state", "stopped"},
+                        {"userEnded", false}});
+        return 0;
+    }
+
+    {
+        const auto localDisconnect = terra::isLocalLogicalSessionMutation(
+            "host", "11111111-1111-4111-8111-111111111111", "host", "POST",
+            "/eclipse/v1/sessions/11111111-1111-4111-8111-111111111111/disconnect");
+        const auto localStop = terra::isLocalLogicalSessionMutation(
+            "host", "11111111-1111-4111-8111-111111111111", "host", "POST",
+            "/eclipse/v1/sessions/11111111-1111-4111-8111-111111111111/stop");
+        expect(localDisconnect && localStop,
+               "Local logical session actions were not matched exactly.");
+        expect(!terra::isLocalLogicalSessionMutation(
+                   "host", "11111111-1111-4111-8111-111111111111", "other", "POST",
+                   "/eclipse/v1/sessions/11111111-1111-4111-8111-111111111111/stop") &&
+                   !terra::isLocalLogicalSessionMutation(
+                       "host", "11111111-1111-4111-8111-111111111111", "host", "POST",
+                       "/eclipse/v1/sessions/22222222-2222-4222-8222-222222222222/stop"),
+               "Nonlocal logical session action was intercepted.");
+    }
+
     {
         bool stoppedFromListener = false;
         terra::StreamSession* sessionPointer = nullptr;
@@ -473,5 +508,53 @@ int main() {
                "Worker frame write failed.");
         const auto frame = terra::readStreamWorkerFrame(framed);
         expect(frame && frame->value("type", "") == "stop", "Worker frame round trip failed.");
+        expect(terra::workerDisconnectQuitsHost({{"userEnded", true}}, true),
+               "Explicit worker quit did not retain host quit intent.");
+        expect(!terra::workerDisconnectQuitsHost({{"userEnded", false}}, true) &&
+                   !terra::workerDisconnectQuitsHost({{"userEnded", true}}, false),
+               "Remote worker disconnect incorrectly requested host quit.");
+    }
+
+    {
+        std::atomic_bool disconnected = false;
+        terra::StreamWorkerProcess* processPointer = nullptr;
+        terra::StreamWorkerProcess process([&](const nlohmann::json& event) {
+            if (event.value("type", "") != "disconnected") return;
+            processPointer->stop();
+            disconnected.store(true);
+        });
+        processPointer = &process;
+        process.start(testConfig());
+        expect(process.waitConnected(std::chrono::seconds{2}),
+               "Stream worker did not report connection.");
+        process.requestStop();
+        process.requestStop();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!disconnected.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        expect(disconnected.load(),
+               "Worker stop was not delivered or reader callback self-joined.");
+        process.stop();
+    }
+
+    {
+        terra::StreamWorkerProcess process([](const nlohmann::json&) {});
+        process.start(testConfig());
+        expect(process.waitConnected(std::chrono::seconds{2}),
+               "Concurrent-stop worker did not report connection.");
+        std::atomic_bool stopWorkers = false;
+        std::thread firstStopper([&] {
+            while (!stopWorkers.load()) std::this_thread::yield();
+            process.stop();
+        });
+        std::thread secondStopper([&] {
+            while (!stopWorkers.load()) std::this_thread::yield();
+            process.stop();
+        });
+        stopWorkers.store(true);
+        firstStopper.join();
+        secondStopper.join();
+        process.stop();
     }
 }

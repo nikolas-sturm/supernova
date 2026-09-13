@@ -171,6 +171,11 @@ std::optional<nlohmann::json> readStreamWorkerFrame(std::istream &input) {
   return nlohmann::json::parse(payload);
 }
 
+bool workerDisconnectQuitsHost(const nlohmann::json &event,
+                               const bool quitAppAfter) {
+  return quitAppAfter && event.value("userEnded", false);
+}
+
 int runStreamWorker() {
   const auto frame = readStreamWorkerFrame(std::cin);
   if (!frame)
