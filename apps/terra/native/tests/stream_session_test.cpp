@@ -30,6 +30,8 @@ std::atomic_bool forceAudioLoss = false;
 std::atomic_bool forceVideoRecovery = false;
 std::optional<int> nextRecoveryDisplay;
 std::optional<std::string> nextRecoveryError;
+bool setupVideoDuringStart = false;
+std::string rendererInitializationError;
 int lastRendererDisplay = -1;
 int audioInitializations = 0;
 int startResult = 0;
@@ -125,6 +127,14 @@ extern "C" int LiStartConnection(PSERVER_INFORMATION, PSTREAM_CONFIGURATION stre
     while (blockStart.load() && !interrupted.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
+    if (setupVideoDuringStart) {
+        const auto result = videoCallbacks->setup(VIDEO_FORMAT_H264, streamConfig->width,
+                                                  streamConfig->height, streamConfig->fps, nullptr, 0);
+        if (result != DR_OK) {
+            connectionCallbacks->stageFailed(STAGE_VIDEO_STREAM_START, result);
+            return result;
+        }
+    }
     if (failedStage != STAGE_NONE) connectionCallbacks->stageFailed(failedStage, startResult);
     return interrupted.load() ? -1 : startResult;
 }
@@ -147,7 +157,9 @@ VideoRenderer::VideoRenderer(StreamSettings settings, StatusListener, CloseListe
     lastInitialOverlayState = overlayState;
 }
 VideoRenderer::~VideoRenderer() = default;
-void VideoRenderer::initialize(int, int, int, int) {}
+void VideoRenderer::initialize(int, int, int, int) {
+    if (!rendererInitializationError.empty()) throw std::runtime_error(rendererInitializationError);
+}
 void VideoRenderer::setInputEnabled(bool) {}
 void VideoRenderer::setHdrMode(bool) {}
 void VideoRenderer::closeOverlay(std::uint64_t) { ++overlayCloses; }
@@ -302,6 +314,25 @@ int main(int argc, char** argv) {
 
     enteredStart.store(false);
     blockStart.store(false);
+    {
+        setupVideoDuringStart = true;
+        rendererInitializationError = "Cannot initialize the selected SDL video driver.";
+        std::vector<terra::StreamSessionEvent> failures;
+        terra::StreamSession session(testConfig(), [&](const auto& event) { failures.push_back(event); },
+                                     [](auto, bool, bool) {});
+        std::string error;
+        try {
+            session.start();
+        } catch (const std::runtime_error& exception) {
+            error = exception.what();
+        }
+        setupVideoDuringStart = false;
+        rendererInitializationError.clear();
+        expect(error.find("Video setup failed: Cannot initialize the selected SDL video driver.") != std::string::npos,
+               "Generic video-start error replaced the actual renderer failure.");
+        expect(!failures.empty() && failures.back().message == error,
+               "Renderer failure was lost between status reporting and startup exception.");
+    }
     int disconnects = 0;
     bool hostEnded = false;
     std::string terminalState;

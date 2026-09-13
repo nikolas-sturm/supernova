@@ -102,6 +102,8 @@ std::vector<ClientDisplayOutput> enumerateClientDisplays() {
 #elif defined(__linux__) && defined(TERRA_HAS_LINUX_VIDEO)
 
 #include <SDL.h>
+#include <cstdio>
+#include "sdl_video.h"
 
 namespace terra {
 namespace {
@@ -122,10 +124,14 @@ std::string uniqueId(std::string name, int index, const std::vector<ClientDispla
 std::vector<ClientDisplayOutput> enumerateClientDisplays() {
     std::vector<ClientDisplayOutput> outputs;
     const bool initialized = SDL_WasInit(SDL_INIT_VIDEO) != 0;
-    if (!initialized && SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) {
+    if (!initialized && initializeSdlVideo() < 0) {
+        std::fprintf(stderr, "[terra-displays] SDL video initialization failed: %s\n", SDL_GetError());
         return outputs;
     }
     const auto displayCount = SDL_GetNumVideoDisplays();
+    const auto* driver = SDL_GetCurrentVideoDriver();
+    std::fprintf(stderr, "[terra-displays] video_driver=%s outputs=%d\n",
+                 driver ? driver : "unavailable", displayCount);
     for (int index = 0; index < displayCount; ++index) {
         ClientDisplayOutput output;
         const auto* displayName = SDL_GetDisplayName(index);

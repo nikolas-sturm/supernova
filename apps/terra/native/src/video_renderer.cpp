@@ -1332,6 +1332,7 @@ void VideoRenderer::setGamepadLed(std::uint16_t controllerNumber, std::uint8_t r
 #include <SDL.h>
 #include <SDL_syswm.h>
 #include "sdl_fullscreen.h"
+#include "sdl_video.h"
 #include "wayland_fullscreen.h"
 #if defined(TERRA_HAS_LIBPLACEBO)
 #include <SDL_vulkan.h>
@@ -1723,10 +1724,15 @@ struct VideoRenderer::Impl {
 #if defined(TERRA_USE_VAAPI_X11)
         XInitThreads();
 #endif
-        if (SDL_InitSubSystem(SDL_INIT_VIDEO) < 0) {
+        if (initializeSdlVideo() < 0) {
             throw std::runtime_error(sdlError("Cannot initialize SDL video"));
         }
         sdlVideoInitialized = true;
+        const auto* videoDriver = SDL_GetCurrentVideoDriver();
+        std::fprintf(stderr,
+            "[terra-video] setup video_driver=%s requested_display=%d video=%dx%d fps=%d workspace_mouse_displays=%zu\n",
+            videoDriver ? videoDriver : "unavailable", settings.displayIndex, width, height,
+            frameRate, settings.input.workspaceMouse.size());
 
         if (const char* previous = SDL_GetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH)) {
             previousMouseFocusClickthrough = previous;

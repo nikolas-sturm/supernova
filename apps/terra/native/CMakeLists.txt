@@ -392,6 +392,10 @@ if(BUILD_TESTING)
   endif()
   add_test(NAME display-mode COMMAND terra-display-mode-test)
 
+  add_executable(terra-sdl-video-policy-test tests/sdl_video_policy_test.cpp)
+  target_include_directories(terra-sdl-video-policy-test PRIVATE src)
+  add_test(NAME sdl-video-policy COMMAND terra-sdl-video-policy-test)
+
   add_executable(terra-workspace-mouse-test tests/workspace_mouse_test.cpp)
   target_include_directories(terra-workspace-mouse-test PRIVATE src)
   add_test(NAME workspace-mouse COMMAND terra-workspace-mouse-test)

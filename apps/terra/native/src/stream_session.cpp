@@ -382,6 +382,9 @@ void StreamSession::stageFailed(int stage, int errorCode) {
         }
         {
             std::scoped_lock failureLock{session->startupFailureMutex_};
+            if (!session->startupFailureMessage_.empty()) {
+                message += " " + session->startupFailureMessage_;
+            }
             session->startupFailureMessage_ = message;
         }
         publishAndRelease(std::move(session), "error", std::move(message));
@@ -656,7 +659,12 @@ int StreamSession::videoSetup(int format, int width, int height, int frameRate, 
         } catch (const std::exception& exception) {
             session->video_.reset();
             state = "error";
-            message = exception.what();
+            message = std::string{"Video setup failed: "} + exception.what();
+            {
+                std::scoped_lock failureLock{session->startupFailureMutex_};
+                session->startupFailureMessage_ = message;
+            }
+            std::fprintf(stderr, "[terra-video] %s\n", message.c_str());
             result = -1;
         }
     }

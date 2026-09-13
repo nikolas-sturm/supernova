@@ -248,6 +248,7 @@ int runStreamWorker() {
     session.requestStop();
     return 0;
   } catch (const std::exception &exception) {
+    std::fprintf(stderr, "[terra-worker] startup failed: %s\n", exception.what());
     send({{"type", "error"}, {"message", exception.what()}});
     return 1;
   }

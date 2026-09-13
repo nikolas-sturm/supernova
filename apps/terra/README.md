@@ -88,6 +88,12 @@ workspace routing includes its reason. `terra-worker` reports each child's confi
 `terra-input` reports the actual SDL backend and workspace-map count, even when that map is empty.
 Frame timing diagnostics remain enabled in ordinary per-display routing, too.
 
+Linux display enumeration and stream workers prefer SDL's native Wayland backend in a Wayland
+session unless `SDL_VIDEODRIVER` or an SDL driver hint was explicitly supplied. Existing overrides
+(including X11) are preserved. `[terra-displays]` and `[terra-video]` report the selected backend
+before window/input setup. Renderer startup exceptions are retained in the final worker error,
+rather than being replaced by Moonlight's generic video-start `-1`.
+
 The workstation settings **Display mode** must be Fullscreen or Borderless at launch for
 workspace routing. The main UI's fullscreen setting is separate, and making an already-running
 Windowed stream fullscreen does not retroactively negotiate workspace mouse input. Existing
