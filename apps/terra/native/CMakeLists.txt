@@ -160,6 +160,16 @@ if(TARGET PkgConfig::LINUX_WAYLAND AND TARGET PkgConfig::LINUX_GTK3)
     DEPENDS "${XDG_SHELL_PROTOCOL}"
     VERBATIM
   )
+  set(XDG_OUTPUT_PROTOCOL "${WAYLAND_PROTOCOLS_DATA_DIR}/unstable/xdg-output/xdg-output-unstable-v1.xml")
+  set(XDG_OUTPUT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/xdg-output-client-protocol.h")
+  set(XDG_OUTPUT_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/xdg-output-protocol.c")
+  add_custom_command(
+    OUTPUT "${XDG_OUTPUT_HEADER}" "${XDG_OUTPUT_SOURCE}"
+    COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" client-header "${XDG_OUTPUT_PROTOCOL}" "${XDG_OUTPUT_HEADER}"
+    COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" private-code "${XDG_OUTPUT_PROTOCOL}" "${XDG_OUTPUT_SOURCE}"
+    DEPENDS "${XDG_OUTPUT_PROTOCOL}"
+    VERBATIM
+  )
   set(WLR_LAYER_SHELL_PROTOCOL
       "${CMAKE_CURRENT_SOURCE_DIR}/protocol/wlr-layer-shell-unstable-v1.xml")
   set(WLR_LAYER_SHELL_HEADER
@@ -183,6 +193,7 @@ if(TARGET PkgConfig::LINUX_WAYLAND AND TARGET PkgConfig::LINUX_GTK3)
   )
   set_source_files_properties(
     "${XDG_SHELL_SOURCE}"
+    "${XDG_OUTPUT_SOURCE}"
     "${WLR_LAYER_SHELL_SOURCE}"
     PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden"
   )
@@ -253,7 +264,9 @@ if(WIN32)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TERRA_ENABLE_LINUX_VIDEO)
-  target_sources(terra-core PRIVATE src/wayland_workspace_pointer.cpp)
+  target_sources(terra-core PRIVATE src/wayland_workspace_pointer.cpp src/wayland_fullscreen.cpp
+    "${XDG_SHELL_SOURCE}" "${XDG_OUTPUT_SOURCE}")
+  target_include_directories(terra-core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
   target_link_libraries(terra-core PRIVATE PkgConfig::LINUX_VIDEO PkgConfig::LINUX_WAYLAND)
   target_compile_definitions(terra-core PRIVATE TERRA_HAS_LINUX_VIDEO=1)
   if(TARGET PkgConfig::LINUX_VAAPI_X11)
@@ -456,12 +469,16 @@ if(BUILD_TESTING)
       src/stream_statistics.cpp
       src/video_renderer.cpp
       src/wayland_workspace_pointer.cpp
+      src/wayland_fullscreen.cpp
+      "${XDG_SHELL_SOURCE}"
+      "${XDG_OUTPUT_SOURCE}"
     )
     target_include_directories(
       terra-input-forwarder-test
       PRIVATE
         src
         "${MOONLIGHT_COMMON_ROOT}/src"
+        "${CMAKE_CURRENT_BINARY_DIR}"
     )
     target_link_libraries(terra-input-forwarder-test PRIVATE PkgConfig::LINUX_VIDEO PkgConfig::LINUX_WAYLAND)
     target_compile_definitions(terra-input-forwarder-test PRIVATE TERRA_HAS_LINUX_VIDEO=1)
@@ -484,6 +501,11 @@ if(BUILD_TESTING)
     target_compile_options(terra-wayland-input-forwarder-test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME wayland-input-forwarder COMMAND terra-wayland-input-forwarder-test)
     set_tests_properties(wayland-input-forwarder PROPERTIES ENVIRONMENT "SDL_VIDEODRIVER=dummy")
+
+    add_executable(terra-sdl-fullscreen-test tests/sdl_fullscreen_test.cpp)
+    target_link_libraries(terra-sdl-fullscreen-test PRIVATE PkgConfig::LINUX_VIDEO)
+    target_compile_options(terra-sdl-fullscreen-test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME sdl-fullscreen-target COMMAND terra-sdl-fullscreen-test)
   endif()
 endif()
 

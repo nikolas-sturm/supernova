@@ -71,6 +71,7 @@ public:
     [[nodiscard]] int submit(PDECODE_UNIT decodeUnit);
     [[nodiscard]] bool recoveryRequired() const;
     [[nodiscard]] std::optional<int> recoveryDisplayIndex() const;
+    [[nodiscard]] std::optional<std::string> recoveryError() const;
 
 private:
     struct Impl;

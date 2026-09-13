@@ -29,6 +29,7 @@ STREAM_CONFIGURATION savedStreamConfiguration{};
 std::atomic_bool forceAudioLoss = false;
 std::atomic_bool forceVideoRecovery = false;
 std::optional<int> nextRecoveryDisplay;
+std::optional<std::string> nextRecoveryError;
 int lastRendererDisplay = -1;
 int audioInitializations = 0;
 int startResult = 0;
@@ -164,6 +165,9 @@ void VideoRenderer::setGamepadLed(std::uint16_t, std::uint8_t, std::uint8_t, std
 }
 int VideoRenderer::submit(PDECODE_UNIT) { return DR_OK; }
 bool VideoRenderer::recoveryRequired() const { return forceVideoRecovery.exchange(false); }
+std::optional<std::string> VideoRenderer::recoveryError() const {
+    return std::exchange(nextRecoveryError, std::nullopt);
+}
 std::optional<int> VideoRenderer::recoveryDisplayIndex() const {
     return std::exchange(nextRecoveryDisplay, std::nullopt);
 }
@@ -470,6 +474,27 @@ int main(int argc, char** argv) {
         DECODE_UNIT unit{};
         static_cast<void>(savedVideoCallbacks.submitDecodeUnit(&unit));
         expect(disconnects == 1, "Stale workspace map survived a local display change.");
+    }
+
+    {
+        std::string terminalMessage;
+        bool quitHost = false;
+        terra::StreamSession session(testConfig(), [](const auto&) {},
+            [&](auto event, bool, bool userEnded) {
+                terminalMessage = event.message;
+                quitHost = userEnded;
+            });
+        session.start();
+        savedCallbacks.connectionStarted();
+        expect(savedVideoCallbacks.setup(VIDEO_FORMAT_H264, 1920, 1080, 60, nullptr, 0) == DR_OK,
+               "Placement error test renderer setup failed.");
+        nextRecoveryError = "Compositor refused the assigned workspace output.";
+        forceVideoRecovery.store(true);
+        DECODE_UNIT unit{};
+        static_cast<void>(savedVideoCallbacks.submitDecodeUnit(&unit));
+        expect(terminalMessage.find("Compositor refused the assigned workspace output.") != std::string::npos,
+               "Placement failure was replaced with a generic recovery error.");
+        expect(!quitHost, "Placement failure was treated as explicit host quit.");
     }
 
     for (const auto [audioConfig, expected] : {

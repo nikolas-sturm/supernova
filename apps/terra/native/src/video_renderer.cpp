@@ -1321,6 +1321,7 @@ void VideoRenderer::setGamepadLed(std::uint16_t controllerNumber, std::uint8_t r
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -1330,6 +1331,8 @@ void VideoRenderer::setGamepadLed(std::uint16_t controllerNumber, std::uint8_t r
 
 #include <SDL.h>
 #include <SDL_syswm.h>
+#include "sdl_fullscreen.h"
+#include "wayland_fullscreen.h"
 #if defined(TERRA_HAS_LIBPLACEBO)
 #include <SDL_vulkan.h>
 #include <libplacebo/log.h>
@@ -1731,11 +1734,23 @@ struct VideoRenderer::Impl {
         SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
 
         const int displayCount = SDL_GetNumVideoDisplays();
-        const int displayIndex = settings.displayIndex >= 0 && settings.displayIndex < displayCount
-                                     ? settings.displayIndex
-                                     : 0;
+        int displayIndex = settings.displayIndex >= 0 && settings.displayIndex < displayCount
+                               ? settings.displayIndex : 0;
+        if (!settings.input.workspaceMouse.empty()) {
+            std::vector<MouseRectangle> outputs;
+            for (int index = 0; index < displayCount; ++index) {
+                SDL_Rect bounds{};
+                SDL_GetDisplayBounds(index, &bounds);
+                outputs.push_back({bounds.x, bounds.y, bounds.w, bounds.h});
+            }
+            const auto assigned = workspaceDisplayIndex(outputs, settings.input.workspaceMouse.front().local);
+            if (!assigned) throw std::runtime_error("Assigned workspace output is missing or ambiguous; reconnect after refreshing client displays.");
+            displayIndex = *assigned;
+            const auto* driver = SDL_GetCurrentVideoDriver();
+            workspacePlacementReady = !driver || std::string_view{driver} != "wayland";
+        }
         currentDisplayIndex = displayIndex;
-        if (displayIndex != settings.displayIndex) {
+        if (displayIndex != settings.displayIndex && settings.input.workspaceMouse.empty()) {
             notify("connected", "Selected display is unavailable; using primary display.");
         }
         SDL_DisplayMode desktopMode{};
@@ -1791,7 +1806,7 @@ struct VideoRenderer::Impl {
                 outputWidth = desktopMode.w;
                 outputHeight = desktopMode.h;
             }
-            windowFlags |= SDL_WINDOW_SHOWN | SDL_WINDOW_FULLSCREEN_DESKTOP;
+            windowFlags |= SDL_WINDOW_SHOWN;
         } else {
             if (hasFullscreenMode) {
                 outputWidth = fullscreenMode.w;
@@ -1802,21 +1817,33 @@ struct VideoRenderer::Impl {
             }
         }
 
-        const int windowPosition = SDL_WINDOWPOS_CENTERED_DISPLAY(displayIndex);
+        // Do not seed Wayland's cached coordinates with the requested output:
+        // later validation must reflect compositor events, not our own hint.
+        const int windowPosition = workspacePlacementReady ? SDL_WINDOWPOS_CENTERED_DISPLAY(displayIndex)
+                                                            : SDL_WINDOWPOS_UNDEFINED;
         window = SDL_CreateWindow("Terra Stream", windowPosition, windowPosition, outputWidth,
                                   outputHeight, windowFlags);
         if (!window) throw std::runtime_error(sdlError("Cannot create SDL stream window"));
         int presentationRefreshRate = hasDesktopMode ? desktopMode.refresh_rate : 0;
+        if (settings.displayMode != DisplayMode::windowed) SDL_ShowWindow(window);
+        if (settings.displayMode == DisplayMode::borderless) {
+            const int placed = workspacePlacementReady
+                ? setFullscreenOnDisplay(window, displayIndex, SDL_WINDOW_FULLSCREEN_DESKTOP)
+                : SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+            if (placed < 0) throw std::runtime_error(sdlError("Cannot enter borderless fullscreen"));
+        }
         if (settings.displayMode == DisplayMode::fullscreen) {
             const bool modeApplied = !hasFullscreenMode ||
                                      SDL_SetWindowDisplayMode(window, &fullscreenMode) == 0;
             if (!modeApplied) {
                 notify("connected", sdlError("Cannot apply cadence-matched display mode"));
             }
-            if (SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN) < 0) {
+            if (setFullscreenOnDisplay(window, displayIndex, SDL_WINDOW_FULLSCREEN) < 0) {
                 notify("connected",
                        sdlError("Exclusive fullscreen unavailable; using borderless fullscreen"));
-                static_cast<void>(SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP));
+                if (setFullscreenOnDisplay(window, displayIndex, SDL_WINDOW_FULLSCREEN_DESKTOP) < 0) {
+                    throw std::runtime_error(sdlError("Cannot place fullscreen stream on assigned output"));
+                }
             }
             SDL_ShowWindow(window);
             SDL_DisplayMode activeMode{};
@@ -2119,6 +2146,12 @@ struct VideoRenderer::Impl {
                         }
                     } else {
                         presentationErrorReported = false;
+                        if (framePresented && !workspacePlacementReady && !workspacePlacementDeadline) {
+                            // Reassert after the first buffer: the Wayland surface is
+                            // mapped now, rather than subject to initial placement rules.
+                            requestWaylandFullscreenOutput(window, settings.input.workspaceMouse.front().local);
+                            workspacePlacementDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+                        }
                         if (!presentationReported) {
                             presentationReported = true;
                             std::string presentation;
@@ -2149,6 +2182,10 @@ struct VideoRenderer::Impl {
             if (!initializationComplete) {
                 finishInitialization(exception.what());
             } else {
+                if (!workspacePlacementReady) {
+                    std::scoped_lock lock{initializationMutex};
+                    placementError = exception.what();
+                }
                 recoveryRequested.store(true);
                 notify("connected", exception.what());
             }
@@ -2171,16 +2208,16 @@ struct VideoRenderer::Impl {
         initializeDecoder(videoFormat, width, height);
     }
 
-    void applyInputState() {
+    void applyInputState(bool force = false) {
         bool enabled = false;
         std::uint64_t generation = 0;
         {
             std::scoped_lock lock{frameMutex};
-            if (inputRequestGeneration == inputAppliedGeneration) return;
+            if (!force && inputRequestGeneration == inputAppliedGeneration) return;
             enabled = inputEnabled;
             generation = inputRequestGeneration;
         }
-        inputForwarder.setEnabled(enabled);
+        inputForwarder.setEnabled(enabled && workspacePlacementReady && !recoveryRequested.load());
         {
             std::scoped_lock lock{frameMutex};
             inputAppliedGeneration = generation;
@@ -2349,6 +2386,34 @@ struct VideoRenderer::Impl {
             windowHidden = true;
         }
         inputForwarder.processWorkspacePointerEvents();
+        if (!workspacePlacementReady && workspacePlacementDeadline && !windowHidden) {
+            SDL_Rect output{};
+            int width = 0;
+            int height = 0;
+            SDL_GetWindowSize(window, &width, &height);
+            const int actualIndex = SDL_GetWindowDisplayIndex(window);
+            const bool matches = SDL_GetDisplayBounds(actualIndex, &output) == 0 &&
+                (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0 &&
+                workspaceWindowMatches(settings.input.workspaceMouse.front().local,
+                    {output.x, output.y, output.w, output.h}, width, height);
+            const bool timedOut = std::chrono::steady_clock::now() >= *workspacePlacementDeadline;
+            if (matches || timedOut) {
+                const auto& assigned = settings.input.workspaceMouse.front().local;
+                std::fprintf(stderr,
+                    "[terra-window] workspace_placement=%s assigned=%d,%d:%dx%d actual_output=%d,%d:%dx%d window=%dx%d sdl_display=%d\n",
+                    matches ? "ready" : "failed", assigned.x, assigned.y, assigned.width, assigned.height,
+                    output.x, output.y, output.w, output.h, width, height, actualIndex);
+            }
+            if (matches) {
+                currentDisplayIndex = actualIndex;
+                workspacePlacementReady = true;
+                applyInputState(true);
+                notify("connected", "Workspace stream placed on assigned client output.");
+            } else if (timedOut) {
+                recoveryDisplayIndex.store(currentDisplayIndex);
+                throw std::runtime_error("Compositor did not place the workspace stream on its assigned output. Check compositor window rules and reconnect; mouse input remains disabled to avoid misrouting.");
+            }
+        }
     }
 
     void togglePerformanceOverlay() {
@@ -2376,6 +2441,7 @@ struct VideoRenderer::Impl {
     }
 
     void requestDisplayRecovery(bool force = false) {
+        if (!workspacePlacementReady) return;
         const int displayIndex = SDL_GetWindowDisplayIndex(window);
         const int nextDisplay = displayIndex >= 0 ? displayIndex : 0;
         if (!force && nextDisplay == currentDisplayIndex && displayIndex >= 0) return;
@@ -2808,12 +2874,16 @@ struct VideoRenderer::Impl {
             pl_render_image(placeboRenderer, &mappedFrame, &targetFrame, &pl_render_fast_params);
         const auto submitted = pl_swapchain_submit_frame(placeboSwapchain);
         pl_unmap_avframe(placeboVulkan->gpu, &mappedFrame);
-        if (submitted) pl_swapchain_swap_buffers(placeboSwapchain);
+        if (submitted) {
+            pl_swapchain_swap_buffers(placeboSwapchain);
+            framePresented = rendered;
+        }
         return rendered && submitted;
     }
 #endif
 
     bool render(const PendingFrame& frame) {
+        framePresented = false;
 #if defined(TERRA_HAS_LIBPLACEBO)
         if (frame.avFrame) {
             const auto renderStarted = std::chrono::steady_clock::now();
@@ -2822,7 +2892,7 @@ struct VideoRenderer::Impl {
                 hardwarePresentationFallbackRequested.store(true);
                 return true;
             }
-            if (rendered && statistics) {
+            if (framePresented && statistics) {
                 statistics->recordPresented(
                     static_cast<std::uint64_t>(
                         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2886,6 +2956,7 @@ struct VideoRenderer::Impl {
             return false;
         }
         SDL_RenderPresent(renderer);
+        framePresented = true;
         if (statistics) {
             statistics->recordPresented(
                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3078,6 +3149,7 @@ struct VideoRenderer::Impl {
     std::condition_variable initializationCondition;
     bool initializationComplete = false;
     std::string initializationError;
+    std::string placementError;
     std::mutex frameMutex;
     std::condition_variable frameCondition;
     std::condition_variable inputCondition;
@@ -3106,6 +3178,9 @@ struct VideoRenderer::Impl {
     bool windowHidden = false;
     bool presentationErrorReported = false;
     bool presentationReported = false;
+    bool framePresented = false;
+    bool workspacePlacementReady = true;
+    std::optional<std::chrono::steady_clock::time_point> workspacePlacementDeadline;
     bool overlayDisabled = false;
     bool overlayVisible = false;
     std::atomic_bool recoveryRequested{false};
@@ -3238,3 +3313,13 @@ void VideoRenderer::setGamepadLed(std::uint16_t, std::uint8_t, std::uint8_t, std
 }  // namespace terra
 
 #endif
+
+namespace terra {
+std::optional<std::string> VideoRenderer::recoveryError() const {
+#if defined(__linux__) && defined(TERRA_HAS_LINUX_VIDEO)
+    std::scoped_lock lock{impl_->initializationMutex};
+    if (!impl_->placementError.empty()) return impl_->placementError;
+#endif
+    return std::nullopt;
+}
+}

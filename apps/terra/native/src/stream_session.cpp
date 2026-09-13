@@ -568,6 +568,10 @@ void StreamSession::createVideoRendererLocked() {
 }
 
 bool StreamSession::recoverVideoRendererLocked(std::string& error) {
+    if (const auto failure = video_->recoveryError()) {
+        error = *failure;
+        return false;
+    }
     if (negotiatedVideoFormat_ == 0 || negotiatedWidth_ <= 0 || negotiatedHeight_ <= 0 ||
         negotiatedFrameRate_ <= 0) {
         error = "Video format is no longer configured.";

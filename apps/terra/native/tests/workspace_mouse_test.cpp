@@ -32,6 +32,22 @@ void roundTrip(const std::vector<terra::WorkspaceMouseDisplay>& displays,
 }  // namespace
 
 int main() {
+    const terra::MouseRectangle assigned{-1920, 0, 1920, 1080};
+    std::vector<terra::MouseRectangle> outputs{{0, 0, 2560, 1440}, assigned};
+    expect(terra::workspaceDisplayIndex(outputs, assigned) == 1, "Assigned output was not resolved.");
+    std::reverse(outputs.begin(), outputs.end());
+    expect(terra::workspaceDisplayIndex(outputs, assigned) == 0,
+           "Worker reused an output index from a different enumeration order.");
+    expect(!terra::workspaceDisplayIndex(outputs, {3000, 0, 1920, 1080}),
+           "Missing assigned output silently fell back to another monitor.");
+    outputs.push_back(assigned);
+    expect(!terra::workspaceDisplayIndex(outputs, assigned), "Ambiguous output bounds were accepted.");
+    expect(terra::workspaceWindowMatches(assigned, assigned, 1920, 1080), "Matching placement was rejected.");
+    expect(!terra::workspaceWindowMatches(assigned, {0, 0, 1920, 1080}, 1920, 1080),
+           "A same-size window on the wrong monitor enabled mapped input.");
+    expect(!terra::workspaceWindowMatches(assigned, assigned, 1280, 720),
+           "An unsettled window size enabled mapped input.");
+
     expect(terra::workspaceMouseBlocker(true, 2, 2, true, true) == nullptr,
            "Eligible workspace mouse routing was disabled.");
     expect(terra::workspaceMouseBlocker(true, 3, 3, true, true) == nullptr,

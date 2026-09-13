@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace terra {
@@ -30,6 +31,26 @@ struct MouseRectangle {
     int height = 0;
     bool operator==(const MouseRectangle&) const = default;
 };
+
+/** @brief Resolve an assigned output across independently enumerated worker processes. */
+inline std::optional<int> workspaceDisplayIndex(std::span<const MouseRectangle> outputs,
+                                              const MouseRectangle& assigned) {
+    if (assigned.width <= 0 || assigned.height <= 0) return std::nullopt;
+    std::optional<int> result;
+    for (std::size_t index = 0; index < outputs.size(); ++index) {
+        if (outputs[index] != assigned) continue;
+        if (result) return std::nullopt;
+        result = static_cast<int>(index);
+    }
+    return result;
+}
+
+/** @brief Require a fullscreen surface to match the output used by its mouse map. */
+inline bool workspaceWindowMatches(const MouseRectangle& assigned, const MouseRectangle& actual,
+                                   int width, int height) {
+    return assigned.width > 0 && assigned.height > 0 && assigned == actual &&
+           width == assigned.width && height == assigned.height;
+}
 
 /** @brief Fullscreen local output paired with its remote workspace display. */
 struct WorkspaceMouseDisplay {

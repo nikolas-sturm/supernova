@@ -62,6 +62,16 @@ share SDL's queue to preserve modifier/button ordering. Multi-seat Wayland confi
 rejected explicitly rather than selecting an ambiguous pointer. Compositor-specific cross-output
 behavior still needs live validation.
 
+On Wayland, Terra enters fullscreen after the window has been shown and requests the assigned
+`wl_output` explicitly after its first presented buffer. Output selection uses xdg-output logical
+bounds, without rewriting SDL's cached window coordinates. This targeting requires SDL 2.0.18+
+and the compositor's xdg-output interface. Input stays disabled while initial placement settles;
+startup output notifications are not treated as mid-session topology changes. Each worker resolves
+its target from the assigned output bounds rather than trusting another process's SDL index order.
+If the compositor does not place the window on that output, Terra reports a placement error instead
+of accepting input with the wrong map. Compositor window rules can affect placement. Moving an
+established workspace stream to a different output still requires reconnecting with a fresh map.
+
 For intermittent crossing problems, Windows emits bounded `terra-mouse` drag summaries
 (foreground/capture ownership, crossing, delivered movement count and longest event gap).
 Wayland logs native workspace pointer activation. Workspace workers on both platforms emit

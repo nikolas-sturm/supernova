@@ -2904,8 +2904,7 @@ struct InputForwarder::Impl {
         SDL_GetWindowSize(window, &width, &height);
         SDL_Rect display{};
         if (SDL_GetDisplayBounds(SDL_GetWindowDisplayIndex(window), &display) != 0 ||
-            display.x != local.x || display.y != local.y || display.w != local.width ||
-            display.h != local.height || width != local.width || height != local.height) return false;
+            !workspaceWindowMatches(local, {display.x, display.y, display.w, display.h}, width, height)) return false;
         const auto position = workspaceMousePosition(settings.workspaceMouse, local.x + x, local.y + y);
         if (!position) return false;
         const int result = LiSendMousePositionEvent(position->x, position->y,
@@ -3192,6 +3191,7 @@ void InputForwarder::setEnabled(bool enabled) {
         }
     } else {
         impl_->enabled = true;
+        impl_->windowFocused = (SDL_GetWindowFlags(impl_->window) & SDL_WINDOW_INPUT_FOCUS) != 0;
         impl_->controllerSuppressed = !impl_->backgroundControllerEvents &&
                                       (SDL_GetWindowFlags(impl_->window) &
                                        SDL_WINDOW_INPUT_FOCUS) == 0;
