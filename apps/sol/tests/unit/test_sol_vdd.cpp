@@ -10,9 +10,9 @@
 #include <cstring>
 
 // local includes
-#include <src/terra_virtual_display.h>
-#include <src/platform/windows/terra_virtual_display_provider.h>
 #include <src/platform/windows/sol_vdd.h>
+#include <src/platform/windows/terra_virtual_display_provider.h>
+#include <src/terra_virtual_display.h>
 
 #ifdef _WIN32
 namespace {
@@ -229,6 +229,96 @@ TEST(SolVddTest, DISABLED_ProductionProviderMultiDisplayRoundTripRestoresEmptyTo
   }
   const auto inventory = sol_vdd::display_inventory();
   cleanup_succeeded = cleanup_succeeded && inventory && inventory->empty();
+  if (cleanup_succeeded) {
+    std::filesystem::remove(persistence_path, error);
+  }
+}
+
+TEST(SolVddTest, DISABLED_ProductionProviderExclusiveTopologyPreservesUnrelatedConnectors) {
+  if (!terra::windows::virtual_display::available()) {
+    GTEST_SKIP() << "SolVDD provider unavailable";
+  }
+  const std::filesystem::path persistence_path = std::filesystem::path {SOL_TEST_BIN_DIR} / "solvdd-exclusive-live-test.json";
+  std::error_code error;
+  std::filesystem::remove(persistence_path, error);
+  terra_virtual_display::manager_t manager {terra::windows::virtual_display::make_callbacks(persistence_path)};
+  ASSERT_TRUE(manager.available());
+
+  std::vector<terra_virtual_display::resource_t> resources;
+  const auto primary = manager.create("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", {
+                                                                                 "Primary workspace live test",
+                                                                                 {2560, 1440, 200, 1, 8, false},
+                                                                                 {0, 0},
+                                                                                 1.0,
+                                                                                 0,
+                                                                                 true,
+                                                                                 false,
+                                                                                 false,
+                                                                                 std::nullopt,
+                                                                               });
+  EXPECT_EQ(primary.status, terra_virtual_display::status_t::success);
+  if (primary.resource) {
+    resources.push_back(*primary.resource);
+  }
+  const auto secondary = manager.create("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", {
+                                                                                   "Secondary workspace live test",
+                                                                                   {1920, 1080, 60, 1, 8, false},
+                                                                                   {2560, 0},
+                                                                                   1.0,
+                                                                                   0,
+                                                                                   false,
+                                                                                   false,
+                                                                                   false,
+                                                                                   std::nullopt,
+                                                                                 });
+  EXPECT_EQ(secondary.status, terra_virtual_display::status_t::success);
+  if (secondary.resource) {
+    resources.push_back(*secondary.resource);
+  }
+  const auto unrelated = manager.create("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", {
+                                                                                   "Unrelated live test",
+                                                                                   {1920, 1080, 60, 1, 8, false},
+                                                                                   {4480, 0},
+                                                                                   1.0,
+                                                                                   0,
+                                                                                   false,
+                                                                                   false,
+                                                                                   false,
+                                                                                   std::nullopt,
+                                                                                 });
+  EXPECT_EQ(unrelated.status, terra_virtual_display::status_t::success);
+  if (unrelated.resource) {
+    resources.push_back(*unrelated.resource);
+  }
+
+  bool activated = false;
+  if (primary.resource && secondary.resource && unrelated.resource) {
+    const std::vector workspace_displays {*primary.resource, *secondary.resource};
+    activated = terra::windows::virtual_display::activate_exclusive(workspace_displays);
+    EXPECT_TRUE(activated);
+    const auto topology = sol_vdd::query_topology();
+    EXPECT_TRUE(topology);
+    if (topology) {
+      EXPECT_EQ(topology->size(), 3);
+      EXPECT_TRUE(std::ranges::contains(*topology, unrelated.resource->slot, &sol_vdd::connector_t::slot));
+    }
+  }
+  EXPECT_TRUE(terra::windows::virtual_display::restore_exclusive());
+
+  bool cleanup_succeeded = true;
+  for (auto resource = resources.rbegin(); resource != resources.rend(); ++resource) {
+    auto current = manager.get(resource->id);
+    if (current && current->state == terra_virtual_display::state_t::attached) {
+      current = manager.detach(current->id, current->revision).resource;
+    }
+    if (!current || manager.remove(current->id, current->revision).status != terra_virtual_display::status_t::success) {
+      ADD_FAILURE() << "Failed to remove live connector " << resource->id;
+      cleanup_succeeded = false;
+    }
+  }
+  const auto inventory = sol_vdd::display_inventory();
+  cleanup_succeeded = cleanup_succeeded && inventory && inventory->empty();
+  EXPECT_TRUE(cleanup_succeeded);
   if (cleanup_succeeded) {
     std::filesystem::remove(persistence_path, error);
   }

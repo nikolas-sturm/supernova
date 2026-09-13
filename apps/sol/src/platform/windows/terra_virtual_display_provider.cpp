@@ -320,6 +320,9 @@ namespace terra::windows::virtual_display {
       }
     }
 
+    /** @brief Apply Windows settings without changing the driver connector inventory. */
+    bool configure_windows(std::vector<configuration_t> &configurations, display_device::WinDisplayDevice &display_api, const std::map<std::string, std::string, std::less<>> &platform_to_device);
+
     /**
      * @brief Apply and verify complete managed virtual-display configuration.
      *
@@ -400,6 +403,15 @@ namespace terra::windows::virtual_display {
         platform_to_device.emplace(configuration.platform_id, *id);
       }
 
+      return configure_windows(configurations, display_api, platform_to_device);
+    }
+
+    /** @brief Activate, configure, and verify Windows paths for existing connectors. */
+    bool configure_windows(std::vector<configuration_t> &configurations, display_device::WinDisplayDevice &display_api, const std::map<std::string, std::string, std::less<>> &platform_to_device) {
+      display_device::StringSet requested_devices;
+      for (const auto &[platform, id] : platform_to_device) {
+        requested_devices.insert(id);
+      }
       auto topology = display_api.getCurrentTopology();
       for (const auto &id : requested_devices) {
         const bool active = std::ranges::any_of(topology, [&](const auto &group) {
@@ -506,9 +518,7 @@ namespace terra::windows::virtual_display {
     }
     auto api_layer = std::make_shared<display_device::WinApiLayer>();
     display_device::WinDisplayDevice display_api {api_layer};
-    return display_api.isApiAccessAvailable() && std::ranges::all_of(*inventory, [&](const auto &connector) {
-             return device_id(*api_layer, connector.id).has_value();
-           });
+    return display_api.isApiAccessAvailable();
   }
 
   bool activate_exclusive(const std::vector<terra_virtual_display::resource_t> &displays) {
@@ -529,33 +539,32 @@ namespace terra::windows::virtual_display {
     display_device::WinDisplayDevice display_api {api_layer};
     display_device::ActiveTopology topology;
     display_device::StringSet expected;
-    std::vector<configuration_t> configurations;
-    configurations.reserve(displays.size());
+    std::map<std::string, std::string, std::less<>> platform_to_device;
     for (const auto &display : displays) {
       const auto id = wait_device_id(*api_layer, display.platform_id);
       if (!id || !expected.emplace(*id).second) {
+        BOOST_LOG(error) << "Terra SolVDD: exclusive connector correlation failed for " << display.platform_id;
         static_cast<void>(restore_rollback(*exclusive_rollback));
         return false;
       }
       topology.push_back({*id});
-      configurations.push_back({
-        display.slot,
-        display.platform_id,
-        {
-          display.name,
-          display.requested_mode,
-          display.position,
-          display.scale,
-          display.rotation,
-          display.primary,
-          display.hdr,
-          display.persistent,
-          display.workspace_id,
-        },
-        display.actual_mode,
-      });
+      platform_to_device.emplace(display.platform_id, *id);
     }
-    if (!display_api.isApiAccessAvailable() || !display_api.isTopologyValid(topology) || !display_api.setTopology(topology) || !apply(configurations)) {
+    if (!display_api.isApiAccessAvailable() || !display_api.isTopologyValid(topology) || !display_api.setTopology(topology)) {
+      BOOST_LOG(error) << "Terra SolVDD: exclusive topology activation failed";
+      static_cast<void>(restore_rollback(*exclusive_rollback));
+      return false;
+    }
+    // Windows may load different saved modes when switching to a subset topology.
+    // Reapply settings only; apply() would delete unrelated driver connectors.
+    std::vector<configuration_t> configurations;
+    for (const auto &display : displays) {
+      configurations.push_back({display.slot, display.platform_id,
+                               {display.name, display.requested_mode, display.position, display.scale, display.rotation, display.primary, display.hdr, display.persistent, display.workspace_id},
+                               display.actual_mode});
+    }
+    if (!configure_windows(configurations, display_api, platform_to_device)) {
+      BOOST_LOG(error) << "Terra SolVDD: exclusive Windows settings application failed";
       static_cast<void>(restore_rollback(*exclusive_rollback));
       return false;
     }
@@ -564,8 +573,26 @@ namespace terra::windows::virtual_display {
       active.insert(group.begin(), group.end());
     }
     if (active != expected) {
+      BOOST_LOG(error) << "Terra SolVDD: exclusive topology differs from requested displays";
       static_cast<void>(restore_rollback(*exclusive_rollback));
       return false;
+    }
+    const auto snapshots = display::enumerate_snapshot({}, display_api.enumAvailableDevices());
+    for (const auto &display : displays) {
+      const auto &id = platform_to_device.at(display.platform_id);
+      const auto snapshot = std::ranges::find(snapshots, id, &display::Snapshot::device_id);
+      const auto refresh = display::make_rational(display.requested_mode.refresh_numerator, display.requested_mode.refresh_denominator);
+      if (snapshot == snapshots.end() || !snapshot->enabled || !snapshot->current_mode || !refresh || snapshot->scale != display::Rational {1, 1} || snapshot->position != display::Position {display.position.x, display.position.y} || snapshot->primary != display.primary || snapshot->hdr_enabled.value_or(false) != display.hdr || snapshot->current_mode->size != display::Size {static_cast<std::uint32_t>(display.requested_mode.width), static_cast<std::uint32_t>(display.requested_mode.height)} || snapshot->current_mode->refresh != *refresh || snapshot->current_mode->bit_depth != static_cast<std::uint32_t>(display.requested_mode.bit_depth) || snapshot->current_mode->hdr != display.requested_mode.hdr) {
+        BOOST_LOG(error) << "Terra SolVDD: exclusive display state differs for " << display.platform_id;
+        if (snapshot != snapshots.end()) {
+          BOOST_LOG(error) << "Terra SolVDD: exclusive snapshot enabled=" << snapshot->enabled << " mode=" << snapshot->current_mode.has_value() << " scale=" << snapshot->scale.numerator << "/" << snapshot->scale.denominator << " position=" << snapshot->position.x << "," << snapshot->position.y << " primary=" << snapshot->primary << " hdr=" << snapshot->hdr_enabled.value_or(false) << " expected_position=" << display.position.x << "," << display.position.y << " expected_primary=" << display.primary << " expected_hdr=" << display.hdr;
+          if (snapshot->current_mode) {
+            BOOST_LOG(error) << "Terra SolVDD: exclusive mode actual=" << snapshot->current_mode->size.width << "x" << snapshot->current_mode->size.height << "@" << snapshot->current_mode->refresh.numerator << "/" << snapshot->current_mode->refresh.denominator << ":" << snapshot->current_mode->bit_depth << ":" << snapshot->current_mode->hdr << " expected=" << display.requested_mode.width << "x" << display.requested_mode.height << "@" << display.requested_mode.refresh_numerator << "/" << display.requested_mode.refresh_denominator << ":" << display.requested_mode.bit_depth << ":" << display.requested_mode.hdr;
+          }
+        }
+        static_cast<void>(restore_rollback(*exclusive_rollback));
+        return false;
+      }
     }
     return true;
   }

@@ -126,10 +126,12 @@ namespace input {
    *
    * @param mail Mailbox used to exchange messages with worker threads.
    * @param session_id Stable paired-client identity shared by launch and resume connections.
-   * @param permissions Input classes permitted for this paired client.
+    * @param permissions Input classes permitted for this paired client.
+    * @param mouse_mode Mouse input policy for this stream.
+    * @param display_id Stable display identity separating concurrent stream viewports.
    * @return Shared input state bound to the stream mailbox.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, terra_api::input_permissions_t permissions = {}, mouse_mode_e mouse_mode = mouse_mode_e::any);
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, terra_api::input_permissions_t permissions = {}, mouse_mode_e mouse_mode = mouse_mode_e::any, std::string display_id = {});
 
 #ifdef SOL_TESTS
   namespace testing {

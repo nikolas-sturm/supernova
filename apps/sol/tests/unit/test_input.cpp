@@ -271,6 +271,22 @@ TEST_F(InputGamepadSessionTest, EnforcesCertificateBoundInputClassesAtQueueIngre
   input::terminate_gamepads("restricted-input-client");
 }
 
+TEST_F(InputGamepadSessionTest, IsolatesDisplayStreamsAndRevokesAllClientDisplays) {
+  ASSERT_FALSE(task_pool.running());
+  const auto first = input::alloc(std::make_shared<safe::mail_raw_t>(), "multi-display-client", {}, input::mouse_mode_e::any, "display-a");
+  const auto second = input::alloc(std::make_shared<safe::mail_raw_t>(), "multi-display-client", {}, input::mouse_mode_e::any, "display-b");
+  const auto other = input::alloc(std::make_shared<safe::mail_raw_t>(), "other-client", {}, input::mouse_mode_e::any, "display-a");
+  EXPECT_NE(first, second);
+  EXPECT_NE(first, other);
+  EXPECT_EQ(first, input::alloc(std::make_shared<safe::mail_raw_t>(), "multi-display-client", {}, input::mouse_mode_e::any, "display-a"));
+  EXPECT_EQ(second, input::alloc(std::make_shared<safe::mail_raw_t>(), "multi-display-client", {}, input::mouse_mode_e::any, "display-b"));
+
+  input::terminate_gamepads("multi-display-client");
+  EXPECT_NE(first, input::alloc(std::make_shared<safe::mail_raw_t>(), "multi-display-client", {}, input::mouse_mode_e::any, "display-a"));
+  EXPECT_NE(second, input::alloc(std::make_shared<safe::mail_raw_t>(), "multi-display-client", {}, input::mouse_mode_e::any, "display-b"));
+  EXPECT_EQ(other, input::alloc(std::make_shared<safe::mail_raw_t>(), "other-client", {}, input::mouse_mode_e::any, "display-a"));
+}
+
 TEST_F(InputGamepadSessionTest, ReplacesInputPermissionsWhenSessionResumes) {
   ASSERT_FALSE(task_pool.running());
   terra_api::input_permissions_t restricted_permissions;

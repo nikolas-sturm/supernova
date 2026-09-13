@@ -2220,6 +2220,13 @@ namespace nvhttp {
           workspace_displays.push_back(*display);
         }
         if (workspace_displays.size() != terra_workspace->display_ids.size() || !terra::windows::virtual_display::activate_exclusive(workspace_displays)) {
+          if (!terra::windows::virtual_display::restore_exclusive()) {
+            BOOST_LOG(error) << "Terra SolVDD: failed to restore display topology after workspace launch failure";
+          }
+          const auto current_workspace = terra_workspace_manager ? terra_workspace_manager->get(terra_workspace->id) : std::nullopt;
+          if (!current_workspace || terra_workspace_manager->stop(current_workspace->id, current_workspace->revision, true).status != terra_workspaces::status_t::success) {
+            BOOST_LOG(error) << "Terra SolVDD: failed to clean workspace resources after exclusive-topology activation failure";
+          }
           tree.put("root.<xmlattr>.status_code", 503);
           tree.put("root.<xmlattr>.status_message", "Exclusive virtual display topology could not be activated");
           tree.put("root.gamesession", 0);

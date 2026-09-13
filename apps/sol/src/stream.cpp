@@ -2517,7 +2517,7 @@ namespace stream {
      * @brief Start the audio, video, and control workers for a streaming session.
      */
     int start(session_t &session, const std::string &addr_string) {
-      session.input = input::alloc(session.mail, session.input_session_id, session.input_permissions, session.profile_mouse_mode);
+      session.input = input::alloc(session.mail, session.input_session_id, session.input_permissions, session.profile_mouse_mode, session.display_id);
 
       session.broadcast_ref = broadcast.ref();
       if (!session.broadcast_ref) {

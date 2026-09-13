@@ -22,6 +22,7 @@ extern "C" {
 #include <string>
 #include <string_view>
 #include <thread>
+#include <map>
 #include <unordered_map>
 
 // lib includes
@@ -317,35 +318,16 @@ namespace input {
     int32_t accumulated_hscroll_delta;  ///< Accumulated hscroll delta.
   };
 
-  /**
-   * @brief Hash string-like session identifiers without allocating temporary strings.
-   */
-  struct transparent_string_hash_t {
-    using is_transparent = void;  ///< Enable heterogeneous unordered-map lookup.
-
-    /**
-     * @brief Hash a string view.
-     *
-     * @param value Session identifier to hash.
-     * @return Hash value for the supplied identifier.
-     */
-    std::size_t operator()(const std::string_view value) const noexcept {
-      return std::hash<std::string_view> {}(value);
-    }
-  };
-
-  using retained_input_map_t = std::unordered_map<
-    std::string,
-    std::shared_ptr<input_t>,
-    transparent_string_hash_t,
-    std::equal_to<>>;  ///< Retained inputs keyed by paired-client identity.
+  using retained_input_map_t = std::map<
+    std::pair<std::string, std::string>,
+    std::shared_ptr<input_t>>;  ///< Retained inputs keyed by paired-client and display identities.
 
   /**
    * @brief Synchronized storage for retained input sessions.
    */
   struct retained_input_state_t {
     std::mutex mutex;  ///< Synchronizes retained session access across transport threads.
-    retained_input_map_t inputs;  ///< Paused input sessions keyed by paired-client identity.
+    retained_input_map_t inputs;  ///< Retained input sessions keyed by paired-client and display identities.
   };
 
   /**
@@ -2345,21 +2327,22 @@ namespace input {
   }
 
   void terminate_gamepads(const std::string_view session_id) {
-    std::shared_ptr<input_t> input;
+    retained_input_map_t inputs;
     {
       auto &state = retained_input_state();
       std::lock_guard lock {state.mutex};
-      const auto iter = state.inputs.find(session_id);
-      if (iter == state.inputs.end()) {
-        return;
+      for (auto iter = state.inputs.begin(); iter != state.inputs.end();) {
+        if (iter->first.first == session_id) {
+          auto removed = iter++;
+          inputs.insert(state.inputs.extract(removed));
+        } else {
+          ++iter;
+        }
       }
-
-      input = std::move(iter->second);
-      state.inputs.erase(iter);
     }
 
-    dispatch_input_task([input = std::move(input)]() {
-      destroy_gamepads(input);
+    dispatch_input_task([inputs = std::move(inputs)]() {
+      destroy_gamepads(inputs);
     });
   }
 
@@ -2419,13 +2402,14 @@ namespace input {
   /**
    * @brief Allocate and initialize platform input state for a stream.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, const terra_api::input_permissions_t permissions, const mouse_mode_e mouse_mode) {
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, const terra_api::input_permissions_t permissions, const mouse_mode_e mouse_mode, std::string display_id) {
+    const auto key = std::make_pair(std::move(session_id), std::move(display_id));
     std::shared_ptr<input_t> input;
     bool resumed = false;
     {
       auto &state = retained_input_state();
       std::lock_guard lock {state.mutex};
-      const auto iter = state.inputs.find(session_id);
+      const auto iter = state.inputs.find(key);
       if (iter != state.inputs.end()) {
         input = iter->second;
         resumed = true;
@@ -2436,7 +2420,7 @@ namespace input {
           permissions,
           mouse_mode
         );
-        state.inputs.try_emplace(std::move(session_id), input);
+        state.inputs.try_emplace(key, input);
       }
     }
 
