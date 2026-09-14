@@ -753,6 +753,28 @@ int main() {
     expect(ignoredOverlayOpens == 0, "Stream overlay opened without captured input.");
     input.stop();
     {
+        settings.hostCursor = true;
+        input.start(window, settings, 1920, 1080, 60, {}, {},
+                    [&](std::uint64_t, bool) { ++ignoredOverlayOpens; });
+        input.setEnabled(true);
+        expect(SDL_ShowCursor(SDL_QUERY) == SDL_DISABLE,
+               "Host-cursor mode did not hide the local cursor.");
+        event = {};
+        event.type = SDL_KEYDOWN;
+        event.key.windowID = SDL_GetWindowID(window);
+        event.key.state = SDL_PRESSED;
+        event.key.keysym.scancode = SDL_SCANCODE_C;
+        event.key.keysym.mod = static_cast<SDL_Keymod>(KMOD_LCTRL | KMOD_LALT | KMOD_LSHIFT);
+        input.handleEvent(event);
+        event.type = SDL_KEYUP;
+        event.key.state = SDL_RELEASED;
+        input.handleEvent(event);
+        expect(SDL_ShowCursor(SDL_QUERY) == SDL_ENABLE,
+               "Local cursor shortcut did not restore the host-cursor local fallback.");
+        input.stop();
+        settings.hostCursor = false;
+    }
+    {
         SDL_Rect display{};
         expect(SDL_GetDisplayBounds(0, &display) == 0, "No SDL display bounds for workspace test.");
         SDL_SetWindowPosition(window, display.x, display.y);

@@ -291,6 +291,7 @@ terra::StreamSettings parseStreamSettings(const Json& value) {
     settings.enableHdr = value.at("enableHdr").get<bool>();
     settings.enableYuv444 = value.at("enableYuv444").get<bool>();
     settings.input.absoluteMouseMode = value.at("absoluteMouseMode").get<bool>();
+    settings.input.hostCursor = value.value("hostCursor", false);
     const auto captureSystemKeys = value.at("captureSystemKeys").get<std::string>();
     if (captureSystemKeys == "fullscreen") {
         settings.input.captureSystemKeys = terra::SystemKeyCapture::fullscreen;

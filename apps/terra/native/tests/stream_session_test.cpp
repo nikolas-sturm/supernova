@@ -576,6 +576,7 @@ int main(int argc, char** argv) {
         auto config = testConfig();
         config.audioEnabled = false;
         config.controllerEnabled = false;
+        config.settings.input.hostCursor = true;
         config.settings.input.workspaceMouse = {
             {{0, 0, 1920, 1080}, {0, 0, 1920, 1080}},
             {{-2560, 0, 2560, 1440}, {-3840, 0, 3840, 2160}},
@@ -585,6 +586,8 @@ int main(int argc, char** argv) {
         const auto parsed = terra::parseStreamWorkerConfig(terra::streamWorkerConfigJson(config));
         expect(!parsed.audioEnabled && !parsed.controllerEnabled,
                "Worker role flags did not survive serialization.");
+        expect(parsed.settings.input.hostCursor == config.settings.input.hostCursor,
+               "Worker host-cursor flag did not survive serialization.");
         expect(parsed.settings.input.workspaceMouse == config.settings.input.workspaceMouse,
                "Worker workspace mouse map did not survive serialization.");
         expect(parsed.launch.logicalSessionId == config.launch.logicalSessionId &&

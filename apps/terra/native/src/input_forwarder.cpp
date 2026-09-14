@@ -1149,6 +1149,9 @@ void InputForwarder::start(HWND window, InputSettings settings, int width, int h
     if (impl_->window) throw std::runtime_error("Input forwarding is already active");
     impl_->window = window;
     impl_->settings = settings;
+    // A host-rendered cursor already draws the pointer in the stream; hide
+    // the local cursor so it is not duplicated.
+    impl_->localCursorVisible = !settings.hostCursor;
     impl_->toggleStatistics = std::move(toggleStatistics);
     impl_->toggleFullscreen = std::move(toggleFullscreen);
     impl_->overlayListener = std::move(overlayListener);
@@ -3145,9 +3148,11 @@ void InputForwarder::start(SDL_Window* window, InputSettings settings, int width
     impl_->restoreRelativeCapture = overlayState.captureSuspended && !settings.absoluteMouseMode;
     impl_->restoreAbsoluteCapture = overlayState.captureSuspended && settings.absoluteMouseMode;
     impl_->windowFocused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
-    impl_->localCursorVisible = true;
+    impl_->localCursorVisible = !settings.hostCursor;
     if (settings.absoluteMouseMode) {
-        SDL_ShowCursor(SDL_ENABLE);
+        // With a host-rendered cursor the streamed frames already carry the
+        // pointer; showing the local cursor would duplicate it.
+        SDL_ShowCursor(settings.hostCursor ? SDL_DISABLE : SDL_ENABLE);
     }
     impl_->streamWidth = std::max(width, 1);
     impl_->streamHeight = std::max(height, 1);

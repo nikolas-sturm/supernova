@@ -105,6 +105,28 @@ describe('App', () => {
     expect(screen.getByText('Frame pacing').closest('label')).toHaveClass(/settingDisabled/)
   })
 
+  it('enables the host cursor for absolute sessions and reverts it with the input mode', async () => {
+    render(<App />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stream Settings' }))
+    expect(screen.queryByText('Render the host cursor in the stream')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('Optimize mouse for remote desktop instead of games'))
+    fireEvent.click(screen.getByText('Render the host cursor in the stream'))
+
+    expect(useClientStore.getState().settingsByMode.gaming).toMatchObject({
+      absoluteMouseMode: true,
+      hostCursor: true,
+    })
+
+    fireEvent.click(screen.getByText('Optimize mouse for remote desktop instead of games'))
+    expect(useClientStore.getState().settingsByMode.gaming).toMatchObject({
+      absoluteMouseMode: false,
+      hostCursor: false,
+    })
+    expect(screen.queryByText('Render the host cursor in the stream')).not.toBeInTheDocument()
+  })
+
   it('swaps complete app modes from synchronized controls', () => {
     render(<App />)
 

@@ -57,6 +57,7 @@ constexpr int audioChannelCount(AudioConfig config) noexcept {
 
 struct InputSettings {
     bool absoluteMouseMode = false;
+    bool hostCursor = false;
     SystemKeyCapture captureSystemKeys = SystemKeyCapture::off;
     bool fullscreen = false;
     bool touchscreenTrackpad = true;

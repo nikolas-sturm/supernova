@@ -522,8 +522,22 @@ export function SettingsView({ section = 'profile' }: { section?: 'profile' | 'g
                 label="Optimize mouse for remote desktop instead of games"
                 note="Applied when the next stream starts; uses absolute positioning without capture"
                 checked={settings.absoluteMouseMode}
-                onChange={(absoluteMouseMode) => update({ absoluteMouseMode })}
+                onChange={(absoluteMouseMode) =>
+                  update(
+                    absoluteMouseMode
+                      ? { absoluteMouseMode }
+                      : { absoluteMouseMode, hostCursor: false },
+                  )
+                }
               />
+              {settings.absoluteMouseMode && (
+                <Toggle
+                  label="Render the host cursor in the stream"
+                  note="Shows the host's native pointer instead of the local cursor; adds stream latency to cursor motion"
+                  checked={settings.hostCursor}
+                  onChange={(hostCursor) => update({ hostCursor })}
+                />
+              )}
               <Toggle
                 label="Use touchscreen as a virtual trackpad"
                 note="Turn off to send direct Sol touch and pen input"
