@@ -535,6 +535,18 @@ namespace platf {
   }
 
   /**
+   * @brief Hide or restore the host pointer cursor.
+   *
+   * @param hidden True to hide the host cursor, false to restore it.
+   */
+  void set_host_cursor_hidden(bool hidden) {
+    // Linux capture backends composite the cursor themselves and honor the
+    // per-session cursor visibility flag, so the host cursor needs no
+    // separate hiding.
+    static_cast<void>(hidden);
+  }
+
+  /**
    * @brief Apply Linux platform state before streaming starts.
    */
   void streaming_will_start() {

@@ -17,13 +17,13 @@ extern "C" {
 #include <cstring>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <map>
 #include <unordered_map>
 
 // lib includes
@@ -438,6 +438,7 @@ namespace input {
     switch (keyCode) {
       case 0x4E /* VKEY_N */:
         display_cursor = !display_cursor;
+        platf::set_host_cursor_hidden(!display_cursor);
         return 1;
     }
 
@@ -873,13 +874,11 @@ namespace input {
       }
       const auto &source = input->mouse_viewports.front();
       // Fail closed after a capture mode change; the client must rebuild its topology map.
-      if (std::abs((touch_port.width - 2 * touch_port.client_offsetX) * touch_port.scalar_inv - source.width) > 1 ||
-          std::abs((touch_port.height - 2 * touch_port.client_offsetY) * touch_port.scalar_inv - source.height) > 1) {
+      if (std::abs((touch_port.width - 2 * touch_port.client_offsetX) * touch_port.scalar_inv - source.width) > 1 || std::abs((touch_port.height - 2 * touch_port.client_offsetY) * touch_port.scalar_inv - source.height) > 1) {
         reject(4, "capture dimensions no longer match the mouse map");
         return;
       }
-      tpcoords = std::pair {touch_port.offset_x + relative->first / touch_port.scalar_tpcoords,
-                           touch_port.offset_y + relative->second / touch_port.scalar_tpcoords};
+      tpcoords = std::pair {touch_port.offset_x + relative->first / touch_port.scalar_tpcoords, touch_port.offset_y + relative->second / touch_port.scalar_tpcoords};
     }
 
     int touch_port_dim_x;
@@ -914,8 +913,7 @@ namespace input {
     }
 
     auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
-    if (!release && !input->mouse_viewports.empty() &&
-        input->mouse_viewports.front().generation != workspace_mouse_generation()) {
+    if (!release && !input->mouse_viewports.empty() && input->mouse_viewports.front().generation != workspace_mouse_generation()) {
       return;
     }
     auto button = util::endian::big(packet->button);

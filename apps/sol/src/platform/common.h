@@ -978,6 +978,20 @@ namespace platf {
 
   void enable_mouse_keys();
 
+  /**
+   * @brief Hide or restore the host pointer cursor.
+   *
+   * Streaming sessions that capture the cursor into the video feed leave the
+   * host cursor untouched. Sessions that render the pointer client-side
+   * instead must also hide the host cursor, because displays without a
+   * hardware cursor plane composite the pointer into the captured desktop
+   * image where it would duplicate the client cursor.
+   *
+   * @param hidden True to replace every system cursor with a blank one,
+   * false to reload the persisted system cursors.
+   */
+  void set_host_cursor_hidden(bool hidden);
+
   // Allow OS-specific actions to be taken to prepare for streaming
   void streaming_will_start();
   void streaming_will_stop();

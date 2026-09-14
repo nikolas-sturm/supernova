@@ -2,6 +2,10 @@
  * @file src/platform/windows/misc.cpp
  * @brief Miscellaneous definitions for Windows.
  */
+// Exposes the OCR_* system cursor identifiers used by SetSystemCursor();
+// must precede every include that can pull in Windows headers.
+#define OEMRESOURCE
+
 // standard includes
 #include <csignal>
 #include <filesystem>
@@ -1229,7 +1233,7 @@ namespace platf {
   void enable_mouse_keys() {
     // If there is no mouse connected, enable Mouse Keys to force the cursor to appear
     if (!GetSystemMetrics(SM_MOUSEPRESENT)) {
-      BOOST_LOG(info) << "A mouse was not detected. Sol will enable Mouse Keys while streaming to force the mouse cursor to appear.";
+      BOOST_LOG(info) << "A mouse was not detected. Sol will enable Mouse Keys while streaming to force the mouse cursor to appear."sv;
 
       // Get the current state of Mouse Keys so we can restore it when streaming is over
       previous_mouse_keys_state.cbSize = sizeof(previous_mouse_keys_state);
@@ -1252,6 +1256,73 @@ namespace platf {
         auto winerr = GetLastError();
         BOOST_LOG(warning) << "Unable to get current state of Mouse Keys: "sv << winerr;
       }
+    }
+  }
+
+  /**
+   * @brief Whether the host cursor is currently replaced with blank cursors.
+   */
+  bool host_cursor_hidden = false;
+
+  void set_host_cursor_hidden(bool hidden) {
+    if (host_cursor_hidden == hidden) {
+      return;
+    }
+
+    if (!hidden) {
+      host_cursor_hidden = false;
+      // Reload the system cursor table that SetSystemCursor() replaced.
+      if (!SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, 0)) {
+        auto winerr = GetLastError();
+        BOOST_LOG(warning) << "Unable to restore system cursors: "sv << winerr;
+      }
+      return;
+    }
+
+    // A fully transparent 1x1 monochrome cursor: the AND mask leaves the
+    // desktop pixel untouched and the XOR mask inverts nothing.
+    static const CHAR blank_and_mask[2] = {0x00, 0x00};
+    static const CHAR blank_xor_mask[2] = {0x00, 0x00};
+    const auto blank_cursor = CreateCursor(nullptr, 0, 0, 1, 1, blank_and_mask, blank_xor_mask);
+    if (!blank_cursor) {
+      auto winerr = GetLastError();
+      BOOST_LOG(warning) << "Unable to create a blank cursor: "sv << winerr;
+      return;
+    }
+
+    // SetSystemCursor() destroys the handle it receives, so every slot needs
+    // its own copy of the blank cursor.
+    static const int cursor_ids[] = {
+      OCR_NORMAL,
+      OCR_IBEAM,
+      OCR_WAIT,
+      OCR_CROSS,
+      OCR_UP,
+      OCR_SIZENWSE,
+      OCR_SIZENESW,
+      OCR_SIZEWE,
+      OCR_SIZENS,
+      OCR_SIZEALL,
+      OCR_NO,
+      OCR_HAND,
+      OCR_APPSTARTING,
+    };
+
+    bool replaced_any = false;
+    for (const auto cursor_id : cursor_ids) {
+      const auto cursor_copy = CopyCursor(blank_cursor);
+      if (!cursor_copy || !SetSystemCursor(cursor_copy, cursor_id)) {
+        auto winerr = GetLastError();
+        BOOST_LOG(warning) << "Unable to blank system cursor ["sv << cursor_id << "]: "sv << winerr;
+        continue;
+      }
+      replaced_any = true;
+    }
+    DestroyCursor(blank_cursor);
+
+    if (replaced_any) {
+      host_cursor_hidden = true;
+      BOOST_LOG(info) << "Sol hid the host cursor for a client-rendered pointer session."sv;
     }
   }
 
@@ -1286,6 +1357,10 @@ namespace platf {
         BOOST_LOG(warning) << "Unable to restore original state of Mouse Keys: "sv << winerr;
       }
     }
+
+    // Restore the host cursor in case the last session rendered its pointer
+    // client-side and blanked the system cursors.
+    set_host_cursor_hidden(false);
   }
 
   void restart_on_exit() {

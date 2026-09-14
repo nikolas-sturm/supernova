@@ -2432,6 +2432,7 @@ namespace nvhttp {
       return;
     }
     display_cursor = *capture_cursor;
+    platf::set_host_cursor_hidden(!display_cursor);
     if (terra_v1) {
       publish_terra_event({"session.created", launch_session->session_id, 1, std::move(created_resource)}, "session.control", client->uuid, {launch_session->app_uuid});
       session_event_lock.unlock();
@@ -2682,6 +2683,7 @@ namespace nvhttp {
       return;
     }
     display_cursor = *capture_cursor;
+    platf::set_host_cursor_hidden(!display_cursor);
     revert_display_configuration = false;
 
     tree.put("root.<xmlattr>.status_code", 200);
@@ -3903,8 +3905,7 @@ namespace nvhttp {
         return false;
       }
       if (session.workspace_mouse_requested) {
-        if (workspace->display_ids.size() < 2 || workspace->display_ids.size() > 4 ||
-            session.profile_mouse_mode == input::mouse_mode_e::relative) {
+        if (workspace->display_ids.size() < 2 || workspace->display_ids.size() > 4 || session.profile_mouse_mode == input::mouse_mode_e::relative) {
           error_message = "Workspace mouse input requires two to four absolute-mode displays";
           return false;
         }
@@ -3912,13 +3913,16 @@ namespace nvhttp {
         const auto mouse_generation = input::workspace_mouse_generation();
         for (const auto &display_id : workspace->display_ids) {
           const auto display = terra_virtual_display_manager->get(display_id);
-          if (!display || display->workspace_id != workspace->id || display->state != terra_virtual_display::state_t::attached ||
-              display->scale != 1.0 || display->rotation != 0) {
+          if (!display || display->workspace_id != workspace->id || display->state != terra_virtual_display::state_t::attached || display->scale != 1.0 || display->rotation != 0) {
             error_message = "Workspace mouse topology is unavailable or has unsupported host scaling or rotation";
             return false;
           }
           const input::mouse_viewport_t viewport {
-            display->position.x, display->position.y, display->actual_mode.width, display->actual_mode.height, mouse_generation
+            display->position.x,
+            display->position.y,
+            display->actual_mode.width,
+            display->actual_mode.height,
+            mouse_generation
           };
           if (display_id == session.display_id) {
             session.mouse_viewports.insert(session.mouse_viewports.begin(), viewport);
@@ -6974,7 +6978,7 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_bad_request, "invalid_argument", "Workspace start overrides are invalid or unsupported");
       return;
     }
-#ifdef _WIN32
+  #ifdef _WIN32
     if (start->virtual_displays && (!terra_virtual_display_manager || !terra_virtual_display_manager->available() || !std::ranges::all_of(*start->virtual_displays, [](const nlohmann::json &value) {
           const auto specification = terra_virtual_specification(value);
           return specification && specification->scale == 1.0 && !specification->workspace_id;
@@ -6982,7 +6986,7 @@ namespace nvhttp {
       send_terra_error(response, SimpleWeb::StatusCode::client_error_unprocessable_entity, "unsupported_configuration", "Workspace start virtual displays are invalid or unsupported");
       return;
     }
-#endif
+  #endif
     const auto operation_body = terra_operations::item_request_body(*body, id, *revision);
     if (!terra_workspace_mutation_preflight(response, *client, request, id, *revision, "workspace.start", operation_body)) {
       return;
@@ -9979,10 +9983,7 @@ namespace nvhttp {
     auto virtual_display_ready_promise = std::make_shared<std::promise<void>>();
     const auto virtual_display_ready = virtual_display_ready_promise->get_future().share();
     virtual_display_callbacks.changed = [virtual_display_ready](const std::optional<terra_virtual_display::resource_t> &previous, const std::optional<terra_virtual_display::resource_t> &current) {
-      if (!previous || !current || previous->position.x != current->position.x || previous->position.y != current->position.y ||
-          previous->actual_mode.width != current->actual_mode.width || previous->actual_mode.height != current->actual_mode.height ||
-          previous->scale != current->scale || previous->rotation != current->rotation || previous->state != current->state ||
-          previous->workspace_id != current->workspace_id) {
+      if (!previous || !current || previous->position.x != current->position.x || previous->position.y != current->position.y || previous->actual_mode.width != current->actual_mode.width || previous->actual_mode.height != current->actual_mode.height || previous->scale != current->scale || previous->rotation != current->rotation || previous->state != current->state || previous->workspace_id != current->workspace_id) {
         input::invalidate_workspace_mouse();
       }
       if (terra_operation_pool.running()) {
@@ -11165,6 +11166,8 @@ namespace nvhttp {
       BOOST_LOG(error) << "Terra SolVDD: failed to restore physical display topology during shutdown";
     }
 #endif
+    // Never leave the host without a cursor on the way out.
+    platf::set_host_cursor_hidden(false);
     {
       std::lock_guard stream_lock {terra_event_stream_mutex};
       terra_event_streams.clear();
@@ -11551,11 +11554,11 @@ namespace nvhttp {
       return terra_app_json(app);
     }
 
-#ifdef _WIN32
+  #ifdef _WIN32
     nlohmann::json topology_document(nlohmann::json displays) {
       return terra_topology_document(std::move(displays));
     }
-#endif
+  #endif
 
     std::vector<std::string> event_collections(const terra_api::client_permissions_t &permissions) {
       return terra_event_collections(permissions);
