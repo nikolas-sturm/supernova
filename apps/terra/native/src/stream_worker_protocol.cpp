@@ -45,7 +45,7 @@ nlohmann::json settingsJson(const StreamSettings &settings) {
       {"enableYuv444", settings.enableYuv444},
       {"input",
        {{"absoluteMouseMode", settings.input.absoluteMouseMode},
-        {"hostCursor", settings.input.hostCursor},
+        {"cursorMode", static_cast<int>(settings.input.cursorMode)},
         {"workspaceMouse", std::move(workspaceMouse)},
         {"captureSystemKeys",
          static_cast<int>(settings.input.captureSystemKeys)},
@@ -85,7 +85,10 @@ StreamSettings parseSettings(const nlohmann::json &value) {
   settings.enableYuv444 = value.at("enableYuv444").get<bool>();
   const auto &input = value.at("input");
   settings.input.absoluteMouseMode = input.at("absoluteMouseMode").get<bool>();
-  settings.input.hostCursor = input.value("hostCursor", false);
+  settings.input.cursorMode =
+      input.contains("cursorMode")
+          ? static_cast<CursorMode>(input.at("cursorMode").get<int>())
+          : CursorMode::local;
   for (const auto &display : input.at("workspaceMouse")) {
     const auto rectangle = [](const nlohmann::json &rect) {
       const auto values = rect.get<std::array<int, 4>>();

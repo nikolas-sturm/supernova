@@ -55,9 +55,15 @@ constexpr int audioChannelCount(AudioConfig config) noexcept {
     }
 }
 
+enum class CursorMode {
+    local,
+    host,
+    both,
+};
+
 struct InputSettings {
     bool absoluteMouseMode = false;
-    bool hostCursor = false;
+    CursorMode cursorMode = CursorMode::local;
     SystemKeyCapture captureSystemKeys = SystemKeyCapture::off;
     bool fullscreen = false;
     bool touchscreenTrackpad = true;

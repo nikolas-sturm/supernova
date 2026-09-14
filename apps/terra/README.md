@@ -263,13 +263,13 @@ without bound.
 
 In game-oriented mouse mode, click the native stream window to capture input; press
 `Ctrl+Alt+Shift+Z` or change focus to release it. Windows uses raw mouse reports; Linux uses SDL2
-relative mode. Remote-desktop mouse mode sends absolute pointer positions without capture and uses the
-responsive local cursor instead of the captured host cursor. As an alternative, the
-"Render the host cursor in the stream" input setting asks Sol to blend its native cursor
-into the video and hides the local cursor, matching what classic Moonlight clients show;
-cursor motion then follows stream latency instead of the compositor. `Ctrl+Alt+Shift+C`
-still brings the local cursor back on top. Mouse mode is fixed when the stream starts;
-change the setting and restart the stream to switch modes. Focus loss releases every forwarded key and
+relative mode. Remote-desktop mouse mode sends absolute pointer positions without capture. Its cursor rendering
+selects between client-only (the default: responsive local cursor, host cursor excluded from the
+stream), host-only (Sol blends its native cursor into the video and the local cursor hides,
+matching classic Moonlight clients), or both (streamed host pointer overlaid by the local cursor).
+Host-rendered cursor motion follows stream latency instead of the compositor, and
+`Ctrl+Alt+Shift+C` still brings the local cursor back on top. Mouse mode is fixed when the stream
+starts; change the setting and restart the stream to switch modes. Focus loss releases every forwarded key and
 mouse button to prevent stuck remote input. Gamepad input supports up to four XInput controllers
 on Windows and sixteen SDL2 controllers on Linux, including stable slots, hot-plug, standard buttons,
 analog sticks, and triggers. Linux builds bundle Moonlight's SDL controller mapping database.

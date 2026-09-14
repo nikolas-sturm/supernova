@@ -526,16 +526,23 @@ export function SettingsView({ section = 'profile' }: { section?: 'profile' | 'g
                   update(
                     absoluteMouseMode
                       ? { absoluteMouseMode }
-                      : { absoluteMouseMode, hostCursor: false },
+                      : { absoluteMouseMode, cursorMode: 'local' as const },
                   )
                 }
               />
               {settings.absoluteMouseMode && (
-                <Toggle
-                  label="Render the host cursor in the stream"
-                  note="Shows the host's native pointer instead of the local cursor; adds stream latency to cursor motion"
-                  checked={settings.hostCursor}
-                  onChange={(hostCursor) => update({ hostCursor })}
+                <SelectSetting
+                  label="Cursor rendering"
+                  value={settings.cursorMode}
+                  options={[
+                    { label: 'Client only', value: 'local' },
+                    { label: 'Host only', value: 'host' },
+                    { label: 'Both', value: 'both' },
+                  ]}
+                  note="Host cursor follows stream latency; Both overlays the responsive client cursor on the streamed host pointer"
+                  onChange={(cursorMode) =>
+                    update({ cursorMode: cursorMode as typeof settings.cursorMode })
+                  }
                 />
               )}
               <Toggle

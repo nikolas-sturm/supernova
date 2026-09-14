@@ -105,26 +105,29 @@ describe('App', () => {
     expect(screen.getByText('Frame pacing').closest('label')).toHaveClass(/settingDisabled/)
   })
 
-  it('enables the host cursor for absolute sessions and reverts it with the input mode', async () => {
+  it('selects host or both cursor rendering for absolute sessions and reverts with the input mode', async () => {
     render(<App />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Stream Settings' }))
-    expect(screen.queryByText('Render the host cursor in the stream')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Cursor rendering')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByText('Optimize mouse for remote desktop instead of games'))
-    fireEvent.click(screen.getByText('Render the host cursor in the stream'))
+    fireEvent.change(screen.getByLabelText('Cursor rendering'), { target: { value: 'host' } })
 
     expect(useClientStore.getState().settingsByMode.gaming).toMatchObject({
       absoluteMouseMode: true,
-      hostCursor: true,
+      cursorMode: 'host',
     })
+
+    fireEvent.change(screen.getByLabelText('Cursor rendering'), { target: { value: 'both' } })
+    expect(useClientStore.getState().settingsByMode.gaming.cursorMode).toBe('both')
 
     fireEvent.click(screen.getByText('Optimize mouse for remote desktop instead of games'))
     expect(useClientStore.getState().settingsByMode.gaming).toMatchObject({
       absoluteMouseMode: false,
-      hostCursor: false,
+      cursorMode: 'local',
     })
-    expect(screen.queryByText('Render the host cursor in the stream')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Cursor rendering')).not.toBeInTheDocument()
   })
 
   it('swaps complete app modes from synchronized controls', () => {

@@ -77,6 +77,38 @@ describe('clientStore mode profiles', () => {
     )
   })
 
+  it('migrates the host-cursor boolean into cursor mode', async () => {
+    localStorage.setItem(
+      'eclipse-client-settings',
+      JSON.stringify({
+        version: 1,
+        state: {
+          appMode: 'gaming',
+          settingsByMode: {
+            gaming: {
+              ...defaultSettings,
+              absoluteMouseMode: true,
+              hostCursor: true,
+            },
+            workstation: {
+              ...defaultSettings,
+              absoluteMouseMode: true,
+              hostCursor: false,
+            },
+          },
+        },
+      }),
+    )
+
+    await useClientStore.persist.rehydrate()
+
+    expect(useClientStore.getState().settingsByMode.gaming).toMatchObject({
+      absoluteMouseMode: true,
+      cursorMode: 'host',
+    })
+    expect(useClientStore.getState().settingsByMode.workstation.cursorMode).toBe('local')
+  })
+
   it('applies logical session updates and removal events', () => {
     const session = {
       id: '11111111-1111-4111-8111-111111111111',

@@ -291,7 +291,16 @@ terra::StreamSettings parseStreamSettings(const Json& value) {
     settings.enableHdr = value.at("enableHdr").get<bool>();
     settings.enableYuv444 = value.at("enableYuv444").get<bool>();
     settings.input.absoluteMouseMode = value.at("absoluteMouseMode").get<bool>();
-    settings.input.hostCursor = value.value("hostCursor", false);
+    const auto cursorMode = value.value("cursorMode", "local");
+    if (cursorMode == "local") {
+        settings.input.cursorMode = terra::CursorMode::local;
+    } else if (cursorMode == "host") {
+        settings.input.cursorMode = terra::CursorMode::host;
+    } else if (cursorMode == "both") {
+        settings.input.cursorMode = terra::CursorMode::both;
+    } else {
+        throw std::invalid_argument("Cursor mode is invalid.");
+    }
     const auto captureSystemKeys = value.at("captureSystemKeys").get<std::string>();
     if (captureSystemKeys == "fullscreen") {
         settings.input.captureSystemKeys = terra::SystemKeyCapture::fullscreen;

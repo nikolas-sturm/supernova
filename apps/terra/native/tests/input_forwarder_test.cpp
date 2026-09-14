@@ -753,7 +753,7 @@ int main() {
     expect(ignoredOverlayOpens == 0, "Stream overlay opened without captured input.");
     input.stop();
     {
-        settings.hostCursor = true;
+        settings.cursorMode = terra::CursorMode::host;
         input.start(window, settings, 1920, 1080, 60, {}, {},
                     [&](std::uint64_t, bool) { ++ignoredOverlayOpens; });
         input.setEnabled(true);
@@ -772,7 +772,16 @@ int main() {
         expect(SDL_ShowCursor(SDL_QUERY) == SDL_ENABLE,
                "Local cursor shortcut did not restore the host-cursor local fallback.");
         input.stop();
-        settings.hostCursor = false;
+    }
+    {
+        settings.cursorMode = terra::CursorMode::both;
+        input.start(window, settings, 1920, 1080, 60, {}, {},
+                    [&](std::uint64_t, bool) { ++ignoredOverlayOpens; });
+        input.setEnabled(true);
+        expect(SDL_ShowCursor(SDL_QUERY) == SDL_ENABLE,
+               "Both-cursor mode hid the local cursor.");
+        input.stop();
+        settings.cursorMode = terra::CursorMode::local;
     }
     {
         SDL_Rect display{};

@@ -642,7 +642,7 @@ export const useClientStore = create<ClientState>()(
       // Persisted contract: keep existing profiles across the Terra branding rename.
       name: 'eclipse-client-settings',
       storage: createJSONStorage(() => settingsStorage),
-      version: 1,
+      version: 2,
       partialize: (state) => ({
         appMode: state.appMode,
         settingsByMode: state.settingsByMode,
@@ -650,16 +650,30 @@ export const useClientStore = create<ClientState>()(
         clientPrimaryDisplayId: state.clientPrimaryDisplayId,
       }),
       migrate: (persisted, version) => {
-        if (version !== 0 || !persisted || typeof persisted !== 'object') return persisted
-        const legacy = persisted as { settings?: Partial<StreamSettings> }
-        const gaming = settingsSchema.safeParse({ ...defaultSettings, ...legacy.settings })
-        return {
-          appMode: 'gaming',
-          settingsByMode: {
-            gaming: gaming.success ? gaming.data : { ...defaultSettingsByMode.gaming },
-            workstation: { ...defaultSettingsByMode.workstation },
-          },
+        if (!persisted || typeof persisted !== 'object') return persisted
+        if (version === 0) {
+          const legacy = persisted as { settings?: Partial<StreamSettings> }
+          const gaming = settingsSchema.safeParse({ ...defaultSettings, ...legacy.settings })
+          return {
+            appMode: 'gaming',
+            settingsByMode: {
+              gaming: gaming.success ? gaming.data : { ...defaultSettingsByMode.gaming },
+              workstation: { ...defaultSettingsByMode.workstation },
+            },
+          }
         }
+        // Version 1 stored the host-cursor preference as a boolean.
+        const stored = persisted as {
+          settingsByMode?: Record<string, Partial<StreamSettings> & { hostCursor?: boolean }>
+        }
+        for (const mode of ['gaming', 'workstation'] as const) {
+          const legacyMode = stored.settingsByMode?.[mode]
+          if (legacyMode && 'hostCursor' in legacyMode) {
+            legacyMode.cursorMode = legacyMode.hostCursor ? 'host' : 'local'
+            delete legacyMode.hostCursor
+          }
+        }
+        return persisted
       },
       merge: (persisted, current) => {
         const stored = persisted as Partial<ClientState>
