@@ -761,7 +761,7 @@ LaunchResult GameStreamClient::launch(const std::string& address, std::uint16_t 
         "&gcpersist=" + std::to_string(settings.input.forceGamepad ? 1 : 0) +
         "&corever=1&eclipseApiVersion=1&eclipseCaptureCursor=" +
         std::to_string(settings.input.absoluteMouseMode &&
-                               settings.input.cursorMode != CursorMode::local
+                               settings.input.cursorMode == CursorMode::local
                            ? 0
                            : 1) +
         (appUuid.empty() ? "" : "&eclipseAppUuid=" + urlEncode(appUuid)) +
